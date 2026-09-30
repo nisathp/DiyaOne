@@ -420,6 +420,11 @@ class MessageModel
 
     @AnyThread
     fun getRawTextContent(): String {
+        if (rawTextContent.isNotBlank()) return rawTextContent
+        val textContent = chatMessage.contents.find { it.isText && !it.isFile }
+        if (textContent != null) {
+            rawTextContent = textContent.utf8Text.orEmpty().trim()
+        }
         return rawTextContent
     }
 

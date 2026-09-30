@@ -20,6 +20,7 @@ import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.core.CustomImdn
 import org.linphone.core.ChatMessage
+import org.linphone.core.ChatMessageListenerStub
 import org.linphone.core.ChatRoom
 import org.linphone.core.ChatRoomListenerStub
 import org.linphone.core.EventLog
@@ -135,6 +136,31 @@ class SendMessageInConversationViewModel
 
     private var participantsListFilter = ""
 
+    // A Basic SIP chat message accepts one file content. Serialize file uploads so a
+    // burst of selected images cannot start several independent transfers at once.
+    private val pendingBasicFileMessages = ArrayDeque<ChatMessage>()
+    private var activeBasicFileMessage: ChatMessage? = null
+
+    private val basicFileMessageListener = object : ChatMessageListenerStub() {
+        @WorkerThread
+        override fun onFileTransferTerminated(message: ChatMessage, content: org.linphone.core.Content) {
+            finishBasicFileMessage(message)
+        }
+
+        @WorkerThread
+        override fun onMsgStateChanged(message: ChatMessage, messageState: ChatMessage.State?) {
+            when (messageState) {
+                ChatMessage.State.Delivered,
+                ChatMessage.State.DeliveredToUser,
+                ChatMessage.State.Displayed,
+                ChatMessage.State.NotDelivered,
+                ChatMessage.State.FileTransferDone,
+                ChatMessage.State.FileTransferError -> finishBasicFileMessage(message)
+                else -> {}
+            }
+        }
+    }
+
     private var capturedPicturedPath = ""
 
     private val chatRoomListener = object : ChatRoomListenerStub() {
@@ -189,6 +215,9 @@ class SendMessageInConversationViewModel
             if (::chatRoom.isInitialized) {
                 chatRoom.removeListener(chatRoomListener)
             }
+            activeBasicFileMessage?.removeListener(basicFileMessageListener)
+            pendingBasicFileMessages.forEach { it.removeListener(basicFileMessageListener) }
+            pendingBasicFileMessages.clear()
         }
     }
 
@@ -351,10 +380,11 @@ class SendMessageInConversationViewModel
                     // Let the file body handler take care of the upload
                     content.filePath = attachment.path
 
-                    if (isBasicChatRoom && contentAdded) {
+                    if (isBasicChatRoom) {
                         val fileMessage = chatRoom.createEmptyMessage()
                         fileMessage.addFileContent(content)
-                        fileMessage.send()
+                        fileMessage.addListener(basicFileMessageListener)
+                        pendingBasicFileMessages.addLast(fileMessage)
                         messageSentEvent.postValue(Event(fileMessage))
                     } else {
                         message.addFileContent(content)
@@ -372,6 +402,10 @@ class SendMessageInConversationViewModel
                 CustomImdn.prepareOutgoing(message)
                 message.send()
                 messageSentEvent.postValue(Event(message))
+            }
+
+            if (isBasicChatRoom) {
+                sendNextBasicFileMessage()
             }
 
             Log.i("$TAG Message sent, re-setting defaults")
@@ -395,6 +429,24 @@ class SendMessageInConversationViewModel
             chatMessageToEdit = null
             maxNumberOfAttachmentsReached.postValue(false)
         }
+    }
+
+    @WorkerThread
+    private fun sendNextBasicFileMessage() {
+        if (activeBasicFileMessage != null) return
+        val next = pendingBasicFileMessages.removeFirstOrNull() ?: return
+        activeBasicFileMessage = next
+        Log.i("$TAG Starting next queued Basic SIP attachment [${next.messageId}]")
+        next.send()
+    }
+
+    @WorkerThread
+    private fun finishBasicFileMessage(message: ChatMessage) {
+        if (activeBasicFileMessage != message) return
+        Log.i("$TAG Basic SIP attachment [${message.messageId}] reached terminal transfer state [${message.state}]")
+        message.removeListener(basicFileMessageListener)
+        activeBasicFileMessage = null
+        sendNextBasicFileMessage()
     }
 
     @UiThread

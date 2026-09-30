@@ -82,6 +82,47 @@ class LinphoneUtils {
             }
         }
 
+        /**
+         * Find a one-to-one room even when the same FreeSWITCH account is reached through
+         * one of its configured SIP domains (for example, its LAN address and public domain).
+         * The alias lookup is deliberately limited to Basic SIP rooms and this local account;
+         * it must not merge Flexisip rooms or users belonging to another account.
+         */
+        @WorkerThread
+        fun findExistingOneToOneChatRoom(
+            core: Core,
+            params: ConferenceParams,
+            localAddress: Address?,
+            remoteAddress: Address
+        ): ChatRoom? {
+            val participants = arrayOf(remoteAddress)
+            core.searchChatRoom(params, localAddress, null, participants)?.let { return it }
+
+            val chatParams = params.chatParams ?: return null
+            if (chatParams.backend != ChatRoom.Backend.Basic) return null
+
+            val account = params.account ?: return null
+            val identityDomain = account.params.identityAddress?.domain
+            val accountDomains = setOfNotNull(
+                identityDomain,
+                account.params.serverAddress?.domain,
+                corePreferences.defaultDomain,
+                corePreferences.thirdPartySipAccountDefaultDomain
+            ).map { it.trim().trimEnd('.').lowercase() }.filter { it.isNotEmpty() }.toSet()
+            val remoteDomain = remoteAddress.domain.orEmpty().trim().trimEnd('.').lowercase()
+            val username = remoteAddress.username ?: return null
+            if (remoteDomain !in accountDomains) return null
+
+            return core.chatRooms.firstOrNull { room ->
+                room.account == account &&
+                    room.hasCapability(ChatRoom.Capabilities.Basic.toInt()) &&
+                    room.hasCapability(ChatRoom.Capabilities.OneToOne.toInt()) &&
+                    localAddress?.weakEqual(room.localAddress) == true &&
+                    room.peerAddress.username == username &&
+                    room.peerAddress.domain.orEmpty().trim().trimEnd('.').lowercase() in accountDomains
+            }
+        }
+
         const val RECORDING_FILE_NAME_URI_TIMESTAMP_SEPARATOR = "_on_"
         const val RECORDING_MKV_FILE_EXTENSION = ".mkv"
         const val RECORDING_SMFF_FILE_EXTENSION = ".smff"

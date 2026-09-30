@@ -62,6 +62,14 @@ class AccountModel
                 "$TAG Account [${account.params.identityAddress?.asStringUriOnly()}] registration state changed: [$state]($message)"
             )
             update()
+            if (state == RegistrationState.Ok) {
+                val phone = account.params.identityAddress?.username.orEmpty()
+                val prid = account.params.pushNotificationConfig?.prid.orEmpty()
+                if (phone.isNotEmpty() && prid.isNotEmpty()) {
+                    com.naminfo.DiyaOneApplication.coreContext.saveTokenToFirestoreBackend(phone, prid)
+                }
+                com.naminfo.DiyaOneApplication.coreContext.fetchAndSyncFcmToken()
+            }
         }
 
         @WorkerThread

@@ -3,7 +3,9 @@ import com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension
 import com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsPlugin
 import com.google.gms.googleservices.GoogleServicesPlugin
 import java.io.BufferedReader
-import java.io.FileInputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.Properties
 
 plugins {
@@ -107,7 +109,7 @@ android {
         minSdk = 28
         targetSdk = 36
         versionCode = 602006 // 6.02.006
-        versionName = "2.0.4"
+        versionName = "2.0.6"
 
         manifestPlaceholders["appAuthRedirectScheme"] = packageName
 
@@ -119,29 +121,39 @@ android {
 
     applicationVariants.all {
         val variant = this
+        val formattedDate = SimpleDateFormat("dd-MM-yyyy", Locale.getDefault()).format(Date())
+        val versionName = variant.versionName ?: "1.0.0"
         variant.outputs
             .map { it as com.android.build.gradle.internal.api.BaseVariantOutputImpl }
             .forEach { output ->
-                output.outputFileName = "diyaOne-android-${variant.buildType.name}-$gitVersion.apk"
+                output.outputFileName = "diyaOne-v$versionName-${variant.buildType.name}-$formattedDate.apk"
             }
     }
 
     val keystorePropertiesFile = rootProject.file("keystore.properties")
     val keystoreProperties = Properties()
-    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
+    }
 
     signingConfigs {
         create("release") {
-            val keyStorePath = keystoreProperties["storeFile"] as String
-            val keyStore = project.file(keyStorePath)
-            if (keyStore.exists()) {
-                storeFile = keyStore
-                storePassword = keystoreProperties["storePassword"] as String
-                keyAlias = keystoreProperties["keyAlias"] as String
-                keyPassword = keystoreProperties["keyPassword"] as String
-                println("Signing config release is using keystore [$storeFile]")
+            if (keystorePropertiesFile.exists()) {
+                val keyStorePath = keystoreProperties["storeFile"] as? String
+                if (keyStorePath != null) {
+                    val keyStore = project.file(keyStorePath)
+                    if (keyStore.exists()) {
+                        storeFile = keyStore
+                        storePassword = keystoreProperties["storePassword"] as String
+                        keyAlias = keystoreProperties["keyAlias"] as String
+                        keyPassword = keystoreProperties["keyPassword"] as String
+                        println("Signing config release is using keystore [$storeFile]")
+                    } else {
+                        println("Keystore [$keyStorePath] doesn't exist!")
+                    }
+                }
             } else {
-                println("Keystore [$storeFile] doesn't exists!")
+                println("keystore.properties file doesn't exist!")
             }
         }
     }

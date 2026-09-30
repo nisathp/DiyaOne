@@ -260,11 +260,17 @@ open class ConversationFragment : SlidingPaneChildFragment() {
 
     private fun showContactTranslationDialog() {
         val currentGlobal = corePreferences.receivedChatTranslationLanguage
-        val currentOverride = corePreferences.getContactTranslationOverride(viewModel.conversationId)
-        val globalLabel = "Use global preference (${currentGlobal.label})"
+        val currentOverride = corePreferences.getContactTranslationOverride(viewModel.getTranslationConversationId())
+        val globalLabel = getString(R.string.use_global_label, currentGlobal.label)
 
         val options = arrayOf(
-            globalLabel, "Tamil", "English", "Hindi", "Chinese", "Arabic", "Spanish"
+            globalLabel,
+            getString(R.string.translation_language_tamil),
+            getString(R.string.translation_language_english),
+            getString(R.string.translation_language_hindi),
+            getString(R.string.translation_language_chinese),
+            getString(R.string.translation_language_arabic),
+            getString(R.string.translation_language_spanish)
         )
 
         val selectedIndex = when (currentOverride?.uppercase()) {
@@ -278,7 +284,7 @@ open class ConversationFragment : SlidingPaneChildFragment() {
         }
 
         AlertDialog.Builder(requireContext())
-            .setTitle("Incoming Message Translation")
+            .setTitle(R.string.incoming_message_translation_title)
             .setSingleChoiceItems(options, selectedIndex) { dialog, which ->
                 val newCode = when (which) {
                     1 -> "TA"

@@ -308,10 +308,11 @@ class ConversationViewModel
             Log.i("$TAG Contacts have been (re)loaded, updating list")
             computeParticipantsInfo()
 
-            if (isGroup.value == true) {
-                for (event in eventsList) {
-                    (event.model as? MessageModel)?.updateAvatarModel()
-                }
+            // Contact avatars are replaced when the contacts cache reloads. Refresh message
+            // avatars for one-to-one and group chats so their presence LiveData is not left
+            // attached to a detached Friend listener.
+            for (event in eventsList) {
+                (event.model as? MessageModel)?.updateAvatarModel()
             }
         }
 
@@ -704,6 +705,7 @@ class ConversationViewModel
         eventsList = list
         updateEvents.postValue(Event(true))
         isEmpty.postValue(eventsList.isEmpty())
+        checkAndTranslateIncomingMessages()
     }
 
     @WorkerThread
@@ -768,6 +770,7 @@ class ConversationViewModel
         eventsList = list
         updateEvents.postValue(Event(true))
         isEmpty.postValue(eventsList.isEmpty())
+        checkAndTranslateIncomingMessages()
     }
 
     @WorkerThread
@@ -1084,8 +1087,12 @@ class ConversationViewModel
         }
     }
 
+    fun getTranslationConversationId(): String {
+        return if (isChatRoomInitialized()) LinphoneUtils.getConversationId(chatRoom) else conversationId
+    }
+
     fun resolveEffectiveLanguage(): ChatTranslationLanguage {
-        val overrideCode = corePreferences.getContactTranslationOverride(conversationId)
+        val overrideCode = corePreferences.getContactTranslationOverride(getTranslationConversationId())
         if (!overrideCode.isNullOrEmpty() && !overrideCode.equals("USE_GLOBAL", ignoreCase = true)) {
             val contactLang = ChatTranslationLanguage.fromCode(overrideCode)
             if (contactLang != ChatTranslationLanguage.NONE) return contactLang
@@ -1094,7 +1101,7 @@ class ConversationViewModel
     }
 
     fun setContactTranslationOverride(languageCode: String?) {
-        corePreferences.setContactTranslationOverride(conversationId, languageCode)
+        corePreferences.setContactTranslationOverride(getTranslationConversationId(), languageCode)
         checkAndTranslateIncomingMessages()
     }
 

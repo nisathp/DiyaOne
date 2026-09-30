@@ -462,7 +462,10 @@ class ConversationModel
         } else {
             val model = coreContext.contactsManager.getContactAvatarModelForAddress(address)
             val oldModel = avatarModel.value
-            if (!model.compare(oldModel)) {
+            // ContactsManager can replace avatar models after a contacts refresh. Reuse the
+            // new instance even when its visible fields match, so this conversation observes
+            // the Friend listener that will receive future presence updates.
+            if (oldModel !== model || !model.compare(oldModel)) {
                 avatarModel.postValue(model)
             }
         }

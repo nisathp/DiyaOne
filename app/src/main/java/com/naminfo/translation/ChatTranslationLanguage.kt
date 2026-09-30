@@ -9,7 +9,7 @@ enum class ChatTranslationLanguage(
     TAMIL("ta", "Tamil", "tamil"),
     ENGLISH("en", "English", "english"),
     HINDI("hi", "Hindi", "hindi"),
-    CHINESE("zh", "Chinese", "chinese"),
+    CHINESE("zh", "Chinese", "zh-CN"),
     ARABIC("ar", "Arabic", "arabic"),
     SPANISH("es", "Spanish", "spanish");
 

@@ -236,7 +236,7 @@
                 android:onLongClick="@{onLongClickListener}"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="@{model.text, default=`Lorem ipsum dolor sit amet`}"
+                android:text="@{model.translatedText != null &amp;&amp; !model.showOriginal ? model.translatedText : model.text, default=`Lorem ipsum dolor sit amet`}"
                 android:textSize="@{model.isTextEmoji ? @dimen/chat_bubble_emoji_only_text_size : @dimen/chat_bubble_text_size, default=@dimen/chat_bubble_text_size}"
                 android:textColor="?attr/color_main2_800"
                 android:textIsSelectable="true"
@@ -255,7 +255,7 @@
                 android:textColor="?attr/color_main1_500"
                 android:text="@{model.showOriginal ? @string/show_translation_label : @string/show_original_label}"
                 android:onClick="@{() -> model.toggleShowOriginal()}"
-                android:visibility="@{model.translatedText != null ? View.VISIBLE : View.GONE}" />
+                android:visibility="@{model.translatedText != null &amp;&amp; !model.hasBeenRetracted ? View.VISIBLE : View.GONE}" />
 
             <com.naminfo.ui.main.chat.view.ChatBubbleTextView
                 style="@style/default_text_style"

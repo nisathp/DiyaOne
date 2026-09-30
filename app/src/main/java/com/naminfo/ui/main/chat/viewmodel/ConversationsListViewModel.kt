@@ -344,7 +344,9 @@ class ConversationsListViewModel
 
         val participants = arrayOf(remote)
         val localAddress = account.params.identityAddress
-        val existingChatRoom = core.searchChatRoom(params, localAddress, null, participants)
+        val existingChatRoom = LinphoneUtils.findExistingOneToOneChatRoom(
+            core, params, localAddress, LinphoneUtils.canonicalizeBasicChatAddress(remote, account)
+        )
         if (existingChatRoom == null) {
             Log.i(
                 "$TAG No existing 1-1 conversation between local account [${localAddress?.asStringUriOnly()}] and remote [${remote.asStringUriOnly()}] was found for given parameters, let's create it"

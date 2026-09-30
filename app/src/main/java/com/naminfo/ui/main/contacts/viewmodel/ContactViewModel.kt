@@ -618,7 +618,9 @@ class ContactViewModel
 
             val participants = arrayOf(remote)
             val localAddress = account.params.identityAddress
-            val existingChatRoom = core.searchChatRoom(params, localAddress, null, participants)
+            val existingChatRoom = LinphoneUtils.findExistingOneToOneChatRoom(
+                core, params, localAddress, remote
+            )
             if (existingChatRoom != null) {
                 Log.i(
                     "$TAG Found existing conversation [${LinphoneUtils.getConversationId(

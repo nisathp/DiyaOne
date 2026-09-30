@@ -42,15 +42,29 @@ import com.naminfo.utils.AudioUtils
 import com.naminfo.utils.Event
 import com.naminfo.utils.FileUtils
 import com.naminfo.utils.LinphoneUtils
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+import org.json.JSONObject
 
 class CoreContext
     @UiThread
     constructor(val context: Context) : HandlerThread("Core Thread") {
     companion object {
         private const val TAG = "[Core Context]"
+        private const val FREE_SWITCH_DOMAIN = "192.168.1.82"
     }
 
     lateinit var core: Core
+
+    @Volatile
+    var pendingWakeCallId: String? = null
+
+    @Volatile
+    var pendingWakeReadyToken: String? = null
+
+    private val pendingWakeAckLock = Any()
+    private var pendingWakeAckInProgressFor: String? = null
 
     fun isCoreAvailable(): Boolean {
         return ::core.isInitialized
@@ -195,6 +209,23 @@ class CoreContext
     private var previousCallState = Call.State.Idle
 
     private val coreListener = object : CoreListenerStub() {
+        @WorkerThread
+        override fun onAccountRegistrationStateChanged(
+            core: Core,
+            account: Account,
+            state: RegistrationState?,
+            message: String
+        ) {
+            if (state != RegistrationState.Ok) return
+            if (account == core.defaultAccount) {
+                // Core may start before the user creates the first SIP account.
+                // In that case onCoreStarted() has nothing to configure, so
+                // enable push once the account has actually registered.
+                enablePushNotificationsForConfiguredFreeSwitchAccounts()
+                acknowledgePendingWakeCallIfRegistered()
+            }
+        }
+
         @WorkerThread
         override fun onDefaultAccountChanged(core: Core, account: Account?) {
             defaultAccountHasVideoConferenceFactoryUri = account?.params?.audioVideoConferenceFactoryAddress != null
@@ -751,6 +782,15 @@ class CoreContext
     @WorkerThread
     fun onCoreStarted() {
         Log.i("$TAG Core started, updating configuration if required")
+        enablePushNotificationsForConfiguredFreeSwitchAccounts()
+        if (!pendingWakeCallId.isNullOrEmpty()) {
+            Log.i("$TAG Processing pending FCM call wake after Core startup")
+            core.refreshRegisters()
+            // The FCM service can cold-start the Core. Do not make FreeSWITCH
+            // wait for the full SIP registration callback before it starts the
+            // INVITE transaction; registration will continue in parallel.
+            acknowledgePendingWakeCallAfterRegisterRefresh()
+        }
         core.videoCodecPriorityPolicy = CodecPriorityPolicy.Auto
 
         // Set in the Core the list of directories from which it is allowed to delete a file related to a chat message
@@ -1059,8 +1099,12 @@ class CoreContext
         skipNetworkReachabilityTest: Boolean = false
     ) {
         val params = core.createCallParams(null)
-        params?.isVideoEnabled = true
-        params?.videoDirection = MediaDirection.SendRecv
+        if (params == null) {
+            Log.e("$TAG Unable to create video call parameters; refusing to silently downgrade to audio")
+            return
+        }
+        params.isVideoEnabled = true
+        params.videoDirection = MediaDirection.SendRecv
         startCall(address, params, forceZRTP, localAddress, skipNetworkReachabilityTest)
     }
 
@@ -1133,9 +1177,147 @@ class CoreContext
         } else {
             address
         }
+        // The local FreeSWITCH profile requires SDES-SRTP. Apply this to calls
+        // sent to that server only, without changing media encryption for other SIP accounts.
+        if (!forceZRTP && destination.domain.equals(FREE_SWITCH_DOMAIN, ignoreCase = true)) {
+            params.mediaEncryption = MediaEncryption.SRTP
+            params.srtpSuites = arrayOf(SrtpSuite.AESCM128HMACSHA180)
+            Log.i("$TAG Offering SDES-SRTP for FreeSWITCH call")
+        }
         params.recordFile = LinphoneUtils.getRecordingFilePathForAddress(destination)
+        Log.i(
+            "$TAG Outgoing media offer: videoRequested=${params.isVideoEnabled}, " +
+                "videoDirection=${params.videoDirection}, coreVideoEnabled=${core.isVideoEnabled}, " +
+                "camera=${core.videoDevice}, encryption=${params.mediaEncryption}"
+        )
         core.inviteAddressWithParams(destination, params)
         Log.i("$TAG Starting call to [${destination.asStringUriOnly()}]")
+    }
+
+    /**
+     * The FCM wake may arrive while the SIP account is already registered. In
+     * that case refreshRegisters() doesn't necessarily emit another Ok state
+     * callback, so acknowledge readiness directly instead of making FreeSWITCH
+     * wait for its fallback timer.
+     */
+    fun acknowledgePendingWakeCallIfRegistered() {
+        if (!isCoreAvailable() || core.defaultAccount?.state != RegistrationState.Ok) return
+
+        acknowledgePendingWakeCall()
+    }
+
+    /** Acknowledge after an FCM wake has started register refresh on the live Core. */
+    fun acknowledgePendingWakeCallAfterRegisterRefresh() {
+        if (!isCoreAvailable() || core.globalState != GlobalState.On) return
+
+        acknowledgePendingWakeCall()
+    }
+
+    private fun acknowledgePendingWakeCall() {
+        val callId = pendingWakeCallId ?: return
+        val readyToken = pendingWakeReadyToken ?: return
+        synchronized(pendingWakeAckLock) {
+            if (pendingWakeAckInProgressFor == callId) return
+            pendingWakeAckInProgressFor = callId
+        }
+
+        Log.i("$TAG SIP account is ready for FCM wake call [$callId]; acknowledging local backend")
+        Thread {
+            var acknowledged = false
+            repeat(3) { attempt ->
+                if (acknowledged) return@repeat
+                var conn: HttpURLConnection? = null
+                try {
+                    conn = URL("http://$FREE_SWITCH_DOMAIN:3000/api/call-ready")
+                        .openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.connectTimeout = 1500
+                    conn.readTimeout = 1500
+                    conn.doOutput = true
+                    val body = JSONObject().apply {
+                        put("callId", callId)
+                        put("readyToken", readyToken)
+                    }.toString()
+                    OutputStreamWriter(conn.outputStream).use { it.write(body) }
+                    acknowledged = conn.responseCode in 200..299
+                } catch (e: Exception) {
+                    Log.w("$TAG Call-ready ACK attempt ${attempt + 1} failed: ${e.message}")
+                } finally {
+                    conn?.disconnect()
+                }
+                if (!acknowledged && attempt < 2) Thread.sleep(350)
+            }
+
+            if (acknowledged) {
+                if (pendingWakeCallId == callId) {
+                    pendingWakeCallId = null
+                    pendingWakeReadyToken = null
+                }
+                Log.i("$TAG Local backend acknowledged SIP readiness for call [$callId]")
+            } else {
+                Log.w("$TAG Could not acknowledge SIP readiness for call [$callId]; FreeSWITCH will use its bounded fallback")
+            }
+            synchronized(pendingWakeAckLock) {
+                if (pendingWakeAckInProgressFor == callId) pendingWakeAckInProgressFor = null
+            }
+        }.start()
+    }
+
+    fun saveTokenToFirestoreBackend(phoneNumber: String, fcmToken: String) {
+        if (phoneNumber.isBlank() || fcmToken.isBlank()) return
+        Thread {
+            try {
+                val url = URL("http://$FREE_SWITCH_DOMAIN:3000/api/save-token")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setRequestProperty("x-signature", "015a3e11e51129f1e74326b993b508103506093f884b4f66e94404d334473820")
+                conn.connectTimeout = 3000
+                conn.readTimeout = 3000
+                conn.doOutput = true
+
+                val jsonBody = JSONObject().apply {
+                    put("phoneNumber", phoneNumber)
+                    put("fcmToken", fcmToken.trim())
+                }
+
+                OutputStreamWriter(conn.outputStream).use { writer ->
+                    writer.write(jsonBody.toString())
+                    writer.flush()
+                }
+
+                val code = conn.responseCode
+                Log.i("$TAG Token auto-save to Firestore backend for [$phoneNumber] status: $code")
+            } catch (e: Exception) {
+                Log.e("$TAG Error saving token to Firestore backend: $e")
+            }
+        }.start()
+    }
+
+    fun fetchAndSyncFcmToken() {
+        val username = core.defaultAccount?.params?.identityAddress?.username.orEmpty()
+        if (username.isBlank()) return
+        val prid = core.defaultAccount?.params?.pushNotificationConfig?.prid.orEmpty()
+        if (prid.isNotBlank()) {
+            Log.i("$TAG Syncing FCM token from pushNotificationConfig.prid for $username: $prid")
+            saveTokenToFirestoreBackend(username, prid)
+            return
+        }
+        try {
+            com.google.firebase.messaging.FirebaseMessaging.getInstance().token
+                .addOnCompleteListener { task ->
+                    if (task.isSuccessful && !task.result.isNullOrBlank()) {
+                        val token = task.result
+                        Log.i("$TAG Fetched current live FCM token: $token for $username")
+                        saveTokenToFirestoreBackend(username, token)
+                    } else {
+                        Log.e("$TAG Failed to fetch FCM token: ${task.exception}")
+                    }
+                }
+        } catch (e: Exception) {
+            Log.e("$TAG Exception fetching FCM token: $e")
+        }
     }
 
     @WorkerThread
@@ -1402,6 +1584,48 @@ class CoreContext
 
         Log.i("$TAG Removing previous grammar files (without .belr extension)")
         corePreferences.clearPreviousGrammars()
+    }
+
+    @WorkerThread
+    private fun enablePushNotificationsForConfiguredFreeSwitchAccounts() {
+        val supportedDomains = corePreferences.pushNotificationCompatibleDomains.toMutableSet()
+        var domainsUpdated = false
+
+        for (account in core.accountList) {
+            val domain = account.params.identityAddress?.domain
+            if (!domain.isNullOrEmpty() && supportedDomains.add(domain)) {
+                domainsUpdated = true
+            }
+        }
+
+        if (domainsUpdated) {
+            corePreferences.pushNotificationCompatibleDomains = supportedDomains.toTypedArray()
+        }
+
+        if (!core.isPushNotificationAvailable) {
+            Log.w("$TAG Firebase Cloud Messaging isn't available; using the keep-alive service")
+        }
+
+        var hasAccount = false
+        for (account in core.accountList) {
+            val params = account.params
+            val domain = params.identityAddress?.domain
+            if (domain.isNullOrEmpty()) continue
+
+            hasAccount = true
+            if (params.pushNotificationAllowed || !core.isPushNotificationAvailable) continue
+
+            val updatedParams = params.clone()
+            updatedParams.pushNotificationAllowed = true
+            account.params = updatedParams
+            Log.i("$TAG Enabled Firebase push registration for account [${params.identityAddress?.asStringUriOnly()}]")
+        }
+
+        if (hasAccount && !corePreferences.keepServiceAlive) {
+            corePreferences.keepServiceAlive = true
+            startKeepAliveService()
+            Log.i("$TAG Enabled foreground keep-alive service for registered accounts")
+        }
     }
 
     @WorkerThread

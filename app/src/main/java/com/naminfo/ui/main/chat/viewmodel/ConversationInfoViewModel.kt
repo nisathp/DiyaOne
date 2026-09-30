@@ -548,7 +548,9 @@ class ConversationInfoViewModel
         } else {
             participantsList.first().avatarModel
         }
-        if (!avatar.compare(avatarModel.value)) {
+        // A refreshed ContactAvatarModel may contain the same visible fields while owning
+        // a new Friend listener. Keep the header attached to that replacement for presence.
+        if (avatarModel.value !== avatar || !avatar.compare(avatarModel.value)) {
             avatarModel.postValue(avatar)
         }
 

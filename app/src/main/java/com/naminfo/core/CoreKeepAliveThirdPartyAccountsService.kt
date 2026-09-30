@@ -27,7 +27,24 @@ class CoreKeepAliveThirdPartyAccountsService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.i("$TAG Task removed, doing nothing")
+        Log.i("$TAG Task removed by user swipe, scheduling instant restart of keep-alive service...")
+        try {
+            val restartServiceIntent = Intent(applicationContext, this.javaClass).also {
+                it.setPackage(packageName)
+            }
+            val restartServicePendingIntent = android.app.PendingIntent.getService(
+                this, 1, restartServiceIntent,
+                android.app.PendingIntent.FLAG_ONE_SHOT or android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            val alarmService = getSystemService(android.content.Context.ALARM_SERVICE) as? android.app.AlarmManager
+            alarmService?.set(
+                android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                android.os.SystemClock.elapsedRealtime() + 1000,
+                restartServicePendingIntent
+            )
+        } catch (e: Exception) {
+            Log.e("$TAG Failed to schedule restart on task removed: $e")
+        }
         super.onTaskRemoved(rootIntent)
     }
 
