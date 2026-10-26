@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "784742741614",
+    "project_id": "nam-info-projects-a46e0",
+    "storage_bucket": "nam-info-projects-a46e0.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:784742741614:android:415c7d17d884c94e5c187f",
+        "android_client_info": {
+          "package_name": "com.naminfo"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCBUXMFZS47B0Ps9ZnqcExrstfr9h8rDVI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:784742741614:android:c1ce04bcdd5812355c187f",
+        "android_client_info": {
+          "package_name": "com.naminfo.debug"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCBUXMFZS47B0Ps9ZnqcExrstfr9h8rDVI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

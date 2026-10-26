@@ -1,0 +1,612 @@
+package com.naminfo.ui.main.chat.model
+
+import android.text.Spannable
+import android.text.SpannableStringBuilder
+import android.graphics.Typeface
+import androidx.annotation.UiThread
+import androidx.annotation.WorkerThread
+import androidx.core.text.toSpannable
+import android.text.style.StyleSpan
+import androidx.lifecycle.MutableLiveData
+import com.naminfo.DiyaOneApplication.Companion.coreContext
+import com.naminfo.DiyaOneApplication.Companion.corePreferences
+import com.naminfo.R
+import com.naminfo.core.CustomComposing
+import com.naminfo.core.CustomImdn
+import com.naminfo.translation.ChatTranslationLanguage
+import com.naminfo.translation.TranslationRepository
+import com.naminfo.ui.main.chat.decodeReplyPreviewEnvelope
+import com.naminfo.ui.main.chat.ChatDraftRepository
+import com.naminfo.ui.main.chat.RemoteComposingState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import org.linphone.core.Address
+import org.linphone.core.ChatMessage
+import org.linphone.core.ChatMessageListenerStub
+import org.linphone.core.ChatRoom
+import org.linphone.core.ChatRoom.Capabilities
+import org.linphone.core.ChatRoomListenerStub
+import org.linphone.core.Content
+import org.linphone.core.EventLog
+import org.linphone.core.Friend
+import org.linphone.core.tools.Log
+import com.naminfo.ui.main.contacts.model.ContactAvatarModel
+import com.naminfo.utils.AppUtils
+import com.naminfo.utils.FileUtils
+import com.naminfo.utils.LinphoneUtils
+import com.naminfo.utils.ShortcutUtils
+import com.naminfo.utils.TimestampUtils
+
+class ConversationModel
+    @WorkerThread
+    constructor(val chatRoom: ChatRoom) {
+    companion object {
+        private const val TAG = "[Conversation Model]"
+    }
+
+    val id = LinphoneUtils.getConversationId(chatRoom)
+
+    val isGroup = !chatRoom.hasCapability(Capabilities.OneToOne.toInt()) && chatRoom.hasCapability(
+        Capabilities.Conference.toInt()
+    )
+
+    val isEncrypted = chatRoom.hasCapability(Capabilities.Encrypted.toInt())
+
+    val isEncryptionAvailable = LinphoneUtils.isEndToEndEncryptedChatAvailable(chatRoom.core)
+
+    val isReadOnly = MutableLiveData<Boolean>()
+
+    val subject = MutableLiveData<String>()
+
+    val lastUpdateTime = MutableLiveData<Long>()
+
+    val isComposing = MutableLiveData<Boolean>()
+
+    val composingLabel = MutableLiveData<String>()
+
+    val isMuted = MutableLiveData<Boolean>()
+
+    val isEphemeral = MutableLiveData<Boolean>()
+
+    val lastMessageTextSender = MutableLiveData<String>()
+
+    val lastMessageText = MutableLiveData<Spannable>()
+
+    val draftText = MutableLiveData<Spannable>()
+
+    val isDraft = MutableLiveData<Boolean>()
+
+    val lastMessageDeliveryIcon = MutableLiveData<Int>()
+
+    val lastMessageContentIcon = MutableLiveData<Int>()
+
+    val composingIcon = MutableLiveData<Int>()
+
+    val isLastMessageOutgoing = MutableLiveData<Boolean>()
+
+    val dateTime = MutableLiveData<String>()
+
+    val unreadMessageCount = MutableLiveData<Int>()
+
+    val avatarModel = MutableLiveData<ContactAvatarModel>()
+
+    val isBeingDeleted = MutableLiveData<Boolean>()
+
+    private var lastMessage: ChatMessage? = null
+
+    private var customReceiptState: Pair<String, ChatMessage.State>? = null
+
+    private val remoteComposingState = RemoteComposingState {
+        coreContext.postOnCoreThread { computeComposingLabel() }
+    }
+
+    private val draftObserver: (String, String) -> Unit = { conversationId, text ->
+        if (conversationId == id) updateDraftPreview(text)
+    }
+
+    private val customReceiptObserver: (String, ChatMessage.State) -> Unit = { messageKey, state ->
+        val message = lastMessage
+        if (message != null && message.isOutgoing && CustomImdn.key(message) == messageKey) {
+            customReceiptState = messageKey to state
+            lastMessageDeliveryIcon.postValue(LinphoneUtils.getChatIconResId(state))
+        }
+    }
+
+    private val customComposingObserver: (String, String, Boolean) -> Unit = { roomKey, address, active ->
+        if (roomKey == CustomComposing.roomKey(chatRoom)) {
+            coreContext.postOnCoreThread {
+                val parsedAddress = coreContext.core.interpretUrl(address, false)
+                val displayName = parsedAddress?.let { LinphoneUtils.getDisplayName(it) }
+                    ?.takeIf { it.isNotBlank() } ?: address
+                remoteComposingState.update(address, displayName, active)
+                computeComposingLabel()
+            }
+        }
+    }
+
+    private val chatRoomListener = object : ChatRoomListenerStub() {
+        @WorkerThread
+        override fun onStateChanged(chatRoom: ChatRoom, newState: ChatRoom.State?) {
+            Log.i("$TAG Conversation state changed [${chatRoom.state}]")
+            if (chatRoom.state == ChatRoom.State.Created) {
+                subject.postValue(chatRoom.subjectUtf8)
+                computeParticipants()
+            } else if (chatRoom.state == ChatRoom.State.Deleted) {
+                Log.i("$TAG Conversation [$id] has been deleted")
+                isBeingDeleted.postValue(false)
+            }
+        }
+
+        @WorkerThread
+        override fun onConferenceJoined(chatRoom: ChatRoom, eventLog: EventLog) {
+            // This is required as a Created chat room may not have the participants list yet
+            Log.i("$TAG Conversation has been joined")
+            subject.postValue(chatRoom.subjectUtf8)
+            computeParticipants()
+        }
+
+        @WorkerThread
+        override fun onConferenceLeft(chatRoom: ChatRoom, eventLog: EventLog) {
+            Log.w("$TAG Conversation has been left")
+            isReadOnly.postValue(chatRoom.isReadOnly)
+        }
+
+        @WorkerThread
+        override fun onIsComposingReceived(
+            chatRoom: ChatRoom,
+            remoteAddress: Address,
+            isComposing: Boolean
+        ) {
+            val address = remoteAddress.asStringUriOnly()
+            val avatar = coreContext.contactsManager.getContactAvatarModelForAddress(remoteAddress)
+            val displayName = avatar.name.value?.takeIf { it.isNotBlank() }
+                ?: LinphoneUtils.getDisplayName(remoteAddress)
+            remoteComposingState.update(address, displayName, isComposing)
+            computeComposingLabel()
+        }
+
+        @WorkerThread
+        override fun onNewEvent(chatRoom: ChatRoom, eventLog: EventLog) {
+            updateLastUpdatedTime()
+        }
+
+        @WorkerThread
+        override fun onNewEvents(chatRoom: ChatRoom, eventLogs: Array<out EventLog>) {
+            updateLastMessage()
+            updateLastUpdatedTime()
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+        }
+
+        @WorkerThread
+        override fun onChatMessageSending(chatRoom: ChatRoom, eventLog: EventLog) {
+            updateLastMessage()
+        }
+
+        @WorkerThread
+        override fun onChatRoomRead(chatRoom: ChatRoom) {
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+        }
+
+        @WorkerThread
+        override fun onSubjectChanged(chatRoom: ChatRoom, eventLog: EventLog) {
+            Log.i("$TAG Conversation subject changed [${chatRoom.subjectUtf8}]")
+            subject.postValue(chatRoom.subjectUtf8)
+            computeParticipants()
+        }
+
+        @WorkerThread
+        override fun onEphemeralEvent(chatRoom: ChatRoom, eventLog: EventLog) {
+            isEphemeral.postValue(chatRoom.isEphemeralEnabled)
+        }
+
+        @WorkerThread
+        override fun onEphemeralMessageDeleted(chatRoom: ChatRoom, eventLog: EventLog) {
+            Log.i("$TAG An ephemeral message lifetime has expired, updating last displayed message")
+            updateLastMessage()
+        }
+
+        @WorkerThread
+        override fun onMessageRetracted(chatRoom: ChatRoom, message: ChatMessage) {
+            if (lastMessage == null || message.messageId == lastMessage?.messageId) {
+                Log.i("$TAG Last message [${message.messageId}] has been retracted")
+                updateLastMessage()
+            }
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+        }
+
+        @WorkerThread
+        override fun onMessageContentEdited(chatRoom: ChatRoom, message: ChatMessage) {
+            if (lastMessage == null || message.messageId == lastMessage?.messageId) {
+                Log.i("$TAG Last message [${message.messageId}] has been edited")
+                updateLastMessage()
+            }
+        }
+    }
+
+    private val chatMessageListener = object : ChatMessageListenerStub() {
+        @WorkerThread
+        override fun onMsgStateChanged(message: ChatMessage, state: ChatMessage.State?) {
+            updateLastMessageStatus(message)
+        }
+    }
+
+    init {
+        // Prune duplicates persisted by earlier FreeSWITCH fan-out before the
+        // conversation preview and message list read the room history.
+        CustomImdn.removeDuplicateIncomingMessages(chatRoom)
+        chatRoom.addListener(chatRoomListener)
+        CustomImdn.addObserver(customReceiptObserver)
+        CustomComposing.addObserver(customComposingObserver)
+        ChatDraftRepository.addObserver(draftObserver)
+
+        computeComposingLabel()
+        subject.postValue(chatRoom.subjectUtf8)
+        computeParticipants()
+
+        isMuted.postValue(chatRoom.muted)
+        isEphemeral.postValue(chatRoom.isEphemeralEnabled)
+        isReadOnly.postValue(chatRoom.isReadOnly)
+        Log.d(
+            "$TAG Ephemeral messages are [${if (chatRoom.isEphemeralEnabled) "enabled" else "disabled"}], lifetime is [${chatRoom.ephemeralLifetime}]"
+        )
+        lastMessageContentIcon.postValue(0)
+
+        updateDraftPreview(ChatDraftRepository.get(id))
+
+        updateLastMessage()
+        updateLastUpdatedTime()
+
+        unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+    }
+
+    @WorkerThread
+    fun destroy() {
+        CustomImdn.removeObserver(customReceiptObserver)
+        CustomComposing.removeObserver(customComposingObserver)
+        ChatDraftRepository.removeObserver(draftObserver)
+        remoteComposingState.clear()
+        customReceiptState = null
+        lastMessage?.removeListener(chatMessageListener)
+        lastMessage = null
+
+        chatRoom.removeListener(chatRoomListener)
+    }
+
+    private fun updateDraftPreview(text: String) {
+        val draft = text.trim()
+        isDraft.postValue(draft.isNotEmpty())
+        if (draft.isEmpty()) {
+            draftText.postValue(SpannableStringBuilder("").toSpannable())
+            return
+        }
+
+        val label = coreContext.context.getString(R.string.conversations_list_draft_label)
+        val preview = SpannableStringBuilder("$label $draft")
+        preview.setSpan(StyleSpan(Typeface.BOLD), 0, label.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        draftText.postValue(preview.toSpannable())
+    }
+
+    @UiThread
+    fun markAsRead() {
+        coreContext.postOnCoreThread {
+            chatRoom.markAsRead()
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+            Log.i("$TAG Conversation [$id] has been marked as read")
+        }
+    }
+
+    @UiThread
+    fun updateUnreadCount() {
+        coreContext.postOnCoreThread {
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+        }
+    }
+
+    @UiThread
+    fun updateMuteState() {
+        coreContext.postOnCoreThread {
+            isMuted.postValue(chatRoom.muted)
+        }
+    }
+
+    @UiThread
+    fun toggleMute() {
+        coreContext.postOnCoreThread {
+            chatRoom.muted = !chatRoom.muted
+            val muted = chatRoom.muted
+            if (muted) {
+                Log.i("$TAG Conversation [$id] is now muted")
+            } else {
+                Log.i("$TAG Conversation [$id] is no longer muted")
+            }
+            isMuted.postValue(muted)
+        }
+    }
+
+    @UiThread
+    fun call() {
+        coreContext.postOnCoreThread {
+            val address = chatRoom.participants.firstOrNull()?.address ?: chatRoom.peerAddress
+            Log.i("$TAG Calling [${address.asStringUriOnly()}]")
+            coreContext.startAudioCall(address, localAddress = chatRoom.localAddress)
+        }
+    }
+
+    @UiThread
+    fun delete() {
+        coreContext.postOnCoreThread { core ->
+            Log.i("$TAG Deleting conversation [$id]")
+            isBeingDeleted.postValue(true)
+            val basic = chatRoom.hasCapability(Capabilities.Basic.toInt())
+            ShortcutUtils.removeShortcutToChatRoom(chatRoom)
+            core.deleteChatRoom(chatRoom)
+
+            if (basic) {
+                Log.i("$TAG Conversation [$id] has been deleted")
+                isBeingDeleted.postValue(false)
+            }
+        }
+    }
+
+    @UiThread
+    fun leaveGroup() {
+        coreContext.postOnCoreThread {
+            chatRoom.leave()
+            Log.i("$TAG Group conversation [$id] has been leaved")
+            isReadOnly.postValue(true)
+        }
+    }
+
+    @UiThread
+    fun updateLastMessageInfo() {
+        coreContext.postOnCoreThread {
+            updateLastMessage()
+        }
+    }
+
+    @WorkerThread
+    private fun updateLastMessageStatus(message: ChatMessage) {
+        val isOutgoing = message.isOutgoing
+
+        if (isGroup && !isOutgoing) {
+            val fromAddress = message.fromAddress
+            val sender = coreContext.contactsManager.findContactByAddress(fromAddress)
+            val name = sender?.name ?: LinphoneUtils.getDisplayName(fromAddress)
+            val senderName = AppUtils.getFormattedString(
+                R.string.conversations_last_message_format,
+                name
+            )
+            lastMessageTextSender.postValue(senderName)
+        } else {
+            lastMessageTextSender.postValue("")
+        }
+        val textContent = message.contents.find { it.isText && !it.isFile }?.utf8Text?.trim().orEmpty()
+        val decodedReply = decodeReplyPreviewEnvelope(textContent)
+        val visibleText = decodedReply?.second ?: textContent
+        val rawSpannable = if (decodedReply != null) {
+            SpannableStringBuilder(visibleText).toSpannable()
+        } else {
+            LinphoneUtils.getFormattedTextDescribingMessage(message)
+        }
+        val globalLang = corePreferences.receivedChatTranslationLanguage
+        val conversationId = LinphoneUtils.getConversationId(chatRoom)
+        val overrideCode = corePreferences.getContactTranslationOverride(conversationId)
+        val effectiveLang = if (!overrideCode.isNullOrEmpty() && !overrideCode.equals("USE_GLOBAL", ignoreCase = true)) {
+            ChatTranslationLanguage.fromCode(overrideCode)
+        } else {
+            globalLang
+        }
+
+        if (!isOutgoing && effectiveLang != ChatTranslationLanguage.NONE && !message.isRetracted) {
+            val messageId = message.messageId
+            val cachedTranslation = TranslationRepository.getCachedTranslation(messageId, effectiveLang)
+            if (cachedTranslation != null) {
+                lastMessageText.postValue(SpannableStringBuilder(cachedTranslation).toSpannable())
+            } else {
+                lastMessageText.postValue(rawSpannable)
+                val peerUsername = chatRoom.peerAddress.username ?: ""
+                if (visibleText.isNotBlank()) {
+                    CoroutineScope(Dispatchers.IO).launch {
+                        val result = TranslationRepository.translateMessage(messageId, peerUsername, visibleText, effectiveLang)
+                        if (result.isSuccess) {
+                            val translated = result.getOrNull()
+                            if (!translated.isNullOrBlank()) {
+                                lastMessageText.postValue(SpannableStringBuilder(translated).toSpannable())
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            lastMessageText.postValue(rawSpannable)
+        }
+
+        isLastMessageOutgoing.postValue(isOutgoing)
+        if (isOutgoing) {
+            val receiptState = customReceiptState?.takeIf {
+                it.first == CustomImdn.key(message)
+            }?.second
+            val state = receiptState ?: CustomImdn.effectiveState(message)
+            lastMessageDeliveryIcon.postValue(LinphoneUtils.getChatIconResId(state))
+        }
+
+        if (message.isRetracted) {
+            lastMessageContentIcon.postValue(R.drawable.trash)
+        } else if (message.isForward) {
+            lastMessageContentIcon.postValue(R.drawable.forward)
+        } else {
+            var icon = 0
+            for (content in message.contents) {
+                icon = getIconFromContent(content)
+                if (icon != 0) break
+            }
+            lastMessageContentIcon.postValue(icon)
+        }
+    }
+
+    @WorkerThread
+    fun updateLastMessage() {
+        lastMessage?.removeListener(chatMessageListener)
+        lastMessage = null
+
+        val latestMessage = chatRoom.lastMessageInHistory
+        val message = if (CustomImdn.isHiddenControlMessage(latestMessage)) {
+            chatRoom.getHistoryMessageEvents(0).asSequence()
+                .mapNotNull { it.chatMessage }
+                .lastOrNull { !CustomImdn.isHiddenControlMessage(it) }
+        } else {
+            latestMessage
+        }
+        if (message == null || CustomImdn.key(message) != customReceiptState?.first) {
+            customReceiptState = null
+        }
+        if (message != null) {
+            lastMessage = message
+            updateLastMessageStatus(message)
+
+            if (message.isOutgoing && message.state != ChatMessage.State.Displayed) {
+                message.addListener(chatMessageListener)
+            } else if (message.contents.find { it.isFileTransfer } != null) {
+                message.addListener(chatMessageListener)
+            }
+
+            val timestamp = message.time
+            val humanReadableTimestamp = when {
+                TimestampUtils.isToday(timestamp) -> {
+                    TimestampUtils.timeToString(timestamp)
+                }
+                TimestampUtils.isYesterday(timestamp) -> {
+                    AppUtils.getString(R.string.yesterday)
+                }
+                else -> {
+                    TimestampUtils.toString(timestamp, onlyDate = true)
+                }
+            }
+            dateTime.postValue(humanReadableTimestamp)
+        } else {
+            lastMessage = null
+            lastMessageTextSender.postValue("")
+            lastMessageContentIcon.postValue(0)
+            lastMessageText.postValue(SpannableStringBuilder("").toSpannable())
+            isLastMessageOutgoing.postValue(false)
+            dateTime.postValue("")
+            Log.w("$TAG No last message to display for conversation [$id]")
+        }
+    }
+
+    @WorkerThread
+    private fun getIconFromContent(content: Content): Int {
+        return if (content.isIcalendar) {
+            R.drawable.calendar
+        } else if (content.isVoiceRecording) {
+            R.drawable.waveform
+        } else if (content.isFile) {
+            val mime = "${content.type}/${content.subtype}"
+            val mimeType = FileUtils.getMimeType(mime)
+            val drawable = when (mimeType) {
+                FileUtils.MimeType.Image -> R.drawable.file_image
+                FileUtils.MimeType.Video -> R.drawable.file_video
+                FileUtils.MimeType.Audio -> R.drawable.file_audio
+                FileUtils.MimeType.Pdf -> R.drawable.file_pdf
+                FileUtils.MimeType.PlainText -> R.drawable.file_text
+                else -> R.drawable.file
+            }
+            drawable
+        } else if (content.isFileTransfer) {
+            R.drawable.download_simple
+        } else {
+            0
+        }
+    }
+
+    @WorkerThread
+    private fun updateLastUpdatedTime() {
+        val timestamp = chatRoom.lastUpdateTime
+        lastUpdateTime.postValue(timestamp)
+    }
+
+    @WorkerThread
+    fun computeParticipants() {
+        val friends = arrayListOf<Friend>()
+        val address = if (chatRoom.hasCapability(Capabilities.Basic.toInt())) {
+            Log.d("$TAG Conversation [$id] is 'Basic'")
+            chatRoom.peerAddress
+        } else {
+            val firstParticipant = chatRoom.participants.firstOrNull()
+            if (isGroup) {
+                Log.d(
+                    "$TAG Group conversation [$id] has [${chatRoom.nbParticipants}] participant(s)"
+                )
+                for (participant in chatRoom.participants) {
+                    val friend = coreContext.contactsManager.findContactByAddress(
+                        participant.address
+                    )
+                    if (friend != null && !friends.contains(friend)) {
+                        friends.add(friend)
+                    }
+                }
+            } else {
+                Log.d(
+                    "$TAG Conversation [$id] is with participant [${firstParticipant?.address?.asStringUriOnly()}]"
+                )
+            }
+            firstParticipant?.address ?: chatRoom.peerAddress
+        }
+
+        if (isGroup) {
+            if (avatarModel.value == null || avatarModel.value?.contactName != chatRoom.subjectUtf8) {
+                val fakeFriend = coreContext.core.createFriend()
+                fakeFriend.name = chatRoom.subjectUtf8
+                val model = ContactAvatarModel(fakeFriend)
+                model.defaultToConversationIcon.postValue(true)
+                model.updateSecurityLevelUsingConversation(chatRoom)
+                avatarModel.postValue(model)
+            }
+        } else {
+            val model = coreContext.contactsManager.getContactAvatarModelForAddress(address)
+            val oldModel = avatarModel.value
+            // ContactsManager can replace avatar models after a contacts refresh. Reuse the
+            // new instance even when its visible fields match, so this conversation observes
+            // the Friend listener that will receive future presence updates.
+            if (oldModel !== model || !model.compare(oldModel)) {
+                avatarModel.postValue(model)
+            }
+        }
+    }
+
+    @WorkerThread
+    private fun computeComposingLabel() {
+        val names = remoteComposingState.participantNamesOrNull()
+        if (names != null) {
+            updateComposingLabel(names)
+            return
+        }
+
+        val composing = chatRoom.isRemoteComposing
+        isComposing.postValue(composing)
+        val pair = LinphoneUtils.getComposingIconAndText(chatRoom)
+        val icon = pair.first
+        composingIcon.postValue(icon)
+        val label = pair.second
+        composingLabel.postValue(label)
+    }
+
+    @WorkerThread
+    private fun updateComposingLabel(names: List<String>) {
+        val isActive = names.isNotEmpty()
+        isComposing.postValue(isActive)
+        composingIcon.postValue(if (isActive) R.drawable.chat_teardrop_dots else 0)
+        composingLabel.postValue(
+            if (isActive) {
+                AppUtils.getStringWithPlural(
+                    R.plurals.conversation_composing_label,
+                    names.size,
+                    names.joinToString(", ")
+                )
+            } else {
+                ""
+            }
+        )
+    }
+}

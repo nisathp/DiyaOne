@@ -1,0 +1,573 @@
+package com.naminfo.ui.main.contacts.fragment
+
+import android.app.Dialog
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.os.Bundle
+import android.provider.ContactsContract
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.annotation.UiThread
+import androidx.lifecycle.ViewModelProvider
+import androidx.navigation.fragment.findNavController
+import androidx.navigation.fragment.navArgs
+import com.google.android.material.bottomsheet.BottomSheetDialogFragment
+import com.naminfo.DiyaOneApplication.Companion.coreContext
+import com.naminfo.DiyaOneApplication.Companion.corePreferences
+import com.naminfo.R
+import org.linphone.core.Factory
+import org.linphone.core.tools.Log
+import com.naminfo.databinding.ContactFragmentBinding
+import com.naminfo.ui.GenericActivity
+import com.naminfo.ui.main.contacts.model.ContactTrustDialogModel
+import com.naminfo.ui.main.contacts.model.NumberOrAddressPickerDialogModel
+import com.naminfo.ui.main.contacts.viewmodel.ContactViewModel
+import com.naminfo.ui.main.fragment.SlidingPaneChildFragment
+import com.naminfo.utils.AppUtils
+import com.naminfo.utils.ConfirmationDialogModel
+import com.naminfo.utils.DialogUtils
+import com.naminfo.utils.Event
+import androidx.core.net.toUri
+import android.widget.Toast
+import android.widget.ArrayAdapter
+import android.widget.LinearLayout
+import android.widget.ListView
+import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
+import com.naminfo.translation.CallLanguage
+import androidx.appcompat.widget.SearchView
+import com.naminfo.ui.main.contacts.viewmodel.ConferenceCallViewModel
+import com.naminfo.ui.main.contacts.viewmodel.ContactsListViewModel
+
+@UiThread
+class ContactFragment : SlidingPaneChildFragment() {
+    companion object {
+        private const val TAG = "[Contact Fragment]"
+    }
+
+    private lateinit var binding: ContactFragmentBinding
+
+    private lateinit var viewModel: ContactViewModel
+
+    private val args: ContactFragmentArgs by navArgs()
+
+    private var numberOrAddressPickerDialog: Dialog? = null
+
+    private var bottomSheetDialog: BottomSheetDialogFragment? = null
+
+    private lateinit var conferenceViewModel: ConferenceCallViewModel
+    private lateinit var contactsListViewModel: ContactsListViewModel
+    private var conferencePicker: AlertDialog? = null
+
+    private data class ConferenceParticipant(
+        val name: String,
+        val number: String
+    )
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        binding = ContactFragmentBinding.inflate(layoutInflater)
+        return binding.root
+    }
+
+    override fun goBack(): Boolean {
+        sharedViewModel.closeSlidingPaneEvent.value = Event(true)
+
+        if (findNavController().currentDestination?.id == R.id.contactFragment) {
+            // If not done this fragment won't be paused, which will cause us issues
+            val action = ContactFragmentDirections.actionContactFragmentToEmptyFragment()
+            findNavController().navigate(action)
+            return true
+        }
+        return false
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        postponeEnterTransition()
+        super.onViewCreated(view, savedInstanceState)
+
+        binding.lifecycleOwner = viewLifecycleOwner
+
+        viewModel = ViewModelProvider(this)[ContactViewModel::class.java]
+        binding.viewModel = viewModel
+        observeToastEvents(viewModel)
+
+        val refKey = args.contactRefKey
+        Log.i("$TAG Looking up for contact with ref key [$refKey]")
+        viewModel.findContact(sharedViewModel.displayedFriend, refKey)
+
+        conferenceViewModel =
+            ViewModelProvider(this)[ConferenceCallViewModel::class.java]
+
+        contactsListViewModel =
+            ViewModelProvider(requireActivity())[ContactsListViewModel::class.java]
+
+        viewModel.selectConferenceContactsEvent.observe(viewLifecycleOwner) { event ->
+            event.consume { video ->
+                if (conferenceViewModel.inProgress.value != true) {
+                    showConferenceContactPicker(video)
+                } else {
+                    Toast.makeText(
+                        requireContext(),
+                        "Conference request is already in progress",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+
+        conferenceViewModel.errorEvent.observe(viewLifecycleOwner) { event ->
+            event.consume { message ->
+                Toast.makeText(
+                    requireContext(),
+                    message,
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+
+        binding.setBackClickListener {
+            goBack()
+        }
+
+        binding.setDeleteClickListener {
+            showDeleteConfirmationDialog()
+        }
+
+        binding.setGoToSharedMediaClickListener {
+            if (findNavController().currentDestination?.id == R.id.contactFragment) {
+                val conversationId = viewModel.existingConversationId.value.orEmpty()
+                Log.i("$TAG Going to shared media fragment for conversation [$conversationId]")
+                val action = ContactFragmentDirections.actionContactFragmentToConversationMediaListFragment(conversationId)
+                findNavController().navigate(action)
+            }
+        }
+
+        binding.setGoToSharedDocumentsClickListener {
+            if (findNavController().currentDestination?.id == R.id.contactFragment) {
+                val conversationId = viewModel.existingConversationId.value.orEmpty()
+                Log.i("$TAG Going to shared documents fragment for conversation [$conversationId]")
+                val action = ContactFragmentDirections.actionContactFragmentToConversationDocumentsListFragment(conversationId)
+                findNavController().navigate(action)
+            }
+        }
+
+        sharedViewModel.isSlidingPaneSlideable.observe(viewLifecycleOwner) { slideable ->
+            viewModel.showBackButton.value = slideable
+        }
+
+        viewModel.contactFoundEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                Log.i("$TAG Contact has been found, start postponed enter transition")
+                startPostponedEnterTransition()
+                sharedViewModel.openSlidingPaneEvent.value = Event(true)
+            }
+        }
+
+        viewModel.showLongPressMenuForNumberOrAddressEvent.observe(viewLifecycleOwner) {
+            it.consume { model ->
+                val modalBottomSheet = ContactNumberOrAddressMenuDialogFragment(model.isSip, model.hasPresence, {
+                    // onDismiss
+                    model.selected.value = false
+                }, {
+                    // onCopyNumberOrAddressToClipboard
+                    copyNumberOrAddressToClipboard(model.displayedValue, model.isSip)
+                }, {
+                    // onInviteNumberOrAddress
+                    inviteContactBySms(model.displayedValue)
+                })
+
+                modalBottomSheet.show(
+                    parentFragmentManager,
+                    ContactNumberOrAddressMenuDialogFragment.TAG
+                )
+                bottomSheetDialog = modalBottomSheet
+            }
+        }
+
+        viewModel.showNumberOrAddressPickerDialogEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                val model = NumberOrAddressPickerDialogModel(
+                    viewModel.sipAddressesAndPhoneNumbers.value.orEmpty()
+                )
+                val dialog = DialogUtils.getNumberOrAddressPickerDialog(requireActivity(), model)
+                numberOrAddressPickerDialog = dialog
+
+                model.dismissEvent.observe(viewLifecycleOwner) { event ->
+                    event.consume {
+                        dialog.dismiss()
+                    }
+                }
+
+                dialog.show()
+            }
+        }
+
+        viewModel.openNativeContactEditor.observe(viewLifecycleOwner) {
+            it.consume { uri ->
+                try {
+                    val editIntent = Intent(Intent.ACTION_EDIT).apply {
+                        setDataAndType(uri.toUri(), ContactsContract.Contacts.CONTENT_ITEM_TYPE)
+                        putExtra("finishActivityOnSaveCompleted", true)
+                    }
+                    startActivity(editIntent)
+                } catch (anfe: ActivityNotFoundException) {
+                    Log.e("$TAG Failed to open native contact editor with URI [$uri]: $anfe")
+                }
+            }
+        }
+
+        viewModel.openLinphoneContactEditor.observe(viewLifecycleOwner) {
+            it.consume { refKey ->
+                if (findNavController().currentDestination?.id == R.id.contactFragment) {
+                    val action =
+                        ContactFragmentDirections.actionContactFragmentToEditContactFragment(
+                            refKey
+                        )
+                    findNavController().navigate(action)
+                }
+            }
+        }
+
+        viewModel.showTCallLanguageDialogEvent.observe(viewLifecycleOwner) { event ->
+            event.consume { address ->
+                showTCallLanguageDialog { language ->
+                    viewModel.selectTCallLanguage(language, address)
+                }
+            }
+        }
+
+        viewModel.goToConversationEvent.observe(viewLifecycleOwner) {
+            it.consume { conversationId ->
+                Log.i("$TAG Going to conversation [$conversationId]")
+                sharedViewModel.showConversationEvent.value = Event(conversationId)
+                sharedViewModel.navigateToConversationsEvent.value = Event(true)
+            }
+        }
+
+        viewModel.displayTrustProcessDialogEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                showTrustProcessDialog()
+            }
+        }
+
+        viewModel.startCallToDeviceToIncreaseTrustEvent.observe(viewLifecycleOwner) {
+            it.consume { triple ->
+                callDirectlyOrShowConfirmTrustCallDialog(triple.first, triple.second, triple.third)
+            }
+        }
+
+        viewModel.contactRemovedEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                Log.w(
+                    "$TAG Contact [${viewModel.contact.value?.name?.value}] has been deleted"
+                )
+
+                val message = getString(R.string.contact_deleted_toast)
+                val icon = R.drawable.check
+                (requireActivity() as GenericActivity).showGreenToast(message, icon)
+
+                goBack()
+            }
+        }
+    }
+
+    private fun showConferenceContactPicker(video: Boolean) {
+        if (conferencePicker?.isShowing == true) return
+
+        // Use the existing matched contact list.
+        // Mobion contacts have ref keys in the form "mobion:9876543210".
+        val participants = contactsListViewModel.contactsList.value
+            .orEmpty()
+            .mapNotNull { model ->
+                if (!model.id.startsWith("mobion:")) {
+                    return@mapNotNull null
+                }
+
+                val number = model.id.removePrefix("mobion:").trim()
+                if (number.isEmpty()) return@mapNotNull null
+
+                ConferenceParticipant(
+                    name = model.contactName.orEmpty().ifBlank { number },
+                    number = number
+                )
+            }
+            .distinctBy { it.number }
+            .sortedBy { it.name.lowercase() }
+
+        if (participants.isEmpty()) {
+            Toast.makeText(
+                requireContext(),
+                "No contacts available. Wait for contacts to load or clear the contact search.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        val selectedNumbers = mutableSetOf<String>()
+        var visibleParticipants = participants
+        val pickerContext = requireContext()
+        val density = resources.displayMetrics.density
+        val content = LinearLayout(pickerContext).apply {
+            orientation = LinearLayout.VERTICAL
+            val padding = (16 * density).toInt()
+            setPadding(padding, 0, padding, 0)
+        }
+        val search = SearchView(pickerContext).apply {
+            setIconifiedByDefault(false)
+            queryHint = getString(R.string.conference_participant_search_hint)
+        }
+        val participantAdapter = ArrayAdapter(
+            pickerContext,
+            android.R.layout.simple_list_item_multiple_choice,
+            participants.map { "${it.name}\n${it.number}" }.toMutableList()
+        )
+        val participantList = ListView(pickerContext).apply {
+            choiceMode = ListView.CHOICE_MODE_MULTIPLE
+            adapter = participantAdapter
+        }
+        val emptyResults = TextView(pickerContext).apply {
+            text = getString(R.string.conference_participant_search_empty)
+            gravity = android.view.Gravity.CENTER
+            visibility = View.GONE
+        }
+        content.addView(search)
+        val listHeight = minOf((320 * density).toInt(), resources.displayMetrics.heightPixels / 2)
+        content.addView(participantList, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, listHeight))
+        content.addView(emptyResults, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, listHeight))
+        participantList.emptyView = emptyResults
+
+        participantList.setOnItemClickListener { _, _, position, _ ->
+            val number = visibleParticipants[position].number
+            if (participantList.isItemChecked(position)) {
+                selectedNumbers.add(number)
+            } else {
+                selectedNumbers.remove(number)
+            }
+        }
+        search.setOnQueryTextListener(object : SearchView.OnQueryTextListener {
+            override fun onQueryTextSubmit(query: String?): Boolean {
+                search.clearFocus()
+                return true
+            }
+
+            override fun onQueryTextChange(newText: String?): Boolean {
+                val query = newText.orEmpty().trim()
+                visibleParticipants = participants.filter {
+                    it.name.contains(query, ignoreCase = true) || it.number.contains(query)
+                }
+                participantAdapter.setNotifyOnChange(false)
+                participantAdapter.clear()
+                participantAdapter.addAll(visibleParticipants.map { "${it.name}\n${it.number}" })
+                participantAdapter.notifyDataSetChanged()
+                participantList.clearChoices()
+                visibleParticipants.forEachIndexed { index, participant ->
+                    participantList.setItemChecked(index, participant.number in selectedNumbers)
+                }
+                return true
+            }
+        })
+
+        val dialog = AlertDialog.Builder(requireContext())
+            .setTitle(
+                if (video) {
+                    "Select video conference users"
+                } else {
+                    "Select audio conference users"
+                }
+            )
+            .setView(content)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Call", null)
+            .create()
+
+        conferencePicker = dialog
+
+        dialog.setOnDismissListener {
+            conferencePicker = null
+        }
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener {
+                    val selectedParticipants = participants.filter {
+                        it.number in selectedNumbers
+                    }
+
+                    if (selectedParticipants.isEmpty()) {
+                        Toast.makeText(
+                            requireContext(),
+                            "Select at least one contact",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        return@setOnClickListener
+                    }
+
+                    if (conferenceViewModel.inProgress.value == true) {
+                        return@setOnClickListener
+                    }
+
+                    conferenceViewModel.sendToConnect(
+                        selectedNumbers = selectedParticipants.map { it.number },
+                        video = video
+                    )
+                    dialog.dismiss()
+
+                    Toast.makeText(
+                        requireContext(),
+                        "Preparing conference…",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+        }
+
+        dialog.show()
+        search.clearFocus()
+    }
+
+    override fun onPause() {
+        super.onPause()
+
+        numberOrAddressPickerDialog?.dismiss()
+        numberOrAddressPickerDialog = null
+
+        bottomSheetDialog?.dismiss()
+        bottomSheetDialog = null
+
+        conferencePicker?.dismiss()
+        conferencePicker = null
+    }
+
+    private fun showTCallLanguageDialog(onLanguageSelected: (CallLanguage) -> Unit) {
+        val languages = CallLanguage.entries.filter { it != CallLanguage.NONE }
+        AlertDialog.Builder(requireContext())
+            .setTitle(R.string.t_call_select_language_title)
+            .setItems(languages.map { it.label }.toTypedArray()) { dialog, which ->
+                languages.getOrNull(which)?.let(onLanguageSelected)
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
+    }
+
+    private fun copyNumberOrAddressToClipboard(value: String, isSip: Boolean) {
+        val resourceId = if (isSip) R.string.sip_address else R.string.phone_number
+        val label = AppUtils.getString(resourceId)
+        if (AppUtils.copyToClipboard(requireContext(), label, value)) {
+            val message = if (isSip) {
+                getString(R.string.sip_address_copied_to_clipboard_toast)
+            } else {
+                getString(R.string.contact_details_phone_number_copied_to_clipboard_toast)
+            }
+            (requireActivity() as GenericActivity).showGreenToast(message, R.drawable.check)
+        }
+    }
+
+    private fun inviteContactBySms(number: String) {
+        Log.i("$TAG Sending SMS to [$number]")
+
+        val smsBody = getString(
+            R.string.contact_sms_invite_content,
+            getString(R.string.website_download_url)
+        )
+        val smsIntent: Intent = Intent().apply {
+            action = Intent.ACTION_SENDTO
+            data = "smsto:$number".toUri()
+            putExtra("address", number)
+            putExtra("sms_body", smsBody)
+        }
+        try {
+            startActivity(smsIntent)
+        } catch (anfe: ActivityNotFoundException) {
+            Log.e("$TAG Failed to start SMS intent: $anfe")
+        }
+    }
+
+    private fun showTrustProcessDialog() {
+        val initials = viewModel.contact.value?.initials?.value.orEmpty()
+        val picture = viewModel.contact.value?.picturePath?.value.orEmpty()
+        val model = ContactTrustDialogModel(initials, picture)
+        val dialog = DialogUtils.getContactTrustProcessExplanationDialog(requireActivity(), model)
+        dialog.show()
+    }
+
+    private fun callDirectlyOrShowConfirmTrustCallDialog(contactName: String, deviceName: String, deviceSipUri: String) {
+        coreContext.postOnCoreThread {
+            if (corePreferences.showDialogWhenCallingDeviceUuidDirectly) {
+                coreContext.postOnMainThread {
+                    showConfirmTrustCallDialog(contactName, deviceName, deviceSipUri)
+                }
+            } else {
+                val address = Factory.instance().createAddress(deviceSipUri)
+                if (address != null) {
+                    coreContext.startCall(address, forceZRTP = true)
+                }
+            }
+        }
+    }
+
+    private fun showConfirmTrustCallDialog(contactName: String, deviceName: String, deviceSipUri: String) {
+        val label = AppUtils.getFormattedString(
+            R.string.contact_dialog_increase_trust_level_message,
+            contactName,
+            deviceName
+        )
+        val model = ConfirmationDialogModel(label)
+        val dialog = DialogUtils.getContactTrustCallConfirmationDialog(requireActivity(), model)
+
+        model.dismissEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                dialog.dismiss()
+            }
+        }
+
+        model.confirmEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                coreContext.postOnCoreThread {
+                    if (model.doNotShowAnymore.value == true) {
+                        corePreferences.showDialogWhenCallingDeviceUuidDirectly = false
+                    }
+
+                    val address = Factory.instance().createAddress(deviceSipUri)
+                    if (address != null) {
+                        coreContext.startCall(address, forceZRTP = true)
+                    }
+                }
+                dialog.dismiss()
+            }
+        }
+
+        dialog.show()
+    }
+
+    private fun showDeleteConfirmationDialog() {
+        val model = ConfirmationDialogModel()
+        val dialog = DialogUtils.getDeleteContactConfirmationDialog(
+            requireActivity(),
+            model,
+            viewModel.contact.value?.name?.value ?: ""
+        )
+
+        model.dismissEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                dialog.dismiss()
+            }
+        }
+
+        model.confirmEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                Log.w(
+                    "$TAG Deleting contact [${viewModel.contact.value?.name?.value}]"
+                )
+                viewModel.deleteContact()
+                dialog.dismiss()
+            }
+        }
+
+        dialog.show()
+    }
+}
