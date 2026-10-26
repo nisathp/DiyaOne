@@ -1,1 +1,0 @@
-Linphone - open source SIP client
