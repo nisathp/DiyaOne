@@ -547,7 +547,22 @@ class ContactsManager
             return found
         }
 
-        val username = address.username
+        val rawUsername = address.username.orEmpty()
+        val cleanUsername = rawUsername
+            .replace(Regex("^(T_|tac_|tvc_)", RegexOption.IGNORE_CASE), "")
+            .trim()
+
+        if (cleanUsername != rawUsername) {
+            val clone = address.clone()
+            clone.username = cleanUsername
+            val foundClean = coreContext.core.findFriend(clone)
+            if (foundClean != null) {
+                Log.i("$TAG Found friend [${foundClean.name}] matching clean SIP address [${clone.asStringUriOnly()}]")
+                return foundClean
+            }
+        }
+
+        val username = cleanUsername
         val sipUri = LinphoneUtils.getAddressAsCleanStringUriOnly(address)
         // Start an async query in Magic Search in case LDAP or remote CardDAV is configured
         val remoteContactDirectories = coreContext.core.remoteContactDirectories
@@ -571,7 +586,7 @@ class ContactsManager
             )
         }
 
-        return if (!username.isNullOrEmpty() && (username.startsWith("+") || username.isDigitsOnly())) {
+        return if (username.isNotEmpty() && (username.startsWith("+") || username.isDigitsOnly())) {
             Log.i("$TAG Looking for friend using phone number [$username]")
             val foundUsingPhoneNumber = coreContext.core.findFriendByPhoneNumber(username)
             if (foundUsingPhoneNumber != null) {
