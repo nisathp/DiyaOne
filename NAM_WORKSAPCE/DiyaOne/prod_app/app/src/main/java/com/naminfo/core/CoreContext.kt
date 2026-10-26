@@ -415,6 +415,7 @@ class CoreContext
                     }
                 }
                 Call.State.OutgoingInit -> {
+                    Log.i("[Call Diagnostics] OUTGOING STATE -> OutgoingInit (Call initialized)")
                     LinphoneUtils.rememberOutgoingCallMedia(call)
                     val conferenceInfo = core.findConferenceInformationFromUri(call.remoteAddress)
                     // Do not show outgoing call view for conference calls, wait for connected state
@@ -428,7 +429,18 @@ class CoreContext
                         )
                     }
                 }
-                Call.State.OutgoingRinging, Call.State.OutgoingEarlyMedia -> {
+                Call.State.OutgoingProgress -> {
+                    Log.i("[Call Diagnostics] OUTGOING STATE -> OutgoingProgress (Connecting to server / waiting for ringing - Scenario 1)")
+                }
+                Call.State.OutgoingRinging -> {
+                    Log.i("[Call Diagnostics] OUTGOING STATE -> OutgoingRinging (Received 180 Ringing from server - Scenario 2)")
+                    if (corePreferences.routeAudioToBluetoothWhenPossible) {
+                        Log.i("$TAG Trying to route audio to either bluetooth, hearing aid, headphones or headset if available")
+                        AudioUtils.routeAudioToAnyConnectedAudioDeviceOtherThanEarpieceAndSpeaker(call)
+                    }
+                }
+                Call.State.OutgoingEarlyMedia -> {
+                    Log.i("[Call Diagnostics] OUTGOING STATE -> OutgoingEarlyMedia (Received 183 Early Media with RTP audio - Scenario 3)")
                     if (corePreferences.routeAudioToBluetoothWhenPossible) {
                         Log.i("$TAG Trying to route audio to either bluetooth, hearing aid, headphones or headset if available")
                         AudioUtils.routeAudioToAnyConnectedAudioDeviceOtherThanEarpieceAndSpeaker(call)

@@ -106,7 +106,7 @@ class HistoryListAdapter :
                 SUGGESTION_TYPE
             }
         } catch (ioobe: IndexOutOfBoundsException) {
-            Log.d(TAG, "getItemViewType: ")
+            Log.d("TAG", "getItemViewType: ")
         }
         return CALL_LOG_TYPE
     }
