@@ -96,6 +96,19 @@
             app:layout_constraintBottom_toBottomOf="@id/date_time" />
 
         <ImageView
+            android:id="@+id/t_call_icon"
+            android:layout_width="16dp"
+            android:layout_height="16dp"
+            android:layout_marginStart="6dp"
+            android:src="@drawable/ic_t_call"
+            android:contentDescription="@null"
+            android:visibility="@{model.isTCall ? View.VISIBLE : View.GONE}"
+            app:tint="?attr/color_main2_500"
+            app:layout_constraintStart_toEndOf="@id/call_media_type"
+            app:layout_constraintTop_toTopOf="@id/date_time"
+            app:layout_constraintBottom_toBottomOf="@id/date_time" />
+
+        <ImageView
             android:onClick="@{onCallClickListener}"
             android:id="@+id/call"
             android:layout_width="@dimen/large_icon_size"

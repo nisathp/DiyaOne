@@ -53,7 +53,6 @@ class CoreContext
     constructor(val context: Context) : HandlerThread("Core Thread") {
     companion object {
         private const val TAG = "[Core Context]"
-        private const val FREE_SWITCH_DOMAIN = "192.168.1.82"
     }
 
     lateinit var core: Core
@@ -1206,12 +1205,16 @@ class CoreContext
         } else {
             address
         }
+        val activeServerDomain = params.account?.params?.domain
+            ?: corePreferences.thirdPartySipAccountDefaultDomain
+                .removePrefix("sips:").removePrefix("sip:").substringBefore(":")
+
         // The local FreeSWITCH profile requires SDES-SRTP. Apply this to calls
         // sent to that server only, without changing media encryption for other SIP accounts.
-        if (!forceZRTP && destination.domain.equals(FREE_SWITCH_DOMAIN, ignoreCase = true)) {
+        if (!forceZRTP && destination.domain.equals(activeServerDomain, ignoreCase = true)) {
             params.mediaEncryption = MediaEncryption.SRTP
             params.srtpSuites = arrayOf(SrtpSuite.AESCM128HMACSHA180)
-            Log.i("$TAG Offering SDES-SRTP for FreeSWITCH call")
+            Log.i("$TAG Offering SDES-SRTP for FreeSWITCH call on domain [$activeServerDomain]")
         }
         params.recordFile = LinphoneUtils.getRecordingFilePathForAddress(destination)
         Log.i(
