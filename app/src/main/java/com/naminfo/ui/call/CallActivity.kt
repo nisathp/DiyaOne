@@ -14,6 +14,7 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.UiThread
+import androidx.appcompat.app.AlertDialog
 import androidx.core.app.ActivityCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -36,6 +37,8 @@ import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.compatibility.Api28Compatibility
 import com.naminfo.compatibility.Compatibility
+import com.naminfo.translation.CallLanguage
+import org.linphone.core.Call
 import org.linphone.core.tools.Log
 import com.naminfo.databinding.CallActivityBinding
 import com.naminfo.telecom.RedirectionHandler
@@ -251,6 +254,12 @@ class CallActivity : GenericActivity() {
             it.consume {
                 Log.w("$TAG Asking for RECORD_AUDIO permission before answering incoming call")
                 requestRecordAudioPermissionToAnswerLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        }
+
+        callViewModel.showIncomingTCallLanguageDialogEvent.observe(this) {
+            it.consume { call ->
+                showIncomingTCallLanguageDialog(call)
             }
         }
 
@@ -627,6 +636,20 @@ class CallActivity : GenericActivity() {
         val modalBottomSheet = AudioDevicesMenuDialogFragment(devicesList)
         modalBottomSheet.show(supportFragmentManager, AudioDevicesMenuDialogFragment.TAG)
         bottomSheetDialog = modalBottomSheet
+    }
+
+    private fun showIncomingTCallLanguageDialog(call: Call) {
+        val languages = CallLanguage.entries.filter { it != CallLanguage.NONE }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.t_call_select_language_title)
+            .setItems(languages.map { it.label }.toTypedArray()) { dialog, which ->
+                languages.getOrNull(which)?.let { language ->
+                    callViewModel.selectIncomingTCallLanguageAndAnswer(call, language)
+                }
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
     }
 
     private fun showConferenceLayoutMenu() {

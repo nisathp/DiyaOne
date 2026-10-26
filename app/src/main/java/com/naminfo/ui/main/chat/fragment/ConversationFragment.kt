@@ -266,6 +266,7 @@ open class ConversationFragment : SlidingPaneChildFragment() {
         val options = arrayOf(
             globalLabel,
             getString(R.string.translation_language_tamil),
+            getString(R.string.translation_language_telugu),
             getString(R.string.translation_language_english),
             getString(R.string.translation_language_hindi),
             getString(R.string.translation_language_chinese),
@@ -275,11 +276,12 @@ open class ConversationFragment : SlidingPaneChildFragment() {
 
         val selectedIndex = when (currentOverride?.uppercase()) {
             "TA" -> 1
-            "EN" -> 2
-            "HI" -> 3
-            "ZH" -> 4
-            "AR" -> 5
-            "ES" -> 6
+            "TE" -> 2
+            "EN" -> 3
+            "HI" -> 4
+            "ZH" -> 5
+            "AR" -> 6
+            "ES" -> 7
             else -> 0
         }
 
@@ -288,11 +290,12 @@ open class ConversationFragment : SlidingPaneChildFragment() {
             .setSingleChoiceItems(options, selectedIndex) { dialog, which ->
                 val newCode = when (which) {
                     1 -> "TA"
-                    2 -> "EN"
-                    3 -> "HI"
-                    4 -> "ZH"
-                    5 -> "AR"
-                    6 -> "ES"
+                    2 -> "TE"
+                    3 -> "EN"
+                    4 -> "HI"
+                    5 -> "ZH"
+                    6 -> "AR"
+                    7 -> "ES"
                     else -> null
                 }
                 viewModel.setContactTranslationOverride(newCode)
@@ -331,7 +334,8 @@ open class ConversationFragment : SlidingPaneChildFragment() {
                 }
             }
 
-            sendMessageViewModel.notifyComposing(editable.toString().isNotEmpty())
+            sendMessageViewModel.saveComposerDraft(editable?.toString().orEmpty())
+            sendMessageViewModel.notifyComposing(editable?.isNotEmpty() == true)
         }
     }
 
@@ -1067,6 +1071,17 @@ open class ConversationFragment : SlidingPaneChildFragment() {
             }
         }
 
+        viewModel.historyClearedEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                sharedViewModel.updateConversationLastMessageEvent.value = Event(viewModel.conversationId)
+                sharedViewModel.forceRefreshDisplayedConversationEvent.value = Event(true)
+                (requireActivity() as GenericActivity).showGreenToast(
+                    getString(R.string.conversation_info_history_deleted_toast),
+                    R.drawable.chat_teardrop_text
+                )
+            }
+        }
+
         sharedViewModel.newChatMessageEphemeralLifetimeToSetEvent.observe(viewLifecycleOwner) {
             it.consume { ephemeralLifetime ->
                 Log.i(
@@ -1364,9 +1379,35 @@ open class ConversationFragment : SlidingPaneChildFragment() {
             showContactTranslationDialog()
         }
 
+        popupView.setClearMessagesClickListener {
+            popupWindow.dismiss()
+            showClearMessagesConfirmationDialog()
+        }
+
         // Elevation is for showing a shadow around the popup
         popupWindow.elevation = 20f
         popupWindow.showAsDropDown(view, 0, 0, Gravity.BOTTOM)
+    }
+
+    private fun showClearMessagesConfirmationDialog() {
+        val model = ConfirmationDialogModel()
+        val dialog = DialogUtils.getDeleteConversationHistoryConfirmationDialog(
+            requireActivity(),
+            model
+        )
+
+        model.dismissEvent.observe(viewLifecycleOwner) {
+            it.consume { dialog.dismiss() }
+        }
+
+        model.confirmEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                viewModel.clearMessageHistory()
+                dialog.dismiss()
+            }
+        }
+
+        dialog.show()
     }
 
     @UiThread

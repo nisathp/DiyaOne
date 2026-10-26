@@ -65,6 +65,100 @@ object CustomImdn {
     fun isReceipt(message: ChatMessage?): Boolean =
         message?.utf8Text?.startsWith(RECEIPT_PREFIX) == true
 
+    fun isHiddenControlMessage(message: ChatMessage?): Boolean =
+        isReceipt(message) || CustomComposing.isControlMessage(message)
+
+    fun visibleUnreadMessagesCount(room: ChatRoom): Int =
+        visibleUnreadMessagesCount(room.unreadHistory.asIterable())
+
+    internal fun visibleUnreadMessagesCount(messages: Iterable<ChatMessage?>): Int {
+        val seenIds = mutableSetOf<String>()
+        return messages.count { message ->
+            if (message == null || message.isRead || message.isOutgoing ||
+                isHiddenControlMessage(message)
+            ) {
+                false
+            } else {
+                val id = stableMessageId(message)
+                id == null || seenIds.add(id)
+            }
+        }
+    }
+
+    private fun stableMessageId(message: ChatMessage): String? =
+        validId(metadata(message).optString("id"))
+            ?: validId(message.getCustomHeader(HEADER))
+
+    /**
+     * FreeSWITCH can fan one SIP MESSAGE out as multiple requests with distinct
+     * Call-IDs. Keep one incoming history entry for the stable app message ID.
+     * Call on the core thread, before processing receipts for a new message.
+     */
+    fun removeDuplicateIncomingMessages(room: ChatRoom) {
+        if (!supported(room)) return
+
+        val byStableId = room.getHistoryMessageEvents(0)
+            .asSequence()
+            .mapNotNull { it.chatMessage }
+            .filter { !it.isOutgoing && !isReceipt(it) }
+            .mapNotNull { message -> stableMessageId(message)?.let { it to message } }
+            .groupBy({ it.first }, { it.second })
+
+        for ((stableId, messages) in byStableId) {
+            if (messages.size < 2) continue
+
+            val canonical = messages.minWithOrNull(
+                compareBy<ChatMessage> { it.time }.thenBy { it.messageId }
+            ) ?: continue
+            for (duplicate in messages) {
+                if (duplicate.messageId != canonical.messageId) {
+                    Log.w(
+                        "[Custom IMDN] Removing duplicate incoming message " +
+                            "id=$stableId sipId=${duplicate.messageId}"
+                    )
+                    room.deleteMessage(duplicate)
+                }
+            }
+        }
+    }
+
+    /** Returns true when the message being received is an already stored duplicate. */
+    private fun removeDuplicateIncomingMessage(
+        room: ChatRoom,
+        incoming: ChatMessage,
+        stableId: String
+    ): Boolean {
+        val messages = room.getHistoryMessageEvents(0)
+            .asSequence()
+            .mapNotNull { it.chatMessage }
+            .filter { !it.isOutgoing && !isReceipt(it) && stableMessageId(it) == stableId }
+            .toList()
+
+        val incomingIsStored = messages.any { it.messageId == incoming.messageId }
+        if (!incomingIsStored) {
+            // The current callback can race history persistence. If another SIP
+            // event with this stable ID is already stored, this callback is a duplicate.
+            return messages.isNotEmpty()
+        }
+
+        if (messages.size < 2) return false
+
+        val canonical = messages.minWithOrNull(
+            compareBy<ChatMessage> { it.time }.thenBy { it.messageId }
+        ) ?: return false
+
+        for (duplicate in messages) {
+            if (duplicate.messageId != canonical.messageId) {
+                Log.w(
+                    "[Custom IMDN] Removing duplicate incoming message " +
+                        "id=$stableId sipId=${duplicate.messageId}"
+                )
+                room.deleteMessage(duplicate)
+            }
+        }
+        return incoming.messageId != canonical.messageId
+    }
+
     /**
      * Call before sending an original message.
      * Reuses its ID when the same message is retried.
@@ -128,9 +222,19 @@ object CustomImdn {
             return
         }
 
-        val messageId = validId(message.getCustomHeader(HEADER))
+        val messageId = stableMessageId(message)
         if (messageId == null) {
             Log.w("[Custom IMDN] Original message has no valid custom ID")
+            return
+        }
+
+        // The history callback may contain multiple SIP transactions created
+        // by one app send. Dedupe before storing metadata or acknowledging it.
+        if (removeDuplicateIncomingMessage(room, message, messageId)) {
+            Log.i(
+                "[Custom IMDN] Ignoring duplicate incoming message " +
+                    "id=$messageId sipId=${message.messageId}"
+            )
             return
         }
 

@@ -7,6 +7,7 @@ enum class ChatTranslationLanguage(
 ) {
     NONE(null, "None", "none"),
     TAMIL("ta", "Tamil", "tamil"),
+    TELUGU("te", "Telugu", "telugu"),
     ENGLISH("en", "English", "english"),
     HINDI("hi", "Hindi", "hindi"),
     CHINESE("zh", "Chinese", "zh-CN"),

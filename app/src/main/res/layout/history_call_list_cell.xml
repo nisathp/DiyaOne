@@ -43,6 +43,25 @@
             app:layout_constraintTop_toTopOf="parent"/>
 
         <androidx.appcompat.widget.AppCompatTextView
+            style="@style/default_text_style_600"
+            android:id="@+id/t_call_badge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:paddingTop="2dp"
+            android:paddingBottom="2dp"
+            android:text="@string/contact_t_call_action"
+            android:textSize="11sp"
+            android:textColor="@android:color/white"
+            android:background="@drawable/shape_squircle_light_blue_background"
+            android:visibility="@{model.isTCall ? View.VISIBLE : View.GONE}"
+            app:layout_constraintStart_toEndOf="@id/direction_label"
+            app:layout_constraintTop_toTopOf="@id/direction_label"
+            app:layout_constraintBottom_toBottomOf="@id/direction_label" />
+
+        <androidx.appcompat.widget.AppCompatTextView
             style="@style/default_text_style_300"
             android:id="@+id/date_time"
             android:layout_width="wrap_content"

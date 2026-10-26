@@ -212,6 +212,35 @@
 
         <androidx.appcompat.widget.AppCompatTextView
             style="@style/settings_title_style"
+            android:id="@+id/call_language_title"
+            android:onClick="@{() -> viewModel.showCallLanguageDialog()}"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:padding="5dp"
+            android:layout_marginStart="16dp"
+            android:layout_marginEnd="10dp"
+            android:layout_marginTop="20dp"
+            android:text="@string/settings_calls_call_language_title"
+            android:background="@drawable/squircle_transparent_button_background"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toStartOf="@id/call_language_value"
+            app:layout_constraintTop_toBottomOf="@id/change_ringtone"/>
+
+        <androidx.appcompat.widget.AppCompatTextView
+            style="@style/settings_subtitle_style"
+            android:id="@+id/call_language_value"
+            android:onClick="@{() -> viewModel.showCallLanguageDialog()}"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="16dp"
+            android:gravity="center"
+            android:text="@{viewModel.selectedCallLanguage.label, default=`None`}"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toTopOf="@id/call_language_title"
+            app:layout_constraintBottom_toBottomOf="@id/call_language_title"/>
+
+        <androidx.appcompat.widget.AppCompatTextView
+            style="@style/settings_title_style"
             android:onClick="@{() -> viewModel.toggleCallRedirectionService()}"
             android:id="@+id/call_redirection_service_title"
             android:visibility="gone"

@@ -33,6 +33,7 @@ import org.linphone.core.Conference
 import org.linphone.core.Friend
 import org.linphone.core.tools.Log
 import com.naminfo.ui.main.model.ConversationContactOrSuggestionModel
+import com.naminfo.ui.main.chat.SingleFlightGate
 import com.naminfo.ui.main.viewmodel.AddressSelectionViewModel
 import com.naminfo.utils.AppUtils
 import com.naminfo.utils.Event
@@ -47,9 +48,14 @@ class ConversationForwardMessageViewModel
 
     val operationInProgress = MutableLiveData<Boolean>()
 
+    override val showAddressSuggestions = false
+
     val chatRoomCreatedEvent: MutableLiveData<Event<String>> by lazy {
         MutableLiveData()
     }
+
+    // Core operations are serialized; keep a pending creation from being requested twice.
+    private val conversationCreationGate = SingleFlightGate()
 
     private val chatRoomListener = object : ChatRoomListenerStub() {
         @WorkerThread
@@ -63,11 +69,13 @@ class ConversationForwardMessageViewModel
             if (state == ChatRoom.State.Created) {
                 Log.i("$TAG Conversation [$id] successfully created")
                 chatRoom.removeListener(this)
+                conversationCreationGate.complete()
                 operationInProgress.postValue(false)
                 chatRoomCreatedEvent.postValue(Event(LinphoneUtils.getConversationId(chatRoom)))
             } else if (state == ChatRoom.State.CreationFailed) {
                 Log.e("$TAG Conversation [$id] creation has failed!")
                 chatRoom.removeListener(this)
+                conversationCreationGate.complete()
                 operationInProgress.postValue(false)
                 showRedToast(R.string.conversation_failed_to_create_toast, R.drawable.warning_circle)
             }
@@ -133,12 +141,18 @@ class ConversationForwardMessageViewModel
 
     @WorkerThread
     fun createOneToOneChatRoomWith(remote: Address) {
+        if (!conversationCreationGate.tryEnter()) {
+            Log.w("$TAG Ignoring duplicate conversation creation request for [${remote.asStringUriOnly()}]")
+            return
+        }
+
         val core = coreContext.core
         val account = core.defaultAccount
         if (account == null) {
             Log.e(
                 "$TAG No default account found, can't create conversation with [${remote.asStringUriOnly()}]!"
             )
+            conversationCreationGate.complete()
             return
         }
 
@@ -150,7 +164,11 @@ class ConversationForwardMessageViewModel
         params.subject = AppUtils.getString(R.string.conversation_one_to_one_hidden_subject)
         params.account = account
 
-        val chatParams = params.chatParams ?: return
+        val chatParams = params.chatParams ?: run {
+            conversationCreationGate.complete()
+            operationInProgress.postValue(false)
+            return
+        }
         chatParams.ephemeralLifetime = 0 // Make sure ephemeral is disabled by default
 
         val sameDomain = remote.domain == corePreferences.defaultDomain && remote.domain == account.params.domain
@@ -176,6 +194,7 @@ class ConversationForwardMessageViewModel
             Log.e(
                 "$TAG Account is in secure mode, can't chat with SIP address of different domain [${remote.asStringUriOnly()}]"
             )
+            conversationCreationGate.complete()
             operationInProgress.postValue(false)
             showRedToast(R.string.conversation_invalid_participant_due_to_security_mode_toast, R.drawable.warning_circle)
             return
@@ -197,6 +216,7 @@ class ConversationForwardMessageViewModel
                     if (chatRoom.state == ChatRoom.State.Created) {
                         val id = LinphoneUtils.getConversationId(chatRoom)
                         Log.i("$TAG 1-1 conversation [$id] has been created")
+                        conversationCreationGate.complete()
                         operationInProgress.postValue(false)
                         chatRoomCreatedEvent.postValue(Event(LinphoneUtils.getConversationId(chatRoom)))
                     } else {
@@ -206,11 +226,13 @@ class ConversationForwardMessageViewModel
                 } else {
                     val id = LinphoneUtils.getConversationId(chatRoom)
                     Log.i("$TAG Conversation successfully created [$id]")
+                    conversationCreationGate.complete()
                     operationInProgress.postValue(false)
                     chatRoomCreatedEvent.postValue(Event(LinphoneUtils.getConversationId(chatRoom)))
                 }
             } else {
                 Log.e("$TAG Failed to create 1-1 conversation with [${remote.asStringUriOnly()}]!")
+                conversationCreationGate.complete()
                 operationInProgress.postValue(false)
                 showRedToast(R.string.conversation_failed_to_create_toast, R.drawable.warning_circle)
             }
@@ -218,6 +240,7 @@ class ConversationForwardMessageViewModel
             Log.w(
                 "$TAG A 1-1 conversation between local account [${localAddress?.asStringUriOnly()}] and remote [${remote.asStringUriOnly()}] for given parameters already exists!"
             )
+            conversationCreationGate.complete()
             operationInProgress.postValue(false)
             chatRoomCreatedEvent.postValue(Event(LinphoneUtils.getConversationId(existingChatRoom)))
         }

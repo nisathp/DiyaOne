@@ -12,6 +12,7 @@ import java.io.FileOutputStream
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.contacts.ContactLoader.Companion.LINPHONE_ADDRESS_BOOK_FRIEND_LIST
 import com.naminfo.translation.ChatTranslationLanguage
+import com.naminfo.translation.CallLanguage
 
 class CorePreferences
     @UiThread
@@ -522,6 +523,16 @@ class CorePreferences
             config.setString("app", "received_chat_translation_language", value.name)
         }
 
+    // Global Call Language Preference
+    var callLanguage: CallLanguage
+        get() {
+            val code = config.getString("app", "call_language", "NONE")
+            return CallLanguage.fromCode(code)
+        }
+        set(value) {
+            config.setString("app", "call_language", value.name)
+        }
+
     // Individual Contact Translation Override
     fun getContactTranslationOverride(conversationId: String): String? {
         val key = "contact_translation_override_${conversationId.replace("[^a-zA-Z0-9_]".toRegex(), "_")}"
@@ -621,18 +632,26 @@ class CorePreferences
             "$TAG Overriding $to by $from asset"
         )
 
-        val outStream = FileOutputStream(outFile)
-        val inFile = context.assets.open(from)
-        val buffer = ByteArray(1024)
-        var length: Int = inFile.read(buffer)
+        try {
+            val outStream = FileOutputStream(outFile)
+            val inFile = context.assets.open(from)
+            val buffer = ByteArray(1024)
+            var length: Int = inFile.read(buffer)
 
-        while (length > 0) {
-            outStream.write(buffer, 0, length)
-            length = inFile.read(buffer)
+            while (length > 0) {
+                outStream.write(buffer, 0, length)
+                length = inFile.read(buffer)
+            }
+
+            inFile.close()
+            outStream.flush()
+            outStream.close()
+        } catch (e: Exception) {
+            android.util.Log.e(
+                context.getString(com.naminfo.R.string.app_name),
+                "$TAG Exception copying asset $from to $to: ${e.message}",
+                e
+            )
         }
-
-        inFile.close()
-        outStream.flush()
-        outStream.close()
     }
 }

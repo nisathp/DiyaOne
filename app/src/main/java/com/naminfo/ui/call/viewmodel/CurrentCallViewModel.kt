@@ -40,6 +40,7 @@ import org.linphone.core.MediaDirection
 import org.linphone.core.MediaEncryption
 import org.linphone.core.SecurityLevel
 import org.linphone.core.tools.Log
+import com.naminfo.translation.CallLanguage
 import com.naminfo.ui.GenericViewModel
 import com.naminfo.ui.call.conference.viewmodel.ConferenceViewModel
 import com.naminfo.ui.call.model.AudioDeviceModel
@@ -177,6 +178,10 @@ class CurrentCallViewModel
         MutableLiveData()
     }
 
+    val showIncomingTCallLanguageDialogEvent: MutableLiveData<Event<Call>> by lazy {
+        MutableLiveData()
+    }
+
     val requestCameraPermission: MutableLiveData<Event<Boolean>> by lazy {
         MutableLiveData()
     }
@@ -269,6 +274,8 @@ class CurrentCallViewModel
 
     lateinit var currentCall: Call
 
+    private val incomingTCallLanguagePrompts = mutableSetOf<String>()
+
     private val contactsListener = object : ContactsListener {
         @WorkerThread
         override fun onContactsLoaded() {
@@ -330,14 +337,20 @@ class CurrentCallViewModel
                 isVideoEnabled.postValue(call.params.isVideoEnabled)
                 updateVideoDirection(call.params.videoDirection)
             } else if (LinphoneUtils.isCallEnding(call.state)) {
-                // If current call is being terminated but there is at least one other call, switch
+                // Linphone may keep the terminating call in core.calls until Released. Do not
+                // mistake that call for another active call, otherwise the call UI can remain
+                // stuck after the remote party hangs up.
                 val core = call.core
-                val callsCount = core.callsNb
+                val otherActiveCalls = core.calls.filter {
+                    it != call && !LinphoneUtils.isCallEnding(it.state, considerReleasedAsEnding = true)
+                }
                 Log.i(
-                    "$TAG Call is being ended, check for another current call (currently [$callsCount] calls)"
+                    "$TAG Call is being ended, found [${otherActiveCalls.size}] other active calls"
                 )
-                if (callsCount > 0) {
-                    val newCurrentCall = core.currentCall ?: core.calls.firstOrNull()
+                if (otherActiveCalls.isNotEmpty()) {
+                    val newCurrentCall = core.currentCall
+                        ?.takeIf { it != call && !LinphoneUtils.isCallEnding(it.state, true) }
+                        ?: otherActiveCalls.firstOrNull()
                     if (newCurrentCall != null) {
                         Log.i(
                             "$TAG From now on current call will be [${newCurrentCall.remoteAddress.asStringUriOnly()}]"
@@ -500,7 +513,7 @@ class CurrentCallViewModel
             messages: Array<out ChatMessage>
         ) {
             val visibleMessages = messages.filter {
-                it != null && !CustomImdn.isReceipt(it)
+                it != null && !CustomImdn.isHiddenControlMessage(it)
             }.toTypedArray()
 
             if (visibleMessages.isEmpty()) return
@@ -509,7 +522,7 @@ class CurrentCallViewModel
                     currentCallConversation = lookupCurrentCallConversation(currentCall)
                 }
                 if (currentCallConversation != null && currentCallConversation == chatRoom) {
-                    val unreadCount = chatRoom.unreadMessagesCount
+                    val unreadCount = CustomImdn.visibleUnreadMessagesCount(chatRoom)
                     Log.i(
                         "$TAG Received [${messages.size}] message(s) for current call conversation, currently [$unreadCount] unread messages"
                     )
@@ -622,6 +635,11 @@ class CurrentCallViewModel
             }
             if (call != null) {
                 Log.i("$TAG Answering call [${call.remoteAddress.asStringUriOnly()}]")
+                if (isTranslationCall(call) && corePreferences.callLanguage == CallLanguage.NONE) {
+                    Log.i("$TAG Asking for preferred language before answering incoming T Call")
+                    showIncomingTCallLanguageDialogEvent.postValue(Event(call))
+                    return@postOnCoreThread
+                }
                 coreContext.answerCall(call)
             } else {
                 Log.e("$TAG No call found in incoming state, can't answer any!")
@@ -643,6 +661,31 @@ class CurrentCallViewModel
         }
 
         answerCallFrom("")
+    }
+
+    @UiThread
+    fun selectIncomingTCallLanguageAndAnswer(call: Call, language: CallLanguage) {
+        corePreferences.callLanguage = language
+        coreContext.postOnCoreThread {
+            if (LinphoneUtils.isCallIncoming(call.state)) {
+                Log.i("$TAG Answering incoming T Call with selected language [${language.code}]")
+                coreContext.answerCall(call)
+            } else {
+                Log.w("$TAG Incoming T Call ended before language selection completed")
+            }
+        }
+    }
+
+    @WorkerThread
+    private fun isTranslationCall(call: Call): Boolean {
+        fun isTranslationUsername(username: String): Boolean =
+            username.startsWith("T_", ignoreCase = true) ||
+                username.startsWith("tac_", ignoreCase = true) ||
+                username.startsWith("tvc_", ignoreCase = true)
+
+        return isTranslationUsername(call.remoteAddress.username.orEmpty()) ||
+            isTranslationUsername(call.toAddress.username.orEmpty()) ||
+            !call.remoteParams?.getCustomHeader("X-User-Language").isNullOrBlank()
     }
 
     @UiThread
@@ -1091,6 +1134,15 @@ class CurrentCallViewModel
 
         terminatedByUser = false
         currentCall = call
+        if (call.dir == Call.Dir.Incoming && LinphoneUtils.isCallIncoming(call.state) && isTranslationCall(call)) {
+            val promptKey = call.callLog.callId?.takeIf { it.isNotBlank() }
+                ?: call.callLog.refKey?.takeIf { it.isNotBlank() }
+                ?: "${call.remoteAddress.asStringUriOnly()}-${System.identityHashCode(call)}"
+            if (incomingTCallLanguagePrompts.add(promptKey)) {
+                Log.i("$TAG Showing language preference for incoming T Call [${call.remoteAddress.asStringUriOnly()}]")
+                showIncomingTCallLanguageDialogEvent.postValue(Event(call))
+            }
+        }
         callStatsModel.update(call, call.audioStats)
         callMediaEncryptionModel.update(call)
         call.addListener(callListener)
@@ -1246,7 +1298,7 @@ class CurrentCallViewModel
         val chatRoom = lookupCurrentCallConversation(call)
         currentCallConversation = chatRoom
         if (chatRoom != null) {
-            val unreadCount = chatRoom.unreadMessagesCount
+            val unreadCount = CustomImdn.visibleUnreadMessagesCount(chatRoom)
             Log.i(
                 "$TAG Found existing 1-1 conversation for current call, currently [$unreadCount] unread messages in existing conversation"
             )

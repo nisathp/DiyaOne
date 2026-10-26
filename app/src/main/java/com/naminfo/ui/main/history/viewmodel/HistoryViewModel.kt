@@ -22,6 +22,7 @@ import com.naminfo.utils.Event
 import com.naminfo.utils.LinphoneUtils
 import com.naminfo.contacts.ContactsManager
 import org.linphone.core.Friend
+import com.naminfo.translation.CallLanguage
 
 class HistoryViewModel
     @UiThread
@@ -188,18 +189,75 @@ class HistoryViewModel
 
     @UiThread
     fun startAudioCall() {
+        Log.i("[Call Diagnostics] HISTORY UI -> Action: [Normal Audio Call]")
         coreContext.postOnCoreThread { core ->
             if (!::address.isInitialized) return@postOnCoreThread
+            Log.i("[Call Diagnostics] HISTORY UI -> Target: [${address.asStringUriOnly()}]")
             coreContext.startAudioCall(address, localAddress = callLocalAddress)
         }
     }
 
     @UiThread
     fun startVideoCall() {
+        Log.i("[Call Diagnostics] HISTORY UI -> Action: [Normal Video Call]")
         coreContext.postOnCoreThread { core ->
             if (!::address.isInitialized) return@postOnCoreThread
+            Log.i("[Call Diagnostics] HISTORY UI -> Target: [${address.asStringUriOnly()}]")
             coreContext.startVideoCall(address, localAddress = callLocalAddress)
         }
+    }
+
+    val showTCallTypeDialogEvent = MutableLiveData<Event<Address>>()
+    val showTCallLanguageDialogEvent = MutableLiveData<Event<Address>>()
+
+    @UiThread
+    fun startTCall() {
+        Log.i("[Call Diagnostics] HISTORY UI -> Action: [T Call Button Clicked]")
+        coreContext.postOnCoreThread { core ->
+            if (!::address.isInitialized) return@postOnCoreThread
+            if (corePreferences.callLanguage == CallLanguage.NONE) {
+                showTCallLanguageDialogEvent.postValue(Event(address))
+            } else {
+                showTCallTypeDialogEvent.postValue(Event(address))
+            }
+        }
+    }
+
+    @UiThread
+    fun selectTCallLanguage(language: CallLanguage, sourceAddress: Address) {
+        corePreferences.callLanguage = language
+        showTCallTypeDialogEvent.postValue(Event(sourceAddress))
+    }
+
+    @UiThread
+    fun startTAudioCall(tAddress: Address) {
+        coreContext.postOnCoreThread {
+            val audioAddress = getTranslationCallAddress(tAddress, "tac_")
+            Log.i("[Call Diagnostics] HISTORY UI -> Action: [T Audio Call Selected], Target: [${audioAddress.asStringUriOnly()}]")
+            coreContext.startAudioCall(audioAddress, localAddress = callLocalAddress)
+        }
+    }
+
+    @UiThread
+    fun startTVideoCall(tAddress: Address) {
+        coreContext.postOnCoreThread {
+            val videoAddress = getTranslationCallAddress(tAddress, "tvc_")
+            Log.i("[Call Diagnostics] HISTORY UI -> Action: [T Video Call Selected], Target: [${videoAddress.asStringUriOnly()}]")
+            coreContext.startVideoCall(videoAddress, localAddress = callLocalAddress)
+        }
+    }
+
+    @WorkerThread
+    private fun getTranslationCallAddress(sourceAddress: Address, prefix: String): Address {
+        val rawUsername = sourceAddress.username.orEmpty()
+        val cleanNumber = rawUsername
+            .replace(Regex("^(T_|tac_|tvc_)", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("^\\+91[\\s-]*"), "")
+            .trim()
+        val domain = sourceAddress.domain.takeIf { !it.isNullOrBlank() }
+            ?: coreContext.core.defaultAccount?.params?.domain.orEmpty()
+        val sipUri = "sip:$prefix$cleanNumber@$domain"
+        return coreContext.core.interpretUrl(sipUri, false) ?: sourceAddress
     }
 
     @UiThread

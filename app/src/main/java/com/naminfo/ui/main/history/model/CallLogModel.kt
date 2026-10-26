@@ -3,6 +3,7 @@ package com.naminfo.ui.main.history.model
 import androidx.annotation.IntegerRes
 import androidx.annotation.UiThread
 import androidx.annotation.WorkerThread
+import androidx.lifecycle.MutableLiveData
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
@@ -38,6 +39,8 @@ class CallLogModel
 
     val isVideoCall: Boolean
 
+    val isTCall: Boolean
+
     @IntegerRes
     val iconResId: Int
 
@@ -46,6 +49,10 @@ class CallLogModel
     val friendRefKey: String?
 
     var friendExists: Boolean = false
+
+    val isSelected = MutableLiveData<Boolean>(false)
+
+    val isSelectionMode = MutableLiveData<Boolean>(false)
 
     val canAddToContacts: Boolean
         get() = !friendExists && !wasConference && !corePreferences.disableAddContact
@@ -72,6 +79,10 @@ class CallLogModel
         } else {
             LinphoneUtils.wasVideoCall(callLog)
         }
+        isTCall = remoteUsername.startsWith("T_", ignoreCase = true) ||
+            remoteUsername.startsWith("tac_", ignoreCase = true) ||
+            remoteUsername.startsWith("tvc_", ignoreCase = true) ||
+            TranslationCallHistoryMetadata.isTranslationCall(coreContext.context, callLog.callId ?: callLog.refKey)
         if (wasConference) {
             val conferenceInfo = callLog.conferenceInfo
             if (conferenceInfo != null && !isCustomConference) {
@@ -101,7 +112,16 @@ class CallLogModel
             friendRefKey = friend.refKey
             friendExists = coreContext.contactsManager.isContactAvailable(friend)
         }
-        displayedAddress = address.username.orEmpty()
+        displayedAddress = when {
+            remoteUsername.startsWith("T_", ignoreCase = true) -> {
+                val phoneNumber = remoteUsername.substringAfter('_')
+                "${if (isVideoCall) "tvc_" else "tac_"}$phoneNumber"
+            }
+            isTCall && !remoteUsername.startsWith("tac_", ignoreCase = true) &&
+                !remoteUsername.startsWith("tvc_", ignoreCase = true) ->
+                "${if (isVideoCall) "tvc_" else "tac_"}$remoteUsername"
+            else -> remoteUsername
+        }
 
         displayedName = if (isCustomConference) {
             AppUtils.getString(
@@ -130,7 +150,10 @@ class CallLogModel
     @UiThread
     fun delete() {
         coreContext.postOnCoreThread { core ->
-            core.removeCallLog(callLog)
+            val logsToRemove = core.callLogs.filter { it.remoteAddress.weakEqual(address) }
+            for (log in logsToRemove) {
+                core.removeCallLog(log)
+            }
         }
     }
 }

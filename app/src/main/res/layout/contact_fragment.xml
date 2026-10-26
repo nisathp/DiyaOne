@@ -248,7 +248,7 @@
                             app:tint="?attr/color_main2_500"
                             app:layout_constraintTop_toTopOf="parent"
                             app:layout_constraintStart_toEndOf="@id/chat"
-                            app:layout_constraintEnd_toEndOf="parent" />
+                            app:layout_constraintEnd_toStartOf="@id/t_call" />
 
                         <androidx.appcompat.widget.AppCompatTextView
                             style="@style/default_text_style"
@@ -267,6 +267,41 @@
                             app:layout_constraintBottom_toBottomOf="parent"
                             app:layout_constraintStart_toStartOf="@id/video_call"
                             app:layout_constraintEnd_toEndOf="@id/video_call"/>
+
+                        <ImageView
+                            android:id="@+id/t_call"
+                            android:onClick="@{() -> viewModel.startTCall()}"
+                            android:visibility="@{viewModel.audioCallDisabled ? View.GONE : View.VISIBLE}"
+                            android:enabled="@{viewModel.atLeastOneSipAddressOrPhoneNumber}"
+                            android:layout_width="56dp"
+                            android:layout_height="56dp"
+                            android:layout_marginTop="10dp"
+                            android:background="@drawable/circle_light_blue_button_background"
+                            android:padding="16dp"
+                            android:src="@drawable/ic_t_call"
+                            android:contentDescription="@string/contact_t_call_action"
+                            app:tint="?attr/color_main2_500"
+                            app:layout_constraintTop_toTopOf="parent"
+                            app:layout_constraintStart_toEndOf="@id/video_call"
+                            app:layout_constraintEnd_toEndOf="parent" />
+
+                        <androidx.appcompat.widget.AppCompatTextView
+                            style="@style/default_text_style"
+                            android:id="@+id/t_call_label"
+                            android:onClick="@{() -> viewModel.startTCall()}"
+                            android:visibility="@{viewModel.audioCallDisabled ? View.GONE : View.VISIBLE}"
+                            android:enabled="@{viewModel.atLeastOneSipAddressOrPhoneNumber}"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginBottom="10dp"
+                            android:layout_marginTop="8dp"
+                            android:text="@string/contact_t_call_action"
+                            android:textSize="14sp"
+                            android:labelFor="@id/t_call"
+                            app:layout_constraintTop_toBottomOf="@id/t_call"
+                            app:layout_constraintBottom_toBottomOf="parent"
+                            app:layout_constraintStart_toStartOf="@id/t_call"
+                            app:layout_constraintEnd_toEndOf="@id/t_call"/>
 
                     </androidx.constraintlayout.widget.ConstraintLayout>
 

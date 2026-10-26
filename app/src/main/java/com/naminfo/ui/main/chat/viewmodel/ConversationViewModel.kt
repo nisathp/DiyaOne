@@ -30,9 +30,12 @@ import com.naminfo.utils.FileUtils
 import com.naminfo.utils.LinphoneUtils
 import androidx.core.net.toUri
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
+import com.naminfo.core.CustomComposing
 import com.naminfo.core.CustomImdn
+import com.naminfo.ui.main.chat.RemoteComposingState
 import com.naminfo.translation.ChatTranslationLanguage
 import com.naminfo.translation.TranslationRepository
+import com.naminfo.utils.AppUtils
 
 class ConversationViewModel
     @UiThread
@@ -119,6 +122,10 @@ class ConversationViewModel
         MutableLiveData()
     }
 
+    val historyClearedEvent: MutableLiveData<Event<Boolean>> by lazy {
+        MutableLiveData()
+    }
+
     val updateEvents: MutableLiveData<Event<Boolean>> by lazy {
         MutableLiveData()
     }
@@ -138,6 +145,22 @@ class ConversationViewModel
     private var latestMatch: EventLog? = null
 
     private var latestMatchModel: MessageModel? = null
+
+    private val remoteComposingState = RemoteComposingState {
+        coreContext.postOnCoreThread { computeComposingLabel() }
+    }
+
+    private val customComposingObserver: (String, String, Boolean) -> Unit = { roomKey, address, active ->
+        coreContext.postOnCoreThread {
+            if (isChatRoomInitialized() && roomKey == CustomComposing.roomKey(chatRoom)) {
+                val parsedAddress = coreContext.core.interpretUrl(address, false)
+                val displayName = parsedAddress?.let { LinphoneUtils.getDisplayName(it) }
+                    ?.takeIf { it.isNotBlank() } ?: address
+                remoteComposingState.update(address, displayName, active)
+                computeComposingLabel()
+            }
+        }
+    }
 
     private val chatRoomListener = object : ChatRoomListenerStub() {
         @WorkerThread
@@ -185,12 +208,15 @@ class ConversationViewModel
 
         @WorkerThread
         override fun onChatMessagesReceived(chatRoom: ChatRoom, eventLogs: Array<EventLog>) {
-            if (eventLogs.all { CustomImdn.isReceipt(it.chatMessage) }) return
-            Log.i("$TAG Received [${eventLogs.size}] new message(s)")
+            val visibleEvents = eventLogs.filterNot {
+                CustomImdn.isHiddenControlMessage(it.chatMessage)
+            }
+            if (visibleEvents.isEmpty()) return
+            Log.i("$TAG Received [${visibleEvents.size}] new message(s)")
             computeComposingLabel()
 
-            unreadMessagesCount.postValue(chatRoom.unreadMessagesCount)
-            addEvents(eventLogs)
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+            addEvents(visibleEvents.toTypedArray())
         }
 
         @WorkerThread
@@ -210,8 +236,13 @@ class ConversationViewModel
             remoteAddress: Address,
             isComposing: Boolean
         ) {
+            val address = remoteAddress.asStringUriOnly()
+            val avatar = coreContext.contactsManager.getContactAvatarModelForAddress(remoteAddress)
+            val name = avatar.name.value?.takeIf { it.isNotBlank() }
+                ?: LinphoneUtils.getDisplayName(remoteAddress)
+            remoteComposingState.update(address, name, isComposing)
             Log.i(
-                "$TAG Remote [${remoteAddress.asStringUriOnly()}] is ${if (isComposing) "composing" else "no longer composing"}"
+                "$TAG Remote [$address] is ${if (isComposing) "composing" else "no longer composing"}"
             )
             computeComposingLabel()
         }
@@ -293,7 +324,7 @@ class ConversationViewModel
                 messageDeletedEvent.postValue(Event(true))
             }
 
-            unreadMessagesCount.postValue(chatRoom.unreadMessagesCount)
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
         }
 
         @WorkerThread
@@ -324,6 +355,7 @@ class ConversationViewModel
         coreContext.postOnCoreThread { core ->
             isEndToEndEncryptionAvailable.postValue(LinphoneUtils.isEndToEndEncryptedChatAvailable(core))
             coreContext.contactsManager.addListener(contactsListener)
+            CustomComposing.addObserver(customComposingObserver)
         }
 
         searchBarVisible.value = false
@@ -341,6 +373,8 @@ class ConversationViewModel
 
         coreContext.postOnCoreThread {
             coreContext.contactsManager.removeListener(contactsListener)
+            CustomComposing.removeObserver(customComposingObserver)
+            remoteComposingState.clear()
             if (isChatRoomInitialized()) {
                 chatRoom.removeListener(chatRoomListener)
             }
@@ -352,6 +386,7 @@ class ConversationViewModel
     override fun beforeNotifyingChatRoomFound(sameOne: Boolean) {
         if (!sameOne) {
             Log.i("$TAG Conversation found and not the same as before, configuring it...")
+            remoteComposingState.clear()
             chatRoom.addListener(chatRoomListener)
             configureChatRoom()
         } else {
@@ -413,7 +448,7 @@ class ConversationViewModel
     fun updateUnreadMessageCount() {
         if (!isChatRoomInitialized()) return
         coreContext.postOnCoreThread {
-            unreadMessagesCount.postValue(chatRoom.unreadMessagesCount)
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
         }
     }
 
@@ -421,6 +456,22 @@ class ConversationViewModel
     fun applyFilter() {
         coreContext.postOnCoreThread {
             computeEvents()
+        }
+    }
+
+    @UiThread
+    fun clearMessageHistory() {
+        coreContext.postOnCoreThread {
+            if (!isChatRoomInitialized()) return@postOnCoreThread
+
+            Log.i("$TAG Clearing local message history for conversation [$conversationId]")
+            chatRoom.deleteHistory()
+            eventsList.forEach(EventLogModel::destroy)
+            eventsList = arrayListOf()
+            updateEvents.postValue(Event(true))
+            isEmpty.postValue(true)
+            unreadMessagesCount.postValue(0)
+            historyClearedEvent.postValue(Event(true))
         }
     }
 
@@ -473,7 +524,7 @@ class ConversationViewModel
         if (!isChatRoomInitialized()) return
 
         coreContext.postOnCoreThread {
-            if (chatRoom.unreadMessagesCount > 0) {
+            if (CustomImdn.visibleUnreadMessagesCount(chatRoom) > 0) {
                 Log.i("$TAG Marking chat room as read")
                 chatRoom.markAsRead()
             }
@@ -626,7 +677,7 @@ class ConversationViewModel
 
         computeConversationInfo()
 
-        unreadMessagesCount.postValue(chatRoom.unreadMessagesCount)
+        unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
         computeEvents()
     }
 
@@ -738,6 +789,7 @@ class ConversationViewModel
         eventsList = list
         updateEvents.postValue(Event(true))
         isEmpty.postValue(eventsList.isEmpty())
+        checkAndTranslateIncomingMessages()
     }
 
     @WorkerThread
@@ -852,7 +904,7 @@ class ConversationViewModel
     ): Array<EventLog> {
         val seen = existing.mapNotNull { messageEventKey(it) }.toMutableSet()
         return incoming.filter { event ->
-            if (CustomImdn.isReceipt(event.chatMessage)) {
+            if (CustomImdn.isHiddenControlMessage(event.chatMessage)) {
                 false
             } else {
                 val key = messageEventKey(event)
@@ -874,12 +926,12 @@ class ConversationViewModel
         if (visibleHistory.size == 1) {
             // If there is a single event, improve processing speed by skipping grouping tasks
             val event = visibleHistory[0]
-            if (!CustomImdn.isReceipt(event.chatMessage)) {
+            if (!CustomImdn.isHiddenControlMessage(event.chatMessage)) {
                 eventsList.addAll(processGroupedEvents(arrayListOf(event)))
             }
         } else {
             for (event in visibleHistory) {
-                if (CustomImdn.isReceipt(event.chatMessage)) continue
+                if (CustomImdn.isHiddenControlMessage(event.chatMessage)) continue
                 if (groupedEventLogs.isEmpty()) {
                     groupedEventLogs.add(event)
                     continue
@@ -975,7 +1027,21 @@ class ConversationViewModel
     private fun computeComposingLabel() {
         if (!isChatRoomInitialized()) return
 
-        val pair = LinphoneUtils.getComposingIconAndText(chatRoom)
+        val callbackNames = remoteComposingState.participantNamesOrNull()
+        val pair = if (callbackNames == null) {
+            LinphoneUtils.getComposingIconAndText(chatRoom)
+        } else if (callbackNames.isEmpty()) {
+            Pair(0, "")
+        } else {
+            Pair(
+                R.drawable.chat_teardrop_dots,
+                AppUtils.getStringWithPlural(
+                    R.plurals.conversation_composing_label,
+                    callbackNames.size,
+                    callbackNames.joinToString(", ")
+                )
+            )
+        }
         val icon = pair.first
         composingIcon.postValue(icon)
         val label = pair.second

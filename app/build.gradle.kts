@@ -17,7 +17,7 @@ plugins {
 }
 
 val packageName = "com.naminfo"
-val useDifferentPackageNameForDebugBuild = false
+val useDifferentPackageNameForDebugBuild = true
 
 val sdkPath = providers.gradleProperty("LinphoneSdkBuildDir").get()
 val googleServices = File(projectDir.absolutePath + "/google-services.json")
@@ -109,7 +109,7 @@ android {
         minSdk = 28
         targetSdk = 36
         versionCode = 602006 // 6.02.006
-        versionName = "2.0.6"
+        versionName = "2.1.0"
 
         manifestPlaceholders["appAuthRedirectScheme"] = packageName
 
@@ -162,6 +162,7 @@ android {
         getByName("debug") {
             if (useDifferentPackageNameForDebugBuild) {
                 applicationIdSuffix = ".debug"
+                manifestPlaceholders["appAuthRedirectScheme"] = "$packageName.debug"
             }
             isDebuggable = true
             isJniDebuggable = true
@@ -176,7 +177,11 @@ android {
             } else {
                 resValue("string", "file_provider", "$packageName.fileprovider")
             }
-            resValue("string", "linphone_openid_callback_scheme", packageName)
+            resValue(
+                "string",
+                "linphone_openid_callback_scheme",
+                if (useDifferentPackageNameForDebugBuild) "$packageName.debug" else packageName
+            )
 
             if (crashlyticsAvailable) {
                 val path = File("$sdkPath/libs-debug/").toString()

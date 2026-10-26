@@ -283,7 +283,6 @@ class ThirdPartySipAccountLoginViewModel
             accountParams.internationalPrefixIsoCountryCode = ""
 
             newlyCreatedAccount = core.createAccount(accountParams)
-
             registrationInProgress.postValue(true)
             core.addListener(coreListener)
             core.addAccount(newlyCreatedAccount)

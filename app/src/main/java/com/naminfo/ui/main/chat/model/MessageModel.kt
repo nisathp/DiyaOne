@@ -3,6 +3,7 @@ package com.naminfo.ui.main.chat.model
 import android.graphics.Typeface
 import android.os.CountDownTimer
 import android.text.Spannable
+import android.text.SpannableString
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -27,6 +28,10 @@ import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.core.CustomImdn
 import com.naminfo.translation.ChatTranslationLanguage
+import com.naminfo.ui.main.chat.DIYA_REPLY_MESSAGE_ID_HEADER
+import com.naminfo.ui.main.chat.decodeReplyPreviewEnvelope
+import com.naminfo.ui.main.chat.hasReplyTarget
+import com.naminfo.ui.main.chat.resolveReplyMessageId
 import org.linphone.core.Address
 import org.linphone.core.ChatMessage
 import org.linphone.core.ChatMessageListenerStub
@@ -97,7 +102,17 @@ class MessageModel
 
     val isReply = MutableLiveData<Boolean>()
 
-    val replyToMessageId = chatMessage.replyMessageId
+    private val replyPreviewEnvelope = chatMessage.contents
+        .firstOrNull { it.isText && !it.isFile }
+        ?.utf8Text
+        ?.trim()
+        ?.let(::decodeReplyPreviewEnvelope)
+        ?.first
+
+    val replyToMessageId = resolveReplyMessageId(
+        chatMessage.replyMessageId,
+        chatMessage.getCustomHeader(DIYA_REPLY_MESSAGE_ID_HEADER)
+    ) ?: replyPreviewEnvelope?.messageId
 
     val isForward = chatMessage.isForward
 
@@ -319,7 +334,7 @@ class MessageModel
         hasBeenEdited.postValue(chatMessage.isEdited && !chatMessage.isRetracted)
         hasBeenRetracted.postValue(chatMessage.isRetracted)
         computeContentsList()
-        if (chatMessage.isReply) {
+        if (hasReplyTarget(chatMessage.isReply, replyToMessageId)) {
             // Wait to see if original message is found before setting isReply to true
             computeReplyInfo()
         } else {
@@ -423,7 +438,8 @@ class MessageModel
         if (rawTextContent.isNotBlank()) return rawTextContent
         val textContent = chatMessage.contents.find { it.isText && !it.isFile }
         if (textContent != null) {
-            rawTextContent = textContent.utf8Text.orEmpty().trim()
+            val content = textContent.utf8Text.orEmpty().trim()
+            rawTextContent = decodeReplyPreviewEnvelope(content)?.second ?: content
         }
         return rawTextContent
     }
@@ -670,21 +686,47 @@ class MessageModel
     @WorkerThread
     fun computeReplyInfo() {
         val replyMessage = chatMessage.replyMessage
+            ?: replyToMessageId?.let { chatMessage.chatRoom.findMessage(it) }
         if (replyMessage != null) {
             val from = replyMessage.fromAddress
-            val avatarModel = coreContext.contactsManager.getContactAvatarModelForAddress(from)
-            replyTo.postValue(avatarModel.contactName ?: LinphoneUtils.getDisplayName(from))
+            replyTo.postValue(coreContext.contactsManager.findDisplayName(from))
             replyText.postValue(LinphoneUtils.getFormattedTextDescribingMessage(replyMessage))
             isReply.postValue(true)
         } else {
-            Log.w("$TAG Failed to find the reply message from ID [${chatMessage.replyMessageId}]")
-            isReply.postValue(false)
+            if (replyPreviewEnvelope != null) {
+                replyTo.postValue(resolveReplyPreviewSenderName(replyPreviewEnvelope.sender))
+                replyText.postValue(SpannableString(replyPreviewEnvelope.text))
+                isReply.postValue(true)
+            } else {
+                Log.w("$TAG Failed to find the reply message from ID [${chatMessage.replyMessageId}]")
+                isReply.postValue(false)
+            }
         }
     }
 
     @WorkerThread
+    private fun resolveReplyPreviewSenderName(sender: String): String {
+        val room = chatMessage.chatRoom
+        val peerAddress = room.peerAddress
+        val localAddress = room.localAddress
+        val address = when {
+            sender.equals(peerAddress.asStringUriOnly(), ignoreCase = true) ||
+                sender.equals(peerAddress.username, ignoreCase = true) -> peerAddress
+            sender.equals(localAddress.asStringUriOnly(), ignoreCase = true) ||
+                sender.equals(localAddress.username, ignoreCase = true) -> localAddress
+            else -> coreContext.core.interpretUrl(sender, false)
+        } ?: return sender
+
+        return coreContext.contactsManager.findDisplayName(address)
+            .trim()
+            .takeIf { it.isNotEmpty() }
+            ?: sender
+    }
+
+    @WorkerThread
     private fun computeTextContent(content: Content, highlight: String) {
-        rawTextContent = content.utf8Text.orEmpty().trim()
+        val messageText = content.utf8Text.orEmpty().trim()
+        rawTextContent = decodeReplyPreviewEnvelope(messageText)?.second ?: messageText
         val spannableBuilder = SpannableStringBuilder(rawTextContent)
 
         val emojiOnly = AppUtils.isTextOnlyContainsEmoji(rawTextContent)
@@ -1102,9 +1144,9 @@ class MessageModel
 
     @UiThread
     fun applyTranslation(translated: String, targetLanguage: ChatTranslationLanguage) {
-        effectiveTargetLanguage.postValue(targetLanguage)
-        translatedText.postValue(Spannable.Factory.getInstance().newSpannable(translated))
-        isTranslating.postValue(false)
-        showOriginal.postValue(false)
+        effectiveTargetLanguage.value = targetLanguage
+        translatedText.value = Spannable.Factory.getInstance().newSpannable(translated)
+        isTranslating.value = false
+        showOriginal.value = false
     }
 }

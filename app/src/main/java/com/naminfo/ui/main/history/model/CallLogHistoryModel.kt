@@ -4,6 +4,7 @@ import androidx.annotation.IntegerRes
 import androidx.annotation.WorkerThread
 import androidx.lifecycle.MutableLiveData
 import com.naminfo.R
+import com.naminfo.DiyaOneApplication.Companion.coreContext
 import org.linphone.core.Call
 import org.linphone.core.Call.Dir
 import org.linphone.core.CallLog
@@ -19,6 +20,8 @@ class CallLogHistoryModel
     val isOutgoing = MutableLiveData<Boolean>()
 
     val isSuccessful = MutableLiveData<Boolean>()
+
+    val isTCall = MutableLiveData<Boolean>()
 
     val wasConference: Boolean
 
@@ -45,6 +48,12 @@ class CallLogHistoryModel
         }
 
         isOutgoing.postValue(callLog.dir == Dir.Outgoing)
+        isTCall.postValue(
+            remoteUsername.startsWith("T_", ignoreCase = true) ||
+                remoteUsername.startsWith("tac_", ignoreCase = true) ||
+                remoteUsername.startsWith("tvc_", ignoreCase = true) ||
+                TranslationCallHistoryMetadata.isTranslationCall(coreContext.context, callLog.callId ?: callLog.refKey)
+        )
 
         val startDate = callLog.startDate
         val date = if (TimestampUtils.isToday(startDate)) {

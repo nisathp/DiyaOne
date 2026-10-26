@@ -11,6 +11,7 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
 import androidx.media.AudioFocusRequestCompat
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
@@ -18,9 +19,9 @@ import kotlinx.coroutines.launch
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
+import com.naminfo.core.CustomComposing
 import com.naminfo.core.CustomImdn
 import org.linphone.core.ChatMessage
-import org.linphone.core.ChatMessageListenerStub
 import org.linphone.core.ChatRoom
 import org.linphone.core.ChatRoomListenerStub
 import org.linphone.core.EventLog
@@ -34,11 +35,15 @@ import com.naminfo.ui.GenericViewModel
 import com.naminfo.ui.main.chat.model.FileModel
 import com.naminfo.ui.main.chat.model.MessageModel
 import com.naminfo.ui.main.chat.model.ParticipantModel
+import com.naminfo.ui.main.chat.createOutgoingTextMessage
+import com.naminfo.ui.main.chat.ChatDraftRepository
+import com.naminfo.ui.main.chat.SingleFlightGate
 import com.naminfo.utils.AudioUtils
 import com.naminfo.utils.Event
 import com.naminfo.utils.FileUtils
 import com.naminfo.utils.LinphoneUtils
 import com.naminfo.utils.VoiceDurationUtils
+import java.util.concurrent.atomic.AtomicLong
 
 class SendMessageInConversationViewModel
     @UiThread
@@ -99,6 +104,8 @@ class SendMessageInConversationViewModel
 
     private lateinit var voiceRecordPlayer: Player
 
+    private var configuredDraftConversationId: String? = null
+
     private val playerListener = PlayerListener {
         Log.i("$TAG End of file reached")
         stopVoiceRecordPlayer()
@@ -125,41 +132,22 @@ class SendMessageInConversationViewModel
     }
 
     lateinit var chatRoom: ChatRoom
+    private var customComposingSignalActive = false
+    private var lastCustomComposingSignalAt = 0L
+    private val composingGeneration = AtomicLong(0L)
+    private var composingIdleJob: Job? = null
 
     private var chatMessageToReplyTo: ChatMessage? = null
 
     private var chatMessageToEdit: ChatMessage? = null
+
+    private val sendRequestGate = SingleFlightGate()
 
     private lateinit var voiceMessageRecorder: Recorder
 
     private var voiceRecordAudioFocusRequest: AudioFocusRequestCompat? = null
 
     private var participantsListFilter = ""
-
-    // A Basic SIP chat message accepts one file content. Serialize file uploads so a
-    // burst of selected images cannot start several independent transfers at once.
-    private val pendingBasicFileMessages = ArrayDeque<ChatMessage>()
-    private var activeBasicFileMessage: ChatMessage? = null
-
-    private val basicFileMessageListener = object : ChatMessageListenerStub() {
-        @WorkerThread
-        override fun onFileTransferTerminated(message: ChatMessage, content: org.linphone.core.Content) {
-            finishBasicFileMessage(message)
-        }
-
-        @WorkerThread
-        override fun onMsgStateChanged(message: ChatMessage, messageState: ChatMessage.State?) {
-            when (messageState) {
-                ChatMessage.State.Delivered,
-                ChatMessage.State.DeliveredToUser,
-                ChatMessage.State.Displayed,
-                ChatMessage.State.NotDelivered,
-                ChatMessage.State.FileTransferDone,
-                ChatMessage.State.FileTransferError -> finishBasicFileMessage(message)
-                else -> {}
-            }
-        }
-    }
 
     private var capturedPicturedPath = ""
 
@@ -193,6 +181,10 @@ class SendMessageInConversationViewModel
     override fun onCleared() {
         super.onCleared()
 
+        composingIdleJob?.cancel()
+        val stopGeneration = composingGeneration.incrementAndGet()
+        coreContext.postOnCoreThread { stopComposingSignal(stopGeneration) }
+
         viewModelScope.launch {
             for (file in attachments.value.orEmpty()) {
                 file.deleteFile()
@@ -215,9 +207,6 @@ class SendMessageInConversationViewModel
             if (::chatRoom.isInitialized) {
                 chatRoom.removeListener(chatRoomListener)
             }
-            activeBasicFileMessage?.removeListener(basicFileMessageListener)
-            pendingBasicFileMessages.forEach { it.removeListener(basicFileMessageListener) }
-            pendingBasicFileMessages.clear()
         }
     }
 
@@ -225,6 +214,11 @@ class SendMessageInConversationViewModel
     fun configureChatRoom(room: ChatRoom) {
         Log.i("$TAG Chat room configured")
         chatRoom = room
+        val conversationId = LinphoneUtils.getConversationId(room)
+        if (configuredDraftConversationId != conversationId) {
+            configuredDraftConversationId = conversationId
+            textToSend.value = ChatDraftRepository.get(conversationId)
+        }
         coreContext.postOnCoreThread {
             chatRoom.addListener(chatRoomListener)
 
@@ -276,6 +270,7 @@ class SendMessageInConversationViewModel
         }
 
         val newValue = model.text.value?.toString() ?: ""
+        isEditing.value = true
         textToSend.value = newValue
 
         coreContext.postOnCoreThread {
@@ -290,9 +285,15 @@ class SendMessageInConversationViewModel
     @UiThread
     fun cancelEdit() {
         Log.i("$TAG Cancelling edit")
-        isEditing.value = false
         chatMessageToEdit = null
-        textToSend.value = ""
+        textToSend.value = configuredDraftConversationId?.let(ChatDraftRepository::get).orEmpty()
+        isEditing.value = false
+    }
+
+    @UiThread
+    fun saveComposerDraft(text: String) {
+        if (isEditing.value == true || isReplying.value == true) return
+        configuredDraftConversationId?.let { ChatDraftRepository.save(it, text) }
     }
 
     @UiThread
@@ -320,26 +321,22 @@ class SendMessageInConversationViewModel
 
     @UiThread
     fun sendMessage() {
+        if (!sendRequestGate.tryEnter()) {
+            Log.w("$TAG Ignoring duplicate send request while the current send is being prepared")
+            return
+        }
+
         coreContext.postOnCoreThread {
             val isBasicChatRoom: Boolean = chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())
 
+            val toSend = textToSend.value.orEmpty().trim()
             val messageToReplyTo = chatMessageToReplyTo
             val messageToEdit = chatMessageToEdit
-            val message = if (messageToReplyTo != null) {
+            if (messageToReplyTo != null) {
                 Log.i("$TAG Sending message as reply to [${messageToReplyTo.messageId}]")
-                chatRoom.createReplyMessage(messageToReplyTo)
-            } else if (messageToEdit != null) {
-                chatRoom.createReplacesMessage(messageToEdit)
-            } else {
-                chatRoom.createEmptyMessage()
             }
-            var contentAdded = false
-
-            val toSend = textToSend.value.orEmpty().trim()
-            if (toSend.isNotEmpty()) {
-                message.addUtf8TextContent(toSend)
-                contentAdded = true
-            }
+            val message = createOutgoingTextMessage(chatRoom, messageToReplyTo, messageToEdit, toSend)
+            var contentAdded = toSend.isNotEmpty()
 
             if (isVoiceRecording.value == true && voiceMessageRecorder.file != null) {
                 stopVoiceRecorder()
@@ -383,8 +380,13 @@ class SendMessageInConversationViewModel
                     if (isBasicChatRoom) {
                         val fileMessage = chatRoom.createEmptyMessage()
                         fileMessage.addFileContent(content)
-                        fileMessage.addListener(basicFileMessageListener)
-                        pendingBasicFileMessages.addLast(fileMessage)
+                        // Basic SIP carries one file per message. Send each selected
+                        // file as its own Core message so every item is persisted in
+                        // chat history and Linphone can retry the full batch after
+                        // the network returns. A ViewModel-owned queue loses all but
+                        // its active item when the chat screen is recreated.
+                        Log.i("$TAG Sending Basic SIP attachment [${attachment.fileName}]")
+                        fileMessage.send()
                         messageSentEvent.postValue(Event(fileMessage))
                     } else {
                         message.addFileContent(content)
@@ -404,8 +406,9 @@ class SendMessageInConversationViewModel
                 messageSentEvent.postValue(Event(message))
             }
 
-            if (isBasicChatRoom) {
-                sendNextBasicFileMessage()
+            // Editing a sent message must not erase a separate unsent draft.
+            if (messageToEdit == null) {
+                configuredDraftConversationId?.let { ChatDraftRepository.save(it, "") }
             }
 
             Log.i("$TAG Message sent, re-setting defaults")
@@ -428,37 +431,47 @@ class SendMessageInConversationViewModel
             chatMessageToReplyTo = null
             chatMessageToEdit = null
             maxNumberOfAttachmentsReached.postValue(false)
+            coreContext.postOnMainThread {
+                sendRequestGate.complete()
+            }
         }
-    }
-
-    @WorkerThread
-    private fun sendNextBasicFileMessage() {
-        if (activeBasicFileMessage != null) return
-        val next = pendingBasicFileMessages.removeFirstOrNull() ?: return
-        activeBasicFileMessage = next
-        Log.i("$TAG Starting next queued Basic SIP attachment [${next.messageId}]")
-        next.send()
-    }
-
-    @WorkerThread
-    private fun finishBasicFileMessage(message: ChatMessage) {
-        if (activeBasicFileMessage != message) return
-        Log.i("$TAG Basic SIP attachment [${message.messageId}] reached terminal transfer state [${message.state}]")
-        message.removeListener(basicFileMessageListener)
-        activeBasicFileMessage = null
-        sendNextBasicFileMessage()
     }
 
     @UiThread
     fun notifyComposing(composing: Boolean) {
+        val generation = composingGeneration.incrementAndGet()
+        composingIdleJob?.cancel()
+
+        if (!composing) {
+            coreContext.postOnCoreThread { stopComposingSignal(generation) }
+            return
+        }
+
+        composingIdleJob = viewModelScope.launch {
+            delay(3_000L)
+            coreContext.postOnCoreThread { stopComposingSignal(generation) }
+        }
+
         coreContext.postOnCoreThread {
-            if (::chatRoom.isInitialized) {
-                if (composing) {
-                    chatRoom.composeTextMessage()
-                } else {
-                    chatRoom.stopComposing()
-                }
+            if (generation != composingGeneration.get() || !::chatRoom.isInitialized) return@postOnCoreThread
+
+            chatRoom.composeTextMessage()
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (!customComposingSignalActive || now - lastCustomComposingSignalAt >= 4_000L) {
+                CustomComposing.send(chatRoom, true)
+                customComposingSignalActive = true
+                lastCustomComposingSignalAt = now
             }
+        }
+    }
+
+    @WorkerThread
+    private fun stopComposingSignal(generation: Long) {
+        if (generation != composingGeneration.get() || !::chatRoom.isInitialized) return
+        chatRoom.stopComposing()
+        if (customComposingSignalActive) {
+            CustomComposing.send(chatRoom, false)
+            customComposingSignalActive = false
         }
     }
 

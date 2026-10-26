@@ -7,6 +7,7 @@ import android.view.ViewGroup
 import android.view.animation.Animation
 import android.view.animation.AnimationUtils
 import androidx.annotation.UiThread
+import androidx.appcompat.app.AlertDialog
 import androidx.core.text.isDigitsOnly
 import androidx.lifecycle.ViewModelProvider
 import androidx.navigation.findNavController
@@ -14,6 +15,7 @@ import androidx.navigation.fragment.findNavController
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
 import com.naminfo.DiyaOneApplication.Companion.coreContext
+import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import org.linphone.core.Address
 import org.linphone.core.tools.Log
@@ -30,6 +32,7 @@ import com.naminfo.utils.Event
 import com.naminfo.utils.LinphoneUtils
 import com.naminfo.utils.RecyclerViewHeaderDecoration
 import com.naminfo.utils.PhoneContactEditor
+import com.naminfo.translation.CallLanguage
 
 @UiThread
 class HistoryListFragment : AbstractMainFragment() {
@@ -101,6 +104,22 @@ class HistoryListFragment : AbstractMainFragment() {
             }
         }
 
+        adapter.itemSelectionToggledEvent.observe(viewLifecycleOwner) {
+            it.consume { model ->
+                listViewModel.toggleSelection(model)
+            }
+        }
+
+        adapter.itemLongPressedSelectionEvent.observe(viewLifecycleOwner) {
+            it.consume { model ->
+                if (listViewModel.isSelectionMode.value == true) {
+                    listViewModel.toggleSelection(model)
+                } else {
+                    listViewModel.enterSelectionMode(model)
+                }
+            }
+        }
+
         adapter.callLogLongClickedEvent.observe(viewLifecycleOwner) {
             it.consume { model ->
                 val modalBottomSheet = HistoryMenuDialogFragment(
@@ -151,6 +170,11 @@ class HistoryListFragment : AbstractMainFragment() {
 
         adapter.callLogCallBackClickedEvent.observe(viewLifecycleOwner) {
             it.consume { model ->
+                if (model.isTCall) {
+                    showTranslationCallFlow(model)
+                    return@consume
+                }
+
                 coreContext.postOnCoreThread { core ->
                     val conferenceInfo = core.findConferenceInformationFromUri(model.address)
                     if (conferenceInfo != null) {
@@ -247,6 +271,10 @@ class HistoryListFragment : AbstractMainFragment() {
             showDeleteAllConfirmationDialog()
         }
 
+        binding.deleteSelectedClickListener = View.OnClickListener {
+            showDeleteSelectedConfirmationDialog()
+        }
+
         binding.setStartCallClickListener {
             if (findNavController().currentDestination?.id == R.id.historyListFragment) {
                 Log.i("$TAG Navigating to start call fragment")
@@ -266,6 +294,57 @@ class HistoryListFragment : AbstractMainFragment() {
             binding.bottomNavBar,
             R.id.historyListFragment
         )
+    }
+
+    private fun showTranslationCallFlow(model: CallLogModel) {
+        if (corePreferences.callLanguage == CallLanguage.NONE) {
+            val languages = CallLanguage.entries.filter { it != CallLanguage.NONE }
+            AlertDialog.Builder(requireContext())
+                .setTitle(R.string.t_call_select_language_title)
+                .setItems(languages.map { it.label }.toTypedArray()) { dialog, which ->
+                    languages.getOrNull(which)?.let { language ->
+                        corePreferences.callLanguage = language
+                        showTranslationCallTypeDialog(model)
+                    }
+                    dialog.dismiss()
+                }
+                .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+                .show()
+        } else {
+            showTranslationCallTypeDialog(model)
+        }
+    }
+
+    private fun showTranslationCallTypeDialog(model: CallLogModel) {
+        val options = arrayOf(
+            getString(R.string.t_call_option_audio),
+            getString(R.string.t_call_option_video)
+        )
+        AlertDialog.Builder(requireContext())
+            .setTitle(R.string.contact_t_call_action)
+            .setItems(options) { dialog, which ->
+                startTranslationCall(model, isVideo = which == 1)
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
+    }
+
+    private fun startTranslationCall(model: CallLogModel, isVideo: Boolean) {
+        coreContext.postOnCoreThread { core ->
+            val username = model.address.username.orEmpty()
+            val number = username
+                .replace(Regex("^(T_|tac_|tvc_)", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^\\+91[\\s-]*"), "")
+                .trim()
+            val domain = model.address.domain.takeIf { it!!.isNotBlank() }
+                ?: core.defaultAccount?.params?.domain.orEmpty()
+            val prefix = if (isVideo) "tvc_" else "tac_"
+            val sipUri = "sip:$prefix$number@$domain"
+            val address = core.interpretUrl(sipUri, false) ?: model.address
+            Log.i("$TAG Starting translation ${if (isVideo) "video" else "audio"} call to [${address.asStringUriOnly()}]")
+            if (isVideo) coreContext.startVideoCall(address) else coreContext.startAudioCall(address)
+        }
     }
 
     override fun onPause() {
@@ -359,6 +438,23 @@ class HistoryListFragment : AbstractMainFragment() {
         }
 
         dialog.show()
+    }
+
+    private fun showDeleteSelectedConfirmationDialog() {
+        val count = listViewModel.selectedCount.value ?: 0
+        if (count == 0) return
+
+        androidx.appcompat.app.AlertDialog.Builder(requireContext())
+            .setTitle(R.string.history_delete_selected_dialog_title)
+            .setMessage(getString(R.string.history_delete_selected_dialog_message))
+            .setPositiveButton(R.string.dialog_delete) { dialog, _ ->
+                listViewModel.deleteSelectedCallLogs()
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ ->
+                dialog.dismiss()
+            }
+            .show()
     }
 
 }

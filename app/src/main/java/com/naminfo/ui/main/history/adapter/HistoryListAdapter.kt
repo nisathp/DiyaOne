@@ -43,6 +43,14 @@ class HistoryListAdapter :
         MutableLiveData()
     }
 
+    val itemSelectionToggledEvent: MutableLiveData<Event<CallLogModel>> by lazy {
+        MutableLiveData()
+    }
+
+    val itemLongPressedSelectionEvent: MutableLiveData<Event<CallLogModel>> by lazy {
+        MutableLiveData()
+    }
+
     val callLogCallBackClickedEvent: MutableLiveData<Event<CallLogModel>> by lazy {
         MutableLiveData()
     }
@@ -116,14 +124,24 @@ class HistoryListAdapter :
                     lifecycleOwner = parent.findViewTreeLifecycleOwner()
 
                     setOnClickListener {
-                        callLogClickedEvent.value = Event(model!!)
+                        val currentModel = model
+                        if (currentModel != null) {
+                            if (currentModel.isSelectionMode.value == true) {
+                                itemSelectionToggledEvent.value = Event(currentModel)
+                            } else {
+                                callLogClickedEvent.value = Event(currentModel)
+                            }
+                        }
                     }
 
                     setOnLongClickListener {
-                        selectedAdapterPosition = viewHolder.bindingAdapterPosition
-                        root.isSelected = true
-                        callLogLongClickedEvent.value = Event(model!!)
-                        true
+                        val currentModel = model
+                        if (currentModel != null) {
+                            itemLongPressedSelectionEvent.value = Event(currentModel)
+                            true
+                        } else {
+                            false
+                        }
                     }
 
                     setOnCallClickListener {

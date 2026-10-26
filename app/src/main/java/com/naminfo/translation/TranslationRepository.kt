@@ -2,6 +2,7 @@ package com.naminfo.translation
 
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.linphone.core.tools.Log
@@ -54,8 +55,18 @@ object TranslationRepository {
 
         val cacheKey = getCacheKey(messageId, targetLanguage)
         if (!inFlightRequests.add(cacheKey)) {
-            Log.w("$TAG Translation already in flight for messageId [$messageId], lang [${targetLanguage.name}]")
-            return@withContext Result.failure(IllegalStateException("Translation already in progress"))
+            Log.i("$TAG Translation already in flight for messageId [$messageId], waiting...")
+            var attempts = 0
+            while (inFlightRequests.contains(cacheKey) && attempts < 30) {
+                delay(100)
+                attempts++
+            }
+            val cachedAfterWait = getCachedTranslation(messageId, targetLanguage)
+            if (cachedAfterWait != null) {
+                return@withContext Result.success(cachedAfterWait)
+            } else {
+                return@withContext Result.failure(IllegalStateException("In-flight translation failed or timed out"))
+            }
         }
 
         try {

@@ -25,6 +25,7 @@ import org.linphone.core.tools.Log
 import com.naminfo.ui.GenericViewModel
 import com.naminfo.ui.main.settings.model.CardDavLdapModel
 import com.naminfo.ui.main.settings.model.CodecModel
+import com.naminfo.translation.CallLanguage
 import com.naminfo.utils.AppUtils
 import com.naminfo.utils.Event
 import com.naminfo.utils.LinphoneUtils
@@ -77,6 +78,11 @@ class SettingsViewModel
     val callRedirectionService = MutableLiveData<Boolean>()
     val callRedirectionServiceEnabledEvent: MutableLiveData<Event<Boolean>> by lazy {
         MutableLiveData<Event<Boolean>>()
+    }
+
+    val selectedCallLanguage = MutableLiveData<CallLanguage>()
+    val showCallLanguageDialogEvent: MutableLiveData<Event<Boolean>> by lazy {
+        MutableLiveData()
     }
 
     // Conversations settings
@@ -334,6 +340,7 @@ class SettingsViewModel
             autoRecordCalls.postValue(corePreferences.automaticallyStartCallRecording)
             useSmffForCallRecording.postValue(corePreferences.callRecordingUseSmffFormat)
             callRedirectionService.postValue(corePreferences.useCallRedirectionService)
+            selectedCallLanguage.postValue(corePreferences.callLanguage)
 
             useWifiOnly.postValue(core.isWifiOnlyEnabled)
             allowIpv6.postValue(core.isIpv6Enabled)
@@ -552,6 +559,17 @@ class SettingsViewModel
             corePreferences.useCallRedirectionService = newValue
             callRedirectionService.postValue(newValue)
         }
+    }
+
+    @UiThread
+    fun showCallLanguageDialog() {
+        showCallLanguageDialogEvent.postValue(Event(true))
+    }
+
+    @UiThread
+    fun updateCallLanguage(language: CallLanguage) {
+        corePreferences.callLanguage = language
+        selectedCallLanguage.value = language
     }
 
     @UiThread

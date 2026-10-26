@@ -433,4 +433,19 @@
         android:label="SettingsAdvancedCallFragment"
         tools:layout="@layout/settings_advanced_calls_fragment"/>
 
+    <fragment
+        android:id="@+id/sipLogsFragment"
+        android:name="com.naminfo.ui.main.fragment.SipLogsFragment"
+        android:label="SipLogsFragment"
+        tools:layout="@layout/sip_logs_fragment" />
+
+    <action
+        android:id="@+id/action_global_sipLogsFragment"
+        app:destination="@id/sipLogsFragment"
+        app:enterAnim="@anim/slide_in_right"
+        app:exitAnim="@anim/slide_out_left"
+        app:popEnterAnim="@anim/slide_in_left"
+        app:popExitAnim="@anim/slide_out_right"
+        app:launchSingleTop="true" />
+
 </navigation>

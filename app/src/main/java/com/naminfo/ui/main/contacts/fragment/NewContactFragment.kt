@@ -1,7 +1,9 @@
 package com.naminfo.ui.main.contacts.fragment
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
@@ -10,6 +12,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.UiThread
+import androidx.core.content.ContextCompat
 import androidx.databinding.DataBindingUtil
 import androidx.databinding.ViewDataBinding
 import androidx.lifecycle.ViewModelProvider
@@ -40,6 +43,13 @@ class NewContactFragment : GenericMainFragment() {
     private lateinit var binding: ContactNewOrEditFragmentBinding
 
     private lateinit var viewModel: ContactNewOrEditViewModel
+
+    private val requestContactsPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+            val writeGranted = permissions[Manifest.permission.WRITE_CONTACTS] ?: false
+            val readGranted = permissions[Manifest.permission.READ_CONTACTS] ?: false
+            Log.i("$TAG Contacts permissions result - write: $writeGranted, read: $readGranted")
+        }
 
     private val backPressedCallback = object : OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
@@ -94,6 +104,12 @@ class NewContactFragment : GenericMainFragment() {
         viewModel = ViewModelProvider(this)[ContactNewOrEditViewModel::class.java]
         binding.viewModel = viewModel
         observeToastEvents(viewModel)
+
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.WRITE_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            requestContactsPermissionLauncher.launch(
+                arrayOf(Manifest.permission.WRITE_CONTACTS, Manifest.permission.READ_CONTACTS)
+            )
+        }
 
         viewModel.findFriendByRefKey("")
 

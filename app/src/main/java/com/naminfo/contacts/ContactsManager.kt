@@ -1,10 +1,14 @@
 package com.naminfo.contacts
 
+import android.Manifest
+import android.content.ContentProviderOperation
 import android.content.ContentUris
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
 import android.provider.ContactsContract
+import androidx.core.content.ContextCompat
 import androidx.annotation.MainThread
 import androidx.annotation.UiThread
 import androidx.annotation.WorkerThread
@@ -378,10 +382,94 @@ class ContactsManager
     }
 
     @WorkerThread
+    fun saveFriendToDeviceNativeContacts(friend: Friend) {
+        val context = coreContext.context
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            Log.w("$TAG WRITE_CONTACTS permission not granted, skipping save to phone's native contacts")
+            return
+        }
+
+        try {
+            val ops = ArrayList<ContentProviderOperation>()
+            val rawContactInsertIndex = ops.size
+
+            ops.add(
+                ContentProviderOperation.newInsert(ContactsContract.RawContacts.CONTENT_URI)
+                    .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, null)
+                    .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, null)
+                    .build()
+            )
+
+            val fn = friend.firstName.orEmpty().trim()
+            val ln = friend.lastName.orEmpty().trim()
+            val name = friend.name.orEmpty().trim()
+
+            if (fn.isNotEmpty() || ln.isNotEmpty() || name.isNotEmpty()) {
+                ops.add(
+                    ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                        .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, rawContactInsertIndex)
+                        .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE)
+                        .withValue(ContactsContract.CommonDataKinds.StructuredName.GIVEN_NAME, fn)
+                        .withValue(ContactsContract.CommonDataKinds.StructuredName.FAMILY_NAME, ln)
+                        .withValue(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, name)
+                        .build()
+                )
+            }
+
+            val org = friend.organization.orEmpty().trim()
+            val job = friend.jobTitle.orEmpty().trim()
+            if (org.isNotEmpty() || job.isNotEmpty()) {
+                ops.add(
+                    ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                        .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, rawContactInsertIndex)
+                        .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Organization.CONTENT_ITEM_TYPE)
+                        .withValue(ContactsContract.CommonDataKinds.Organization.COMPANY, org)
+                        .withValue(ContactsContract.CommonDataKinds.Organization.TITLE, job)
+                        .build()
+                )
+            }
+
+            for (phoneNumber in friend.phoneNumbers) {
+                val num = phoneNumber.orEmpty().trim()
+                if (num.isNotEmpty()) {
+                    ops.add(
+                        ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                            .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, rawContactInsertIndex)
+                            .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
+                            .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, num)
+                            .withValue(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE)
+                            .build()
+                    )
+                }
+            }
+
+            for (sipAddress in friend.addresses) {
+                val uri = sipAddress.asStringUriOnly().removePrefix("sip:").removePrefix("sips:")
+                if (uri.isNotEmpty()) {
+                    ops.add(
+                        ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                            .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, rawContactInsertIndex)
+                            .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.SipAddress.CONTENT_ITEM_TYPE)
+                            .withValue(ContactsContract.CommonDataKinds.SipAddress.SIP_ADDRESS, uri)
+                            .withValue(ContactsContract.CommonDataKinds.SipAddress.TYPE, ContactsContract.CommonDataKinds.SipAddress.TYPE_OTHER)
+                            .build()
+                    )
+                }
+            }
+
+            context.contentResolver.applyBatch(ContactsContract.AUTHORITY, ops)
+            Log.i("$TAG Successfully saved contact [${friend.name}] to native phone contacts")
+        } catch (e: Exception) {
+            Log.e("$TAG Failed to save contact to native phone contacts: $e")
+        }
+    }
+
+    @WorkerThread
     fun newContactAdded(friend: Friend) {
         for (sipAddress in friend.addresses) {
             newContactAddedWithSipUri(friend, sipAddress)
         }
+        saveFriendToDeviceNativeContacts(friend)
     }
 
     @WorkerThread

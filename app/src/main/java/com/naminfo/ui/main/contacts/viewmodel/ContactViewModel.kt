@@ -32,6 +32,7 @@ import com.naminfo.utils.AppUtils
 import com.naminfo.utils.Event
 import com.naminfo.utils.FileUtils
 import com.naminfo.utils.LinphoneUtils
+import com.naminfo.translation.CallLanguage
 
 class ContactViewModel
     @UiThread
@@ -481,6 +482,7 @@ class ContactViewModel
 
     @UiThread
     fun startAudioCall() {
+        Log.i("[Call Diagnostics] CONTACT UI -> Action: [Normal Audio Call]")
         coreContext.postOnCoreThread {
             if (isTakeConferenceContact()) {
                 selectConferenceContactsEvent.postValue(Event(false))
@@ -488,6 +490,7 @@ class ContactViewModel
             }
 
             getPreferredCallAddress()?.let {
+                Log.i("[Call Diagnostics] CONTACT UI -> Target: [${it.asStringUriOnly()}]")
                 coreContext.startAudioCall(it)
             }
         }
@@ -495,6 +498,7 @@ class ContactViewModel
 
     @UiThread
     fun startVideoCall() {
+        Log.i("[Call Diagnostics] CONTACT UI -> Action: [Normal Video Call]")
         coreContext.postOnCoreThread {
             if (isTakeConferenceContact()) {
                 selectConferenceContactsEvent.postValue(Event(true))
@@ -502,8 +506,72 @@ class ContactViewModel
             }
 
             getPreferredCallAddress()?.let {
+                Log.i("[Call Diagnostics] CONTACT UI -> Target: [${it.asStringUriOnly()}]")
                 coreContext.startVideoCall(it)
             }
+        }
+    }
+
+    val showTCallTypeDialogEvent = MutableLiveData<Event<Address>>()
+    val showTCallLanguageDialogEvent = MutableLiveData<Event<Address>>()
+
+    @UiThread
+    fun startTCall() {
+        Log.i("[Call Diagnostics] CONTACT UI -> Action: [T Call Button Clicked]")
+        coreContext.postOnCoreThread {
+            if (isTakeConferenceContact()) {
+                selectConferenceContactsEvent.postValue(Event(false))
+                return@postOnCoreThread
+            }
+
+            val preferredAddress = getPreferredCallAddress() ?: return@postOnCoreThread
+//            val rawUsername = preferredAddress.username.orEmpty()
+//            val cleanNumber = removeIndiaCountryCode(rawUsername).removePrefix("T_").removePrefix("t_").trim()
+//            val domain = preferredAddress.domain.takeIf { !it.isNullOrBlank() }
+//                ?: coreContext.core.defaultAccount?.params?.domain.orEmpty()
+//            val tSipUri = "sip:tac_$cleanNumber@$domain"
+//            val tAddress = coreContext.core.interpretUrl(tSipUri, false) ?: preferredAddress
+//            Log.i("[Call Diagnostics] CONTACT UI -> T Call URI: [$tSipUri], opening option dialog")
+            if (corePreferences.callLanguage == CallLanguage.NONE) {
+                showTCallLanguageDialogEvent.postValue(Event(preferredAddress))
+            } else {
+                showTCallTypeDialogEvent.postValue(Event(preferredAddress))
+            }
+        }
+    }
+
+    @UiThread
+    fun selectTCallLanguage(language: CallLanguage, preferredAddress: Address) {
+        corePreferences.callLanguage = language
+        showTCallTypeDialogEvent.postValue(Event(preferredAddress))
+    }
+
+    @UiThread
+    fun startTAudioCall(preferredAddress: Address) {
+        Log.i("[Call Diagnostics] CONTACT UI -> Action: [T Audio Call Selected], Target: [${preferredAddress.asStringUriOnly()}]")
+        coreContext.postOnCoreThread {
+
+            val rawUsername = preferredAddress.username.orEmpty()
+            val cleanNumber = removeIndiaCountryCode(rawUsername).removePrefix("TAC_").removePrefix("tac_").removePrefix("TVC_").removePrefix("tvc_").trim()
+            val domain = preferredAddress.domain.takeIf { !it.isNullOrBlank() }
+                ?: coreContext.core.defaultAccount?.params?.domain.orEmpty()
+            val tSipUri = "sip:tac_$cleanNumber@$domain"
+            val tAddress = coreContext.core.interpretUrl(tSipUri, false) ?: preferredAddress
+            coreContext.startAudioCall(tAddress)
+        }
+    }
+
+    @UiThread
+    fun startTVideoCall(preferredAddress: Address) {
+        Log.i("[Call Diagnostics] CONTACT UI -> Action: [T Video Call Selected], Target: [${preferredAddress.asStringUriOnly()}]")
+        coreContext.postOnCoreThread {
+            val rawUsername = preferredAddress.username.orEmpty()
+            val cleanNumber = removeIndiaCountryCode(rawUsername).removePrefix("TAC_").removePrefix("tac_").removePrefix("TVC_").removePrefix("tvc_").trim()
+            val domain = preferredAddress.domain.takeIf { !it.isNullOrBlank() }
+                ?: coreContext.core.defaultAccount?.params?.domain.orEmpty()
+            val tSipUri = "sip:tvc_$cleanNumber@$domain"
+            val tAddress = coreContext.core.interpretUrl(tSipUri, false) ?: preferredAddress
+            coreContext.startVideoCall(tAddress)
         }
     }
 

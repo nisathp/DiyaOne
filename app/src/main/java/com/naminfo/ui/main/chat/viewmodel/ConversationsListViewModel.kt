@@ -113,7 +113,7 @@ class ConversationsListViewModel
         ) {
 
             val visibleMessages = messages.filter {
-                it != null && !CustomImdn.isReceipt(it)
+                it != null && !CustomImdn.isHiddenControlMessage(it)
             }.toTypedArray()
 
             if (visibleMessages.isEmpty()) return

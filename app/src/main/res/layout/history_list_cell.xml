@@ -105,8 +105,21 @@
             android:src="@{model.videoCall ? @drawable/video_camera : @drawable/phone}"
             android:background="@drawable/circle_transparent_button_background"
             android:contentDescription="@{model.videoCall ? @string/content_description_call_start_video : @string/content_description_call_start}"
-            android:visibility="@{model.wasConference ? View.GONE : View.VISIBLE}"
+            android:visibility="@{model.isSelectionMode || model.wasConference ? View.GONE : View.VISIBLE}"
             app:tint="?attr/color_main2_500"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toTopOf="@id/call_log_display_name"
+            app:layout_constraintBottom_toBottomOf="@id/date_time" />
+
+        <CheckBox
+            android:id="@+id/select_checkbox"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:layout_marginEnd="6dp"
+            android:clickable="false"
+            android:focusable="false"
+            android:checked="@{model.isSelected}"
+            android:visibility="@{model.isSelectionMode ? View.VISIBLE : View.GONE}"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintTop_toTopOf="@id/call_log_display_name"
             app:layout_constraintBottom_toBottomOf="@id/date_time" />

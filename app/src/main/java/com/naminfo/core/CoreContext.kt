@@ -42,6 +42,7 @@ import com.naminfo.utils.AudioUtils
 import com.naminfo.utils.Event
 import com.naminfo.utils.FileUtils
 import com.naminfo.utils.LinphoneUtils
+import com.naminfo.ui.main.history.model.TranslationCallHistoryMetadata
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -216,6 +217,7 @@ class CoreContext
             state: RegistrationState?,
             message: String
         ) {
+            Log.i("$TAG SIP registration callback state=[$state] message=[$message]")
             if (state != RegistrationState.Ok) return
             if (account == core.defaultAccount) {
                 // Core may start before the user creates the first SIP account.
@@ -254,7 +256,9 @@ class CoreContext
         ) {
             for (message in messages) {
                 if (message != null) {
-                    CustomImdn.receive(chatRoom, message)
+                    if (!CustomComposing.receive(chatRoom, message)) {
+                        CustomImdn.receive(chatRoom, message)
+                    }
                 }
             }
 
@@ -373,8 +377,17 @@ class CoreContext
             Log.i(
                 "$TAG Call [${call.remoteAddress.asStringUriOnly()}] state changed [$currentState]"
             )
+            if (currentState == Call.State.End || currentState == Call.State.Error || currentState == Call.State.Released) {
+                SipTraceRepository.onCallCompleted(call.callLog.callId ?: call.callLog.refKey)
+            }
             when (currentState) {
                 Call.State.IncomingReceived -> {
+                    val isTCall = isTranslationCall(call)
+                    val isVideo = LinphoneUtils.isVideoEnabled(call)
+                    if (isTCall) {
+                        TranslationCallHistoryMetadata.markTranslationCall(context, call.callLog.callId ?: call.callLog.refKey)
+                    }
+                    Log.i("[Call Diagnostics] INCOMING CALL -> Type: [${if (isVideo) "VIDEO" else "AUDIO"}], From: [${call.remoteAddress.asStringUriOnly()}], isTCall: [$isTCall], remoteVideoRequested: [${call.remoteParams?.isVideoEnabled}]")
                     if (corePreferences.autoAnswerEnabled) {
                         val autoAnswerDelay = corePreferences.autoAnswerDelay
                         if (autoAnswerDelay == 0) {
@@ -646,6 +659,7 @@ class CoreContext
             level: LogLevel,
             message: String
         ) {
+            SipTraceRepository.onLogMessageWritten(message)
             if (logcatEnabled) {
                 when (level) {
                     LogLevel.Error -> android.util.Log.e(domain, message)
@@ -680,6 +694,7 @@ class CoreContext
     }
 
     init {
+        SipTraceRepository.initialize(context)
         (context as Application).registerActivityLifecycleCallbacks(activityMonitor)
     }
 
@@ -692,7 +707,6 @@ class CoreContext
             Log.i("$TAG Crashlytics is enabled, registering logging service listener")
             try {
                 FirebaseCrashlytics.getInstance()
-                Factory.instance().loggingService.addListener(loggingServiceListener)
             } catch (e: Exception) {
                 Log.e("$TAG Failed to instantiate Crashlytics: $e")
                 crashlyticsEnabled = false
@@ -701,6 +715,11 @@ class CoreContext
         } else {
             Log.i("$TAG Crashlytics is disabled")
             crashlyticsAvailable = false
+        }
+        runCatching {
+            Factory.instance().loggingService.addListener(loggingServiceListener)
+        }.onFailure { error ->
+            Log.e("$TAG Failed to attach SIP trace listener: ${error.message}")
         }
         Log.i("=========================================")
         Log.i("==== Linphone-android information dump ====")
@@ -715,6 +734,10 @@ class CoreContext
         coreThread = Handler(looper)
 
         core = Factory.instance().createCoreWithConfig(corePreferences.config, context)
+        // Keep outgoing chat messages in Linphone's history and retry them when a
+        // broken channel becomes usable again, including queued file transfers.
+        core.messageAutomaticResendingDelay = 5
+        Log.i("$TAG Automatic outgoing chat-message retry delay set to 5 seconds")
         // Disable automatic outgoing delivery/read/error receipts.
         val imdnPolicy = checkNotNull(core.imNotifPolicy) {
             "Linphone IM notification policy is unavailable"
@@ -767,6 +790,7 @@ class CoreContext
             core.defaultAccount = firstAccount
             Log.w("$TAG Set account [${firstAccount?.params?.identityAddress?.asStringUriOnly()}] as default")
         }
+        SipTraceRepository.setLocalIdentity(core.defaultAccount?.params?.identityAddress?.username)
 
         computeUserAgent()
         if (BuildConfig.DEBUG) {
@@ -786,10 +810,8 @@ class CoreContext
         if (!pendingWakeCallId.isNullOrEmpty()) {
             Log.i("$TAG Processing pending FCM call wake after Core startup")
             core.refreshRegisters()
-            // The FCM service can cold-start the Core. Do not make FreeSWITCH
-            // wait for the full SIP registration callback before it starts the
-            // INVITE transaction; registration will continue in parallel.
-            acknowledgePendingWakeCallAfterRegisterRefresh()
+            // The registration-state listener sends readiness ACK only after
+            // Linphone reports the refreshed registration result.
         }
         core.videoCodecPriorityPolicy = CodecPriorityPolicy.Auto
 
@@ -1088,6 +1110,7 @@ class CoreContext
     ) {
         val params = core.createCallParams(null)
         params?.isVideoEnabled = false
+        params?.videoDirection = MediaDirection.Inactive
         startCall(address, params, forceZRTP, localAddress, skipNetworkReachabilityTest)
     }
 
@@ -1116,6 +1139,12 @@ class CoreContext
         localAddress: Address? = null,
         skipNetworkReachabilityTest: Boolean = false
     ) {
+        val isTranslationCallRequest = isTranslationCallUsername(address.username.orEmpty())
+        if (isTranslationCallRequest && corePreferences.callLanguage.code.isNullOrBlank()) {
+            Log.e("$TAG Can't start a T Call without a selected call language")
+            return
+        }
+
         if (!skipNetworkReachabilityTest && !core.isNetworkReachable) {
             Log.e("$TAG Network unreachable, abort outgoing call")
             return
@@ -1190,25 +1219,18 @@ class CoreContext
                 "videoDirection=${params.videoDirection}, coreVideoEnabled=${core.isVideoEnabled}, " +
                 "camera=${core.videoDevice}, encryption=${params.mediaEncryption}"
         )
+        val isTCall = isTranslationCallUsername(destination.username.orEmpty())
+        val callType = if (params.isVideoEnabled) "VIDEO" else "AUDIO"
+        Log.i("[Call Diagnostics] OUTGOING CALL -> Type: [$callType], Target: [${destination.asStringUriOnly()}], isTCall: [$isTCall]")
+        if (isTCall) addTCallLanguageHeaders(params)
+
         core.inviteAddressWithParams(destination, params)
         Log.i("$TAG Starting call to [${destination.asStringUriOnly()}]")
     }
 
-    /**
-     * The FCM wake may arrive while the SIP account is already registered. In
-     * that case refreshRegisters() doesn't necessarily emit another Ok state
-     * callback, so acknowledge readiness directly instead of making FreeSWITCH
-     * wait for its fallback timer.
-     */
+    /** A current RegistrationState.Ok is valid readiness even if refresh emits no new callback. */
     fun acknowledgePendingWakeCallIfRegistered() {
         if (!isCoreAvailable() || core.defaultAccount?.state != RegistrationState.Ok) return
-
-        acknowledgePendingWakeCall()
-    }
-
-    /** Acknowledge after an FCM wake has started register refresh on the live Core. */
-    fun acknowledgePendingWakeCallAfterRegisterRefresh() {
-        if (!isCoreAvailable() || core.globalState != GlobalState.On) return
 
         acknowledgePendingWakeCall()
     }
@@ -1221,14 +1243,15 @@ class CoreContext
             pendingWakeAckInProgressFor = callId
         }
 
-        Log.i("$TAG SIP account is ready for FCM wake call [$callId]; acknowledging local backend")
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        Log.i("$TAG RegistrationState.Ok confirmed for FCM wake call [$callId]; acknowledging Vercel API")
         Thread {
             var acknowledged = false
             repeat(3) { attempt ->
                 if (acknowledged) return@repeat
                 var conn: HttpURLConnection? = null
                 try {
-                    conn = URL("http://$FREE_SWITCH_DOMAIN:3000/api/call-ready")
+                    conn = URL("https://androidpushnotification.vercel.app/api/call-ready")
                         .openConnection() as HttpURLConnection
                     conn.requestMethod = "POST"
                     conn.setRequestProperty("Content-Type", "application/json")
@@ -1240,7 +1263,12 @@ class CoreContext
                         put("readyToken", readyToken)
                     }.toString()
                     OutputStreamWriter(conn.outputStream).use { it.write(body) }
-                    acknowledged = conn.responseCode in 200..299
+                    val responseCode = conn.responseCode
+                    acknowledged = responseCode in 200..299
+                    Log.i(
+                        "$TAG Call-ready HTTP response for [$callId], attempt=[${attempt + 1}], " +
+                                "status=[$responseCode], elapsedMs=[${android.os.SystemClock.elapsedRealtime() - startedAt}]"
+                    )
                 } catch (e: Exception) {
                     Log.w("$TAG Call-ready ACK attempt ${attempt + 1} failed: ${e.message}")
                 } finally {
@@ -1254,9 +1282,9 @@ class CoreContext
                     pendingWakeCallId = null
                     pendingWakeReadyToken = null
                 }
-                Log.i("$TAG Local backend acknowledged SIP readiness for call [$callId]")
+                Log.i("$TAG Vercel API acknowledged SIP readiness for call [$callId] in [${android.os.SystemClock.elapsedRealtime() - startedAt}ms]")
             } else {
-                Log.w("$TAG Could not acknowledge SIP readiness for call [$callId]; FreeSWITCH will use its bounded fallback")
+                Log.w("$TAG Could not acknowledge SIP readiness for call [$callId]; FreeSWITCH will fail this wake call closed")
             }
             synchronized(pendingWakeAckLock) {
                 if (pendingWakeAckInProgressFor == callId) pendingWakeAckInProgressFor = null
@@ -1268,7 +1296,7 @@ class CoreContext
         if (phoneNumber.isBlank() || fcmToken.isBlank()) return
         Thread {
             try {
-                val url = URL("http://$FREE_SWITCH_DOMAIN:3000/api/save-token")
+                val url = URL("https://androidpushnotification.vercel.app/api/save-token")
                 val conn = url.openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json")
@@ -1358,6 +1386,14 @@ class CoreContext
             return
         }
 
+        if (isTranslationCall(call)) {
+            addTCallLanguageHeaders(params)
+            // Custom headers on CallParams are documented for INVITE requests.
+            // Set them on the incoming call itself as well so Linphone includes
+            // them in the 200 OK response generated when accepting this call.
+            call.setParams(params)
+        }
+
         params.recordFile = LinphoneUtils.getRecordingFilePathForAddress(call.remoteAddress)
 
         /*if (LinphoneUtils.checkIfNetworkHasLowBandwidth(context)) {
@@ -1387,6 +1423,30 @@ class CoreContext
         }
 
         call.acceptWithParams(params)
+    }
+
+    @WorkerThread
+    private fun isTranslationCallUsername(username: String): Boolean =
+        username.startsWith("T_", ignoreCase = true) ||
+            username.startsWith("tac_", ignoreCase = true) ||
+            username.startsWith("tvc_", ignoreCase = true)
+
+    @WorkerThread
+    private fun isTranslationCall(call: Call): Boolean =
+        isTranslationCallUsername(call.remoteAddress.username.orEmpty()) ||
+            isTranslationCallUsername(call.toAddress.username.orEmpty()) ||
+            !call.remoteParams?.getCustomHeader("X-User-Language").isNullOrBlank()
+
+    @WorkerThread
+    private fun addTCallLanguageHeaders(params: CallParams) {
+        val language = corePreferences.callLanguage.code
+        if (language.isNullOrBlank()) {
+            Log.w("$TAG T Call language isn't selected; language headers won't be added")
+            return
+        }
+
+        params.addCustomHeader("X-User-Language", language)
+        Log.i("$TAG Added T Call language header: X-User-Language=[$language]")
     }
 
     @WorkerThread

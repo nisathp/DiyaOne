@@ -7,6 +7,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.PopupWindow
 import androidx.annotation.UiThread
+import androidx.appcompat.app.AlertDialog
 import androidx.core.text.isDigitsOnly
 import androidx.databinding.DataBindingUtil
 import androidx.lifecycle.ViewModelProvider
@@ -28,6 +29,7 @@ import com.naminfo.utils.AppUtils
 import com.naminfo.utils.DialogUtils
 import com.naminfo.utils.Event
 import com.naminfo.utils.PhoneContactEditor
+import com.naminfo.translation.CallLanguage
 
 @UiThread
 class HistoryFragment : SlidingPaneChildFragment() {
@@ -159,6 +161,26 @@ class HistoryFragment : SlidingPaneChildFragment() {
             }
         }
 
+        viewModel.showTCallTypeDialogEvent.observe(viewLifecycleOwner) { event ->
+            event.consume { tAddress ->
+                showTCallTypeDialog(tAddress) { isVideo ->
+                    if (isVideo) {
+                        viewModel.startTVideoCall(tAddress)
+                    } else {
+                        viewModel.startTAudioCall(tAddress)
+                    }
+                }
+            }
+        }
+
+        viewModel.showTCallLanguageDialogEvent.observe(viewLifecycleOwner) { event ->
+            event.consume { address ->
+                showTCallLanguageDialog { language ->
+                    viewModel.selectTCallLanguage(language, address)
+                }
+            }
+        }
+
         binding.setBackClickListener {
             goBack()
         }
@@ -271,5 +293,33 @@ class HistoryFragment : SlidingPaneChildFragment() {
         }
 
         dialog.show()
+    }
+
+    private fun showTCallTypeDialog(tAddress: Address, onCallTypeSelected: (isVideo: Boolean) -> Unit) {
+        val options = arrayOf(
+            getString(R.string.t_call_option_audio),
+            getString(R.string.t_call_option_video)
+        )
+        AlertDialog.Builder(requireContext())
+            .setTitle(R.string.contact_t_call_action)
+            .setItems(options) { dialog, which ->
+                val isVideo = (which == 1)
+                onCallTypeSelected(isVideo)
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
+    }
+
+    private fun showTCallLanguageDialog(onLanguageSelected: (CallLanguage) -> Unit) {
+        val languages = CallLanguage.entries.filter { it != CallLanguage.NONE }
+        AlertDialog.Builder(requireContext())
+            .setTitle(R.string.t_call_select_language_title)
+            .setItems(languages.map { it.label }.toTypedArray()) { dialog, which ->
+                languages.getOrNull(which)?.let(onLanguageSelected)
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
     }
 }

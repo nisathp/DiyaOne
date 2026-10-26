@@ -71,6 +71,12 @@ class DrawerMenuFragment : GenericMainFragment() {
             (requireActivity() as MainActivity).closeDrawerMenu()
         }
 
+        binding.setLogsClickedListener {
+            val navController = (requireActivity() as MainActivity).findNavController()
+            navController.navigate(R.id.action_global_sipLogsFragment)
+            (requireActivity() as MainActivity).closeDrawerMenu()
+        }
+
         binding.setVersionClickedListener {
             (requireActivity() as MainActivity).closeDrawerMenu()
             AlertDialog.Builder(requireContext())

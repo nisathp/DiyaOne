@@ -29,6 +29,14 @@ import androidx.navigation.NavDeepLinkBuilder
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
+import com.naminfo.translation.ChatTranslationLanguage
+import com.naminfo.translation.TranslationRepository
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import com.naminfo.compatibility.Compatibility
 import com.naminfo.contacts.AvatarGenerator
 import com.naminfo.contacts.ContactsManager.ContactsListener
@@ -73,6 +81,7 @@ class NotificationsManager
         const val INTENT_TOGGLE_SPEAKER_CALL_NOTIF_ACTION = "com.naminfo.TOGGLE_SPEAKER_CALL_ACTION"
         const val INTENT_REPLY_MESSAGE_NOTIF_ACTION = "com.naminfo.REPLY_ACTION"
         const val INTENT_MARK_MESSAGE_AS_READ_NOTIF_ACTION = "com.naminfo.MARK_AS_READ_ACTION"
+        const val INTENT_TOGGLE_TRANSLATION_NOTIF_ACTION = "com.naminfo.TOGGLE_TRANSLATION_ACTION"
         const val INTENT_FOREGROUND_SERVICE_NOTIF_DISMISSED_ACTION = "com.naminfo.INTENT_FOREGROUND_SERVICE_NOTIF_DISMISSED_ACTION"
         const val INTENT_DENY_CALL_REDIRECTION_ACTION = "com.naminfo.INTENT_DENY_CALL_REDIRECTION_ACTION"
 
@@ -80,6 +89,7 @@ class NotificationsManager
         const val INTENT_HANGUP_CALL_NOTIF_CODE = 3
         const val INTENT_TOGGLE_SPEAKER_CALL_NOTIF_CODE = 4
         const val INTENT_CALL_REDIRECTION_NOTIF_CODE = 5
+        const val INTENT_TOGGLE_TRANSLATION_NOTIF_CODE = 6
 
         const val INTENT_NOTIF_ID = "NOTIFICATION_ID"
 
@@ -93,6 +103,7 @@ class NotificationsManager
         private const val CALL_REDIRECTION_TAG = "Call Redirection"
 
         private const val MISSED_CALL_TAG = "Missed call"
+        private const val WAKE_CALL_NOTIFICATION_TAG = "Wake call"
         private const val CHAT_NOTIFICATIONS_GROUP = "CHAT_NOTIF_GROUP"
 
         private const val DUMMY_NOTIF_ID = 3
@@ -120,6 +131,7 @@ class NotificationsManager
 
     private val callNotificationsMap: HashMap<String, Notifiable> = HashMap()
     private val chatNotificationsMap: HashMap<String, Notifiable> = HashMap()
+    val notificationShowOriginalMap: ConcurrentHashMap<Int, Boolean> = ConcurrentHashMap()
     private val previousChatNotifications: ArrayList<Int> = arrayListOf()
     private val accountsErrorNotificationsMap: HashMap<String, Int> = HashMap()
 
@@ -127,6 +139,72 @@ class NotificationsManager
 
     private var currentlyDisplayedChatRoomId: String = ""
     private var currentlyDisplayedIncomingCallFragment: Boolean = false
+
+    /** Show immediately on data-only FCM; the actionable SIP call notification replaces it. */
+    @AnyThread
+    fun showIncomingCallWakeNotification(callId: String, callerName: String) {
+        if (callId.isBlank()) return
+        if (!Compatibility.isPostNotificationsPermissionGranted(context)) {
+            Log.w("$TAG Can't show FCM wake alert: POST_NOTIFICATIONS permission isn't granted")
+            return
+        }
+        if (!notificationManager.areNotificationsEnabled()) {
+            Log.w("$TAG Can't show FCM wake alert: app notifications are disabled")
+            return
+        }
+
+        val channelId = context.getString(R.string.notification_channel_without_ringtone_incoming_call_id)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+            notificationManager.getNotificationChannel(channelId) == null
+        ) {
+            notificationManager.createNotificationChannel(
+                NotificationChannel(
+                    channelId,
+                    context.getString(R.string.notification_channel_incoming_call_name),
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = context.getString(R.string.notification_channel_incoming_call_name)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                    setShowBadge(false)
+                }
+            )
+        }
+        if (notificationManager.getNotificationChannel(channelId)?.importance == NotificationManager.IMPORTANCE_NONE) {
+            Log.w("$TAG Can't show FCM wake alert: incoming-call notification channel is blocked")
+            return
+        }
+
+        val intent = Intent(context, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        }
+        val contentIntent = PendingIntent.getActivity(
+            context,
+            callId.hashCode(),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(R.drawable.linphone_notification)
+            .setContentTitle(callerName.take(128).ifBlank { context.getString(R.string.wake_call_notification_title) })
+            .setContentText(context.getString(R.string.wake_call_notification_connecting))
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setTimeoutAfter(20_000)
+            .setContentIntent(contentIntent)
+            .build()
+        notificationManager.notify(WAKE_CALL_NOTIFICATION_TAG, callId.hashCode(), notification)
+        Log.i("$TAG Showing immediate FCM wake alert for call [$callId]")
+    }
+
+    @AnyThread
+    fun cancelIncomingCallWakeNotification(callId: String?) {
+        if (callId.isNullOrBlank()) return
+        notificationManager.cancel(WAKE_CALL_NOTIFICATION_TAG, callId.hashCode())
+    }
 
     private lateinit var mediaPlayer: MediaPlayer
 
@@ -198,6 +276,7 @@ class NotificationsManager
             Log.i("$TAG Call state changed: [$currentState]")
             when (currentState) {
                 Call.State.IncomingReceived, Call.State.IncomingEarlyMedia -> {
+                    cancelIncomingCallWakeNotification(call.callLog.callId)
                     Log.i(
                         "$TAG Showing incoming call notification for [${call.remoteAddress.asStringUriOnly()}]"
                     )
@@ -303,7 +382,7 @@ class NotificationsManager
         ) {
 
             val visibleMessages = messages.filter {
-                it != null && !CustomImdn.isReceipt(it)
+                it != null && !CustomImdn.isHiddenControlMessage(it)
             }.toTypedArray()
 
             if (visibleMessages.isEmpty()) return
@@ -1071,7 +1150,7 @@ class NotificationsManager
             }
 
             for (message in chatRoom.unreadHistory) {
-                if (message.isRead || message.isOutgoing) continue
+                if (message.isRead || message.isOutgoing || CustomImdn.isHiddenControlMessage(message)) continue
                 val notifiableMessage = getNotifiableForChatMessage(message)
                 notifiable.messages.add(notifiableMessage)
             }
@@ -1437,6 +1516,8 @@ class NotificationsManager
         }
 
         val isVideo = LinphoneUtils.isVideoEnabled(call)
+        val isTCall = remoteAddress.username.orEmpty().startsWith("T_", ignoreCase = true)
+        Log.i("[Call Diagnostics] NOTIFICATION MANAGER -> Call Notif -> Type: [${if (isVideo) "VIDEO" else "AUDIO"}], From: [${remoteAddress.asStringUriOnly()}], isTCall: [$isTCall], isIncoming: [$isIncoming]")
 
         val smallIcon = if (isConference) {
             R.drawable.video_conference_notification
@@ -1595,13 +1676,73 @@ class NotificationsManager
             }
 
             val senderPerson = if (message.isOutgoing) null else person // Use null for ourselves
-            val text = if (corePreferences.showChatMessageContentInNotification) {
-                message.message
+
+            val rawText = message.message
+            val globalLang = corePreferences.receivedChatTranslationLanguage
+            val conversationId = id
+            val overrideCode = corePreferences.getContactTranslationOverride(conversationId)
+            val effectiveLang = if (!overrideCode.isNullOrEmpty() && !overrideCode.equals("USE_GLOBAL", ignoreCase = true)) {
+                ChatTranslationLanguage.fromCode(overrideCode)
+            } else {
+                globalLang
+            }
+
+            val peerAddressStr = notifiable.remoteAddress ?: message.senderAddress
+            val peerUsername = Factory.instance().createAddress(peerAddressStr)?.username
+                ?: peerAddressStr.substringBefore("@").removePrefix("sip:").trim()
+
+            var translatedText: String? = null
+            if (!message.isOutgoing && effectiveLang != ChatTranslationLanguage.NONE && rawText.isNotBlank()) {
+                val cached = TranslationRepository.getCachedTranslation(message.messageId, effectiveLang)
+                if (cached != null) {
+                    translatedText = cached
+                } else {
+                    translatedText = runBlocking {
+                        withTimeoutOrNull(3500) {
+                            TranslationRepository.translateMessage(message.messageId, peerUsername, rawText, effectiveLang).getOrNull()
+                        }
+                    }
+                    if (translatedText == null) {
+                        val msgId = message.messageId
+                        val localIdent = notifiable.localIdentity.orEmpty()
+                        val remoteIdent = notifiable.remoteAddress.orEmpty()
+                        CoroutineScope(Dispatchers.IO).launch {
+                            val result = TranslationRepository.translateMessage(msgId, peerUsername, rawText, effectiveLang)
+                            if (result.isSuccess && !result.getOrNull().isNullOrBlank()) {
+                                coreContext.postOnCoreThread {
+                                    val localAddr = Factory.instance().createAddress(localIdent)
+                                    val remoteAddr = Factory.instance().createAddress(remoteIdent)
+                                    if (localAddr != null && remoteAddr != null) {
+                                        val params: ConferenceParams? = null
+                                        val chatRoom: ChatRoom? = coreContext.core.searchChatRoom(
+                                            params,
+                                            localAddr,
+                                            remoteAddr,
+                                            arrayOfNulls<Address>(0)
+                                        )
+                                        val chatMsg = chatRoom?.unreadHistory?.find { it.messageId == msgId }
+                                            ?: chatRoom?.lastMessageInHistory
+                                        if (chatRoom != null && chatMsg != null) {
+                                            updateConversationNotification(chatRoom, chatMsg)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            val showOriginalInNotif = notificationShowOriginalMap[notifiable.notificationId] ?: false
+            val displayText = if (showOriginalInNotif) rawText else (translatedText ?: rawText)
+
+            val finalText = if (corePreferences.showChatMessageContentInNotification) {
+                displayText
             } else {
                 AppUtils.getString(R.string.notification_chat_message_hidden_content)
             }
             val tmp = NotificationCompat.MessagingStyle.Message(
-                text,
+                finalText,
                 message.time,
                 senderPerson
             )
@@ -1637,6 +1778,7 @@ class NotificationsManager
             .setContentIntent(pendingIntent)
             .addAction(getMarkMessageAsReadAction(notifiable))
             .addAction(getReplyMessageAction(notifiable))
+            .addAction(getToggleTranslationAction(notifiable))
             .setShortcutId(id)
             .setLocusId(LocusIdCompat(id))
 
@@ -1651,6 +1793,53 @@ class NotificationsManager
         }
 
         return notificationBuilder.build()
+    }
+
+    @AnyThread
+    private fun getToggleTranslationAction(notifiable: Notifiable): NotificationCompat.Action {
+        val showOriginal = notificationShowOriginalMap[notifiable.notificationId] ?: false
+        val actionTitle = if (showOriginal) {
+            context.getString(R.string.show_translation_label)
+        } else {
+            context.getString(R.string.show_original_label)
+        }
+
+        val toggleIntent = Intent(context, NotificationBroadcastReceiver::class.java).apply {
+            action = INTENT_TOGGLE_TRANSLATION_NOTIF_ACTION
+            putExtra(INTENT_NOTIF_ID, notifiable.notificationId)
+            putExtra(INTENT_LOCAL_IDENTITY, notifiable.localIdentity)
+            putExtra(INTENT_REMOTE_SIP_URI, notifiable.remoteAddress)
+        }
+
+        val togglePendingIntent = PendingIntent.getBroadcast(
+            context,
+            notifiable.notificationId,
+            toggleIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Action.Builder(
+            R.drawable.chat_teardrop_text,
+            actionTitle,
+            togglePendingIntent
+        ).build()
+    }
+
+    @WorkerThread
+    fun toggleNotificationTranslation(chatRoom: ChatRoom, notificationId: Int) {
+        val current = notificationShowOriginalMap[notificationId] ?: false
+        notificationShowOriginalMap[notificationId] = !current
+
+        val notifiable = getNotifiableForConversation(chatRoom, arrayOf())
+        val me = coreContext.contactsManager.getMePerson(chatRoom.localAddress)
+        val pendingIntent = getChatRoomPendingIntent(chatRoom, notifiable.notificationId)
+        val notification = createMessageNotification(
+            notifiable,
+            pendingIntent,
+            LinphoneUtils.getConversationId(chatRoom),
+            me
+        )
+        notify(notifiable.notificationId, notification, CHAT_TAG)
     }
 
     @WorkerThread

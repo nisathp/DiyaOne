@@ -15,8 +15,11 @@ import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.UiThread
+import androidx.appcompat.app.AlertDialog
 import androidx.navigation.fragment.findNavController
 import androidx.navigation.navGraphViewModels
+import com.naminfo.translation.CallLanguage
+import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.compatibility.Compatibility
 import org.linphone.core.tools.Log
@@ -192,6 +195,12 @@ class SettingsFragment : GenericMainFragment() {
                     "$TAG Call redirection service enabled, making sure we have the required permissions and role granted"
                 )
                 requestCallRedirectionRole()
+            }
+        }
+
+        viewModel.showCallLanguageDialogEvent.observe(viewLifecycleOwner) {
+            it.consume {
+                showCallLanguageDialog()
             }
         }
 
@@ -388,6 +397,22 @@ class SettingsFragment : GenericMainFragment() {
         }
 
         dialog.show()
+    }
+
+    private fun showCallLanguageDialog() {
+        val current = corePreferences.callLanguage
+        val options = CallLanguage.entries.map { it.label }.toTypedArray()
+        val selectedIndex = CallLanguage.entries.indexOf(current).coerceAtLeast(0)
+
+        AlertDialog.Builder(requireContext())
+            .setTitle(R.string.settings_calls_call_language_title)
+            .setSingleChoiceItems(options, selectedIndex) { dialog, which ->
+                val selectedLang = CallLanguage.entries.getOrNull(which) ?: CallLanguage.NONE
+                viewModel.updateCallLanguage(selectedLang)
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
     }
 
     private val requestPermissionLauncher = registerForActivityResult(

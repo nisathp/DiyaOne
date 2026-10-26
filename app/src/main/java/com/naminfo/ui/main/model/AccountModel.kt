@@ -114,7 +114,7 @@ class AccountModel
             messages: Array<out ChatMessage>
         ) {
             val visibleMessages = messages.filter {
-                it != null && !CustomImdn.isReceipt(it)
+                it != null && !CustomImdn.isHiddenControlMessage(it)
             }.toTypedArray()
 
             if (visibleMessages.isEmpty()) return
@@ -187,7 +187,10 @@ class AccountModel
 
     @WorkerThread
     fun computeNotificationsCount() {
-        notificationsCount.postValue(account.unreadChatMessageCount + account.missedCallsCount)
+        val unreadMessages = coreContext.core.chatRooms
+            .filter { LinphoneUtils.getAccountForAddress(it.localAddress) == account }
+            .sumOf(CustomImdn::visibleUnreadMessagesCount)
+        notificationsCount.postValue(unreadMessages + account.missedCallsCount)
     }
 
     @WorkerThread

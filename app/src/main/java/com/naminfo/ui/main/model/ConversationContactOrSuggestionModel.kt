@@ -6,9 +6,9 @@ import androidx.lifecycle.MutableLiveData
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import org.linphone.core.Address
 import org.linphone.core.Friend
+import com.naminfo.ui.main.chat.resolveConversationDisplayName
 import com.naminfo.ui.main.contacts.model.ContactAvatarModel
 import com.naminfo.utils.AppUtils
-import com.naminfo.utils.LinphoneUtils
 
 class ConversationContactOrSuggestionModel
     @WorkerThread
@@ -28,12 +28,13 @@ class ConversationContactOrSuggestionModel
 
     val displayNumber = address.username.orEmpty()
 
-    val name = conversationSubject
-        ?: if (friend != null) {
-            friend.name ?: LinphoneUtils.getDisplayName(address)
-        } else {
-            address.username ?: address.domain.orEmpty()
-        }
+    val name = resolveConversationDisplayName(
+        conversationSubject,
+        friend?.name,
+        address.displayName,
+        address.username,
+        address.domain
+    )
 
     val sipUri = if (!corePreferences.hideSipAddresses) {
         // Hide SIP address and only show username for suggestions

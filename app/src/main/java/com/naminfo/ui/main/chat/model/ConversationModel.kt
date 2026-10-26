@@ -2,13 +2,25 @@ package com.naminfo.ui.main.chat.model
 
 import android.text.Spannable
 import android.text.SpannableStringBuilder
+import android.graphics.Typeface
 import androidx.annotation.UiThread
 import androidx.annotation.WorkerThread
 import androidx.core.text.toSpannable
+import android.text.style.StyleSpan
 import androidx.lifecycle.MutableLiveData
 import com.naminfo.DiyaOneApplication.Companion.coreContext
+import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
+import com.naminfo.core.CustomComposing
 import com.naminfo.core.CustomImdn
+import com.naminfo.translation.ChatTranslationLanguage
+import com.naminfo.translation.TranslationRepository
+import com.naminfo.ui.main.chat.decodeReplyPreviewEnvelope
+import com.naminfo.ui.main.chat.ChatDraftRepository
+import com.naminfo.ui.main.chat.RemoteComposingState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.linphone.core.Address
 import org.linphone.core.ChatMessage
 import org.linphone.core.ChatMessageListenerStub
@@ -61,6 +73,10 @@ class ConversationModel
 
     val lastMessageText = MutableLiveData<Spannable>()
 
+    val draftText = MutableLiveData<Spannable>()
+
+    val isDraft = MutableLiveData<Boolean>()
+
     val lastMessageDeliveryIcon = MutableLiveData<Int>()
 
     val lastMessageContentIcon = MutableLiveData<Int>()
@@ -81,11 +97,31 @@ class ConversationModel
 
     private var customReceiptState: Pair<String, ChatMessage.State>? = null
 
+    private val remoteComposingState = RemoteComposingState {
+        coreContext.postOnCoreThread { computeComposingLabel() }
+    }
+
+    private val draftObserver: (String, String) -> Unit = { conversationId, text ->
+        if (conversationId == id) updateDraftPreview(text)
+    }
+
     private val customReceiptObserver: (String, ChatMessage.State) -> Unit = { messageKey, state ->
         val message = lastMessage
         if (message != null && message.isOutgoing && CustomImdn.key(message) == messageKey) {
             customReceiptState = messageKey to state
             lastMessageDeliveryIcon.postValue(LinphoneUtils.getChatIconResId(state))
+        }
+    }
+
+    private val customComposingObserver: (String, String, Boolean) -> Unit = { roomKey, address, active ->
+        if (roomKey == CustomComposing.roomKey(chatRoom)) {
+            coreContext.postOnCoreThread {
+                val parsedAddress = coreContext.core.interpretUrl(address, false)
+                val displayName = parsedAddress?.let { LinphoneUtils.getDisplayName(it) }
+                    ?.takeIf { it.isNotBlank() } ?: address
+                remoteComposingState.update(address, displayName, active)
+                computeComposingLabel()
+            }
         }
     }
 
@@ -122,6 +158,11 @@ class ConversationModel
             remoteAddress: Address,
             isComposing: Boolean
         ) {
+            val address = remoteAddress.asStringUriOnly()
+            val avatar = coreContext.contactsManager.getContactAvatarModelForAddress(remoteAddress)
+            val displayName = avatar.name.value?.takeIf { it.isNotBlank() }
+                ?: LinphoneUtils.getDisplayName(remoteAddress)
+            remoteComposingState.update(address, displayName, isComposing)
             computeComposingLabel()
         }
 
@@ -134,7 +175,7 @@ class ConversationModel
         override fun onNewEvents(chatRoom: ChatRoom, eventLogs: Array<out EventLog>) {
             updateLastMessage()
             updateLastUpdatedTime()
-            unreadMessageCount.postValue(chatRoom.unreadMessagesCount)
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
         }
 
         @WorkerThread
@@ -144,7 +185,7 @@ class ConversationModel
 
         @WorkerThread
         override fun onChatRoomRead(chatRoom: ChatRoom) {
-            unreadMessageCount.postValue(chatRoom.unreadMessagesCount)
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
         }
 
         @WorkerThread
@@ -171,7 +212,7 @@ class ConversationModel
                 Log.i("$TAG Last message [${message.messageId}] has been retracted")
                 updateLastMessage()
             }
-            unreadMessageCount.postValue(chatRoom.unreadMessagesCount)
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
         }
 
         @WorkerThread
@@ -191,8 +232,13 @@ class ConversationModel
     }
 
     init {
+        // Prune duplicates persisted by earlier FreeSWITCH fan-out before the
+        // conversation preview and message list read the room history.
+        CustomImdn.removeDuplicateIncomingMessages(chatRoom)
         chatRoom.addListener(chatRoomListener)
         CustomImdn.addObserver(customReceiptObserver)
+        CustomComposing.addObserver(customComposingObserver)
+        ChatDraftRepository.addObserver(draftObserver)
 
         computeComposingLabel()
         subject.postValue(chatRoom.subjectUtf8)
@@ -206,15 +252,20 @@ class ConversationModel
         )
         lastMessageContentIcon.postValue(0)
 
+        updateDraftPreview(ChatDraftRepository.get(id))
+
         updateLastMessage()
         updateLastUpdatedTime()
 
-        unreadMessageCount.postValue(chatRoom.unreadMessagesCount)
+        unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
     }
 
     @WorkerThread
     fun destroy() {
         CustomImdn.removeObserver(customReceiptObserver)
+        CustomComposing.removeObserver(customComposingObserver)
+        ChatDraftRepository.removeObserver(draftObserver)
+        remoteComposingState.clear()
         customReceiptState = null
         lastMessage?.removeListener(chatMessageListener)
         lastMessage = null
@@ -222,11 +273,25 @@ class ConversationModel
         chatRoom.removeListener(chatRoomListener)
     }
 
+    private fun updateDraftPreview(text: String) {
+        val draft = text.trim()
+        isDraft.postValue(draft.isNotEmpty())
+        if (draft.isEmpty()) {
+            draftText.postValue(SpannableStringBuilder("").toSpannable())
+            return
+        }
+
+        val label = coreContext.context.getString(R.string.conversations_list_draft_label)
+        val preview = SpannableStringBuilder("$label $draft")
+        preview.setSpan(StyleSpan(Typeface.BOLD), 0, label.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        draftText.postValue(preview.toSpannable())
+    }
+
     @UiThread
     fun markAsRead() {
         coreContext.postOnCoreThread {
             chatRoom.markAsRead()
-            unreadMessageCount.postValue(chatRoom.unreadMessagesCount)
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
             Log.i("$TAG Conversation [$id] has been marked as read")
         }
     }
@@ -234,7 +299,7 @@ class ConversationModel
     @UiThread
     fun updateUnreadCount() {
         coreContext.postOnCoreThread {
-            unreadMessageCount.postValue(chatRoom.unreadMessagesCount)
+            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
         }
     }
 
@@ -316,7 +381,46 @@ class ConversationModel
         } else {
             lastMessageTextSender.postValue("")
         }
-        lastMessageText.postValue(LinphoneUtils.getFormattedTextDescribingMessage(message))
+        val textContent = message.contents.find { it.isText && !it.isFile }?.utf8Text?.trim().orEmpty()
+        val decodedReply = decodeReplyPreviewEnvelope(textContent)
+        val visibleText = decodedReply?.second ?: textContent
+        val rawSpannable = if (decodedReply != null) {
+            SpannableStringBuilder(visibleText).toSpannable()
+        } else {
+            LinphoneUtils.getFormattedTextDescribingMessage(message)
+        }
+        val globalLang = corePreferences.receivedChatTranslationLanguage
+        val conversationId = LinphoneUtils.getConversationId(chatRoom)
+        val overrideCode = corePreferences.getContactTranslationOverride(conversationId)
+        val effectiveLang = if (!overrideCode.isNullOrEmpty() && !overrideCode.equals("USE_GLOBAL", ignoreCase = true)) {
+            ChatTranslationLanguage.fromCode(overrideCode)
+        } else {
+            globalLang
+        }
+
+        if (!isOutgoing && effectiveLang != ChatTranslationLanguage.NONE && !message.isRetracted) {
+            val messageId = message.messageId
+            val cachedTranslation = TranslationRepository.getCachedTranslation(messageId, effectiveLang)
+            if (cachedTranslation != null) {
+                lastMessageText.postValue(SpannableStringBuilder(cachedTranslation).toSpannable())
+            } else {
+                lastMessageText.postValue(rawSpannable)
+                val peerUsername = chatRoom.peerAddress.username ?: ""
+                if (visibleText.isNotBlank()) {
+                    CoroutineScope(Dispatchers.IO).launch {
+                        val result = TranslationRepository.translateMessage(messageId, peerUsername, visibleText, effectiveLang)
+                        if (result.isSuccess) {
+                            val translated = result.getOrNull()
+                            if (!translated.isNullOrBlank()) {
+                                lastMessageText.postValue(SpannableStringBuilder(translated).toSpannable())
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            lastMessageText.postValue(rawSpannable)
+        }
 
         isLastMessageOutgoing.postValue(isOutgoing)
         if (isOutgoing) {
@@ -347,10 +451,10 @@ class ConversationModel
         lastMessage = null
 
         val latestMessage = chatRoom.lastMessageInHistory
-        val message = if (CustomImdn.isReceipt(latestMessage)) {
+        val message = if (CustomImdn.isHiddenControlMessage(latestMessage)) {
             chatRoom.getHistoryMessageEvents(0).asSequence()
                 .mapNotNull { it.chatMessage }
-                .lastOrNull { !CustomImdn.isReceipt(it) }
+                .lastOrNull { !CustomImdn.isHiddenControlMessage(it) }
         } else {
             latestMessage
         }
@@ -473,6 +577,12 @@ class ConversationModel
 
     @WorkerThread
     private fun computeComposingLabel() {
+        val names = remoteComposingState.participantNamesOrNull()
+        if (names != null) {
+            updateComposingLabel(names)
+            return
+        }
+
         val composing = chatRoom.isRemoteComposing
         isComposing.postValue(composing)
         val pair = LinphoneUtils.getComposingIconAndText(chatRoom)
@@ -480,5 +590,23 @@ class ConversationModel
         composingIcon.postValue(icon)
         val label = pair.second
         composingLabel.postValue(label)
+    }
+
+    @WorkerThread
+    private fun updateComposingLabel(names: List<String>) {
+        val isActive = names.isNotEmpty()
+        isComposing.postValue(isActive)
+        composingIcon.postValue(if (isActive) R.drawable.chat_teardrop_dots else 0)
+        composingLabel.postValue(
+            if (isActive) {
+                AppUtils.getStringWithPlural(
+                    R.plurals.conversation_composing_label,
+                    names.size,
+                    names.joinToString(", ")
+                )
+            } else {
+                ""
+            }
+        )
     }
 }

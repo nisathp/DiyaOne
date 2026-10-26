@@ -30,6 +30,9 @@
             name="translateClickListener"
             type="View.OnClickListener" />
         <variable
+            name="clearMessagesClickListener"
+            type="View.OnClickListener" />
+        <variable
             name="conversationMuted"
             type="Boolean" />
         <variable
@@ -152,6 +155,19 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintTop_toBottomOf="@id/documents"
+            app:layout_constraintBottom_toTopOf="@id/clear_messages"/>
+
+        <androidx.appcompat.widget.AppCompatTextView
+            style="@style/popup_menu_item"
+            android:id="@+id/clear_messages"
+            android:onClick="@{clearMessagesClickListener}"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:text="@string/conversation_menu_clear_messages"
+            android:drawableStart="@drawable/trash"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/translate"
             app:layout_constraintBottom_toTopOf="@id/bottom_anchor"/>
 
 
@@ -163,7 +179,7 @@
             app:layout_constraintWidth_max="@dimen/popup_menu_width"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/translate"
+            app:layout_constraintTop_toBottomOf="@id/clear_messages"
             app:layout_constraintBottom_toBottomOf="parent" />
 
     </androidx.constraintlayout.widget.ConstraintLayout>

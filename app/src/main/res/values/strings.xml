@@ -29,7 +29,7 @@
     <string name="emoji_tear" translatable="false">😢</string>
 
     <string name="help_about_open_source_licenses_title" translatable="false">GNU General Public License v3.0</string>
-    <string name="help_about_open_source_licenses_subtitle" translatable="false">© Belledonne Communications 2010-2025</string>
+    <string name="help_about_open_source_licenses_subtitle" translatable="false">© Naminfocom 2010-2025</string>
     <string name="help_advanced_send_debug_logs_email_address" translatable="false">linphone-android@belledonne-communications.com</string>
 
     <string name="website_contact_url" translatable="false">https://linphone.org/contact</string>
@@ -89,6 +89,8 @@
     <!-- Related to Android notifications -->
     <string name="notification_channel_call_name">Active calls notifications</string>
     <string name="notification_channel_incoming_call_name">Incoming calls notifications</string>
+    <string name="wake_call_notification_title">Incoming call</string>
+    <string name="wake_call_notification_connecting">Connecting your call…</string>
     <string name="notification_channel_missed_call_name">Missed calls notifications</string>
     <string name="notification_channel_service_name">Service notification</string>
     <string name="notification_channel_service_desc">This service will run all the time to keep app alive and allow you to receive calls and messages without push notifications.</string>
@@ -223,6 +225,28 @@
     <string name="drawer_menu_no_account_configured_yet">No account configured yet</string>
     <string name="drawer_menu_add_account">Add an account</string>
     <string name="drawer_menu_invite">Invite</string>
+    <string name="drawer_menu_logs">Logs</string>
+    <string name="sip_logs_title">SIP Logs</string>
+    <string name="sip_logs_subtitle">Call signalling captured by this phone. Open Logs on the other phone to compare its side.</string>
+    <string name="sip_logs_empty">No SIP call messages yet. Place or receive a call and check again.</string>
+    <string name="sip_logs_call_title">Call %1$d</string>
+    <string name="sip_logs_sent">Sent from this phone</string>
+    <string name="sip_logs_received">Received on this phone</string>
+    <string name="sip_logs_from">From: %1$s</string>
+    <string name="sip_logs_to">To: %1$s</string>
+    <string name="sip_logs_direction_unknown">Direction unavailable</string>
+    <string name="sip_logs_details">SIP + SDP details</string>
+    <string name="sip_logs_hide_details">Hide details</string>
+    <string name="sip_logs_local_identity">This phone: %1$s</string>
+    <string name="sip_logs_clear">Clear</string>
+    <string name="sip_logs_copy">Copy</string>
+    <string name="sip_logs_clear_confirm_title">Clear SIP logs?</string>
+    <string name="sip_logs_clear_confirm_message">This clears the saved SIP trace from this phone.</string>
+    <string name="sip_logs_cleared">SIP logs cleared</string>
+    <string name="sip_logs_copied">SIP trace copied</string>
+    <string name="sip_logs_sdp_audio_only">Audio only SDP</string>
+    <string name="sip_logs_sdp_audio_video">Audio + video SDP</string>
+    <string name="sip_logs_sdp_video_only">Video SDP</string>
     <string name="drawer_menu_invite_text">You are invited to use &appName; for audio/video calls, conferences, and messaging.</string>
     <string name="drawer_menu_invite_chooser">Invite using</string>
     <string name="drawer_menu_version">Version</string>
@@ -555,6 +579,7 @@
     <!-- Chat -->
     <string name="conversations_list_empty">No conversation related to this account for the moment…</string>
     <string name="conversations_list_is_being_removed_label">Removal in progress…</string>
+    <string name="conversations_list_draft_label">Draft:</string>
     <string name="conversations_last_message_format">%s:</string>
     <plurals name="conversations_files_waiting_to_be_shared_toast">
         <item quantity="one">%s file waiting to be shared</item>
@@ -588,8 +613,8 @@
     <string name="new_conversation_no_matching_contact">No matching result…</string>
     <string name="conversation_text_field_hint">Say something…</string>
     <plurals name="conversation_composing_label">
-        <item quantity="one">%s is composing…</item>
-        <item quantity="other">%s are composing…</item>
+        <item quantity="one">%s is typing…</item>
+        <item quantity="other">%s are typing…</item>
     </plurals>
     <string name="conversation_add_participants_title">Add participants</string>
     <string name="conversation_reply_to_message_title">Replying to:</string>
@@ -598,6 +623,7 @@
     <string name="conversation_menu_configure_ephemeral_messages">Ephemeral messages</string>
     <string name="conversation_menu_media_files">Media</string>
     <string name="conversation_menu_documents_files">Documents</string>
+    <string name="conversation_menu_clear_messages">Clear messages</string>
     <string name="conversation_no_media_found">No media found…</string>
     <string name="conversation_no_document_found">No document found…</string>
     <string name="conversation_end_to_end_encrypted_event_title">End-to-end encrypted conversation</string>
@@ -1110,9 +1136,25 @@
 
     <string name="translation_language_none">None</string>
     <string name="translation_language_tamil">Tamil</string>
+    <string name="translation_language_telugu" translatable="false">Telugu</string>
     <string name="translation_language_english">English</string>
     <string name="translation_language_hindi">Hindi</string>
     <string name="translation_language_chinese">Chinese</string>
     <string name="translation_language_arabic">Arabic</string>
     <string name="translation_language_spanish">Spanish</string>
+
+    <string name="contact_t_call_action" translatable="false">T Call</string>
+    <string name="history_filter_all" translatable="false">All</string>
+    <string name="history_filter_regular" translatable="false">Regular</string>
+    <string name="history_filter_t_calls" translatable="false">T Calls</string>
+    <string name="settings_calls_call_language_title" translatable="false">Call language</string>
+    <string name="t_call_select_language_title" translatable="false">Select your language for T Call</string>
+    <string name="t_call_option_audio" translatable="false">Audio Call</string>
+    <string name="t_call_option_video" translatable="false">Video Call</string>
+
+    <string name="history_select_all" translatable="false">Select all</string>
+    <string name="select_none" translatable="false">Select none</string>
+    <string name="history_selected_count" translatable="false">%d selected</string>
+    <string name="history_delete_selected_dialog_title" translatable="false">Delete selected call logs?</string>
+    <string name="history_delete_selected_dialog_message" translatable="false">Are you sure you want to delete the selected call logs?</string>
 </resources>

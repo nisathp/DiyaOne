@@ -16,6 +16,7 @@ import com.google.android.material.bottomsheet.BottomSheetDialogFragment
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
+import org.linphone.core.Address
 import org.linphone.core.Factory
 import org.linphone.core.tools.Log
 import com.naminfo.databinding.ContactFragmentBinding
@@ -35,6 +36,7 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
+import com.naminfo.translation.CallLanguage
 import androidx.appcompat.widget.SearchView
 import com.naminfo.ui.main.contacts.viewmodel.ConferenceCallViewModel
 import com.naminfo.ui.main.contacts.viewmodel.ContactsListViewModel
@@ -228,6 +230,26 @@ class ContactFragment : SlidingPaneChildFragment() {
                             refKey
                         )
                     findNavController().navigate(action)
+                }
+            }
+        }
+
+        viewModel.showTCallTypeDialogEvent.observe(viewLifecycleOwner) { event ->
+            event.consume { tAddress ->
+                showTCallTypeDialog(tAddress) { isVideo ->
+                    if (isVideo) {
+                        viewModel.startTVideoCall(tAddress)
+                    } else {
+                        viewModel.startTAudioCall(tAddress)
+                    }
+                }
+            }
+        }
+
+        viewModel.showTCallLanguageDialogEvent.observe(viewLifecycleOwner) { event ->
+            event.consume { address ->
+                showTCallLanguageDialog { language ->
+                    viewModel.selectTCallLanguage(language, address)
                 }
             }
         }
@@ -431,6 +453,34 @@ class ContactFragment : SlidingPaneChildFragment() {
 
         conferencePicker?.dismiss()
         conferencePicker = null
+    }
+
+    private fun showTCallTypeDialog(tAddress: org.linphone.core.Address, onCallTypeSelected: (isVideo: Boolean) -> Unit) {
+        val options = arrayOf(
+            getString(R.string.t_call_option_audio),
+            getString(R.string.t_call_option_video)
+        )
+        AlertDialog.Builder(requireContext())
+            .setTitle(R.string.contact_t_call_action)
+            .setItems(options) { dialog, which ->
+                val isVideo = (which == 1)
+                onCallTypeSelected(isVideo)
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
+    }
+
+    private fun showTCallLanguageDialog(onLanguageSelected: (CallLanguage) -> Unit) {
+        val languages = CallLanguage.entries.filter { it != CallLanguage.NONE }
+        AlertDialog.Builder(requireContext())
+            .setTitle(R.string.t_call_select_language_title)
+            .setItems(languages.map { it.label }.toTypedArray()) { dialog, which ->
+                languages.getOrNull(which)?.let(onLanguageSelected)
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
     }
 
     private fun copyNumberOrAddressToClipboard(value: String, isSip: Boolean) {

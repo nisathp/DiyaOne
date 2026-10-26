@@ -21,7 +21,6 @@ class EndedCallFragment : GenericCallFragment() {
         private const val TAG = "[Ended Call Fragment]"
 
         private const val LOCALLY_TERMINATED_CALL_TIMEOUT: Long = 1000
-        private const val REMOTELY_TERMINATED_CALL_TIMEOUT: Long = 2000
     }
 
     private lateinit var binding: CallEndedFragmentBinding
@@ -69,10 +68,7 @@ class EndedCallFragment : GenericCallFragment() {
                 )
                 delay(LOCALLY_TERMINATED_CALL_TIMEOUT)
             } else {
-                Log.i(
-                    "$TAG Call terminated by remote end, waiting 2 seconds before finishing activity"
-                )
-                delay(REMOTELY_TERMINATED_CALL_TIMEOUT)
+                Log.i("$TAG Call terminated by remote end, finishing activity immediately")
             }
 
             Log.i("$TAG Returning to main activity")

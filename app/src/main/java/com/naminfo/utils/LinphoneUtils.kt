@@ -34,6 +34,7 @@ import org.linphone.core.MediaDirection
 import org.linphone.core.Reason
 import org.linphone.core.tools.Log
 import com.naminfo.ui.main.contacts.model.ContactAvatarModel
+import com.naminfo.ui.main.chat.resolveComposingNames
 import com.naminfo.ui.main.model.isEndToEndEncryptionMandatory
 
 class LinphoneUtils {
@@ -390,13 +391,8 @@ class LinphoneUtils {
                 return false
             }
 
-            val conference = call.conference
-            val isConference = conference != null
-
             val isIncoming = isCallIncoming(call.state)
-            return if (isConference || getConferenceInfoIfAny(call) != null) {
-                true
-            } else if (isIncoming || call.state == Call.State.Connected) { // In connected state call.currentParams.isVideoEnabled will return false...
+            return if (isIncoming || call.state == Call.State.Connected) {
                 call.remoteParams?.isVideoEnabled == true && call.remoteParams?.videoDirection != MediaDirection.Inactive
             } else {
                 call.currentParams.isVideoEnabled && call.currentParams.videoDirection != MediaDirection.Inactive
@@ -584,27 +580,30 @@ class LinphoneUtils {
             }
 
             val icon = R.drawable.chat_teardrop_dots
-            val composingFriends = arrayListOf<String>()
-            var label = ""
-            for (participant in chatRoom.composingParticipants) {
+            val participantNames = chatRoom.composingParticipants.map { participant ->
                 val address = participant.address
                 val avatar = coreContext.contactsManager.getContactAvatarModelForAddress(address)
-                val name = avatar.name.value ?: getDisplayName(address)
-                composingFriends.add(name)
-                label += "$name, "
+                val name = avatar.name.value?.takeIf { it.isNotBlank() } ?: getDisplayName(address)
+                name
             }
-            if (composingFriends.isNotEmpty()) {
-                label = label.dropLast(2)
-
-                // TODO: use voice recording content type to change icon/text
-                val format = AppUtils.getStringWithPlural(
-                    R.plurals.conversation_composing_label,
-                    composingFriends.size,
-                    label
-                )
-                return Pair(icon, format)
+            val isOneToOne = chatRoom.hasCapability(ChatRoom.Capabilities.OneToOne.toInt())
+            val peerName = if (isOneToOne) {
+                val address = chatRoom.peerAddress
+                val avatar = coreContext.contactsManager.getContactAvatarModelForAddress(address)
+                avatar.name.value?.takeIf { it.isNotBlank() } ?: getDisplayName(address)
+            } else {
+                null
             }
 
+            val composingNames = resolveComposingNames(participantNames, isOneToOne, peerName)
+            if (composingNames.isEmpty()) return Pair(icon, "")
+
+            // TODO: use voice recording content type to change icon/text
+            val label = AppUtils.getStringWithPlural(
+                R.plurals.conversation_composing_label,
+                composingNames.size,
+                composingNames.joinToString(", ")
+            )
             return Pair(icon, label)
         }
 

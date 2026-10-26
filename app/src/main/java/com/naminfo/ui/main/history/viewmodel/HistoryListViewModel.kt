@@ -19,12 +19,21 @@ import org.linphone.core.tools.Log
 import com.naminfo.ui.main.contacts.model.ContactAvatarModel
 import com.naminfo.ui.main.history.model.CallLogModel
 import com.naminfo.ui.main.history.model.CallLogModelWrapper
+import com.naminfo.ui.main.history.model.TranslationCallHistoryMetadata
 import com.naminfo.ui.main.model.ConversationContactOrSuggestionModel
 import com.naminfo.ui.main.viewmodel.AbstractMainViewModel
+import com.naminfo.R
+import com.naminfo.utils.AppUtils
 import com.naminfo.utils.Event
 import com.naminfo.utils.LinphoneUtils
 import java.text.Collator
 import java.util.Locale
+
+enum class CallHistoryFilterMode {
+    ALL,
+    REGULAR,
+    T_CALLS
+}
 
 class HistoryListViewModel
     @UiThread
@@ -32,6 +41,14 @@ class HistoryListViewModel
     companion object {
         private const val TAG = "[History List ViewModel]"
     }
+
+    val selectedHistoryFilterMode = MutableLiveData<CallHistoryFilterMode>(CallHistoryFilterMode.ALL)
+
+    val isSelectionMode = MutableLiveData<Boolean>(false)
+    val selectedCount = MutableLiveData<Int>(0)
+    val selectedCountTitle = MutableLiveData<String>("")
+    val isAllSelected = MutableLiveData<Boolean>(false)
+    private val selectedCallLogIds = HashSet<String>()
 
     val callLogs = MutableLiveData<ArrayList<CallLogModelWrapper>>()
 
@@ -113,19 +130,93 @@ class HistoryListViewModel
     @UiThread
     fun removeAllCallLogs() {
         coreContext.postOnCoreThread { core ->
-            // TODO FIXME: remove workaround later
-            if (coreContext.core.accountList.size > 1) {
-                val account = LinphoneUtils.getDefaultAccount()
-                if (account != null) {
-                    account.clearCallLogs()
-                } else {
-                    core.clearCallLogs()
-                }
-            } else {
-                core.clearCallLogs()
-            }
+            val account = LinphoneUtils.getDefaultAccount()
+            account?.clearCallLogs()
+            core.clearCallLogs()
 
             historyDeletedEvent.postValue(Event(true))
+            computeCallLogsList(currentFilter)
+        }
+    }
+
+    @UiThread
+    fun selectHistoryFilterMode(mode: CallHistoryFilterMode) {
+        selectedHistoryFilterMode.value = mode
+        filter()
+    }
+
+    @UiThread
+    fun enterSelectionMode(initialModel: CallLogModel? = null) {
+        selectedCallLogIds.clear()
+        if (initialModel != null) {
+            selectedCallLogIds.add(initialModel.id.orEmpty())
+        }
+        isSelectionMode.value = true
+        updateSelectionState()
+    }
+
+    @UiThread
+    fun exitSelectionMode() {
+        selectedCallLogIds.clear()
+        isSelectionMode.value = false
+        updateSelectionState()
+    }
+
+    @UiThread
+    fun toggleSelection(model: CallLogModel) {
+        val modelId = model.id.orEmpty()
+        if (selectedCallLogIds.contains(modelId)) {
+            selectedCallLogIds.remove(modelId)
+        } else {
+            selectedCallLogIds.add(modelId)
+        }
+        updateSelectionState()
+    }
+
+    @UiThread
+    fun toggleSelectAll() {
+        val currentLogs = callLogs.value.orEmpty().mapNotNull { it.callLogModel }
+        if (isAllSelected.value == true) {
+            selectedCallLogIds.clear()
+        } else {
+            selectedCallLogIds.clear()
+            selectedCallLogIds.addAll(currentLogs.mapNotNull { it.id })
+        }
+        updateSelectionState()
+    }
+
+    fun updateSelectionState() {
+        val count = selectedCallLogIds.size
+        selectedCount.postValue(count)
+        selectedCountTitle.postValue(AppUtils.getString(R.string.history_selected_count).format(count))
+
+        val totalCount = callLogs.value.orEmpty().mapNotNull { it.callLogModel }.size
+        isAllSelected.postValue(totalCount > 0 && count == totalCount)
+
+        for (wrapper in callLogs.value.orEmpty()) {
+            val model = wrapper.callLogModel ?: continue
+            val selected = selectedCallLogIds.contains(model.id.orEmpty())
+            model.isSelected.postValue(selected)
+            model.isSelectionMode.postValue(isSelectionMode.value == true)
+        }
+    }
+
+    @UiThread
+    fun deleteSelectedCallLogs() {
+        val allDisplayedModels = callLogs.value.orEmpty().mapNotNull { it.callLogModel }
+        val selectedModels = allDisplayedModels.filter { selectedCallLogIds.contains(it.id.orEmpty()) }
+
+        coreContext.postOnCoreThread { core ->
+            for (model in selectedModels) {
+                val logsToRemove = core.callLogs.filter { it.remoteAddress.weakEqual(model.address) }
+                for (log in logsToRemove) {
+                    core.removeCallLog(log)
+                }
+            }
+
+            coreContext.postOnMainThread {
+                exitSelectionMode()
+            }
             computeCallLogsList(currentFilter)
         }
     }
@@ -167,7 +258,24 @@ class HistoryListViewModel
             localAddress?.weakEqual(it.localAddress) == true
         }
 
-        for (callLog in logs) {
+        val mode = selectedHistoryFilterMode.value ?: CallHistoryFilterMode.ALL
+        val filteredLogs = logs.filter { log ->
+            val username = log.remoteAddress.username.orEmpty()
+            val isTCall = username.startsWith("T_", ignoreCase = true) ||
+                username.startsWith("tac_", ignoreCase = true) ||
+                username.startsWith("tvc_", ignoreCase = true) ||
+                TranslationCallHistoryMetadata.isTranslationCall(
+                    coreContext.context,
+                    log.callId ?: log.refKey
+                )
+            when (mode) {
+                CallHistoryFilterMode.ALL -> true
+                CallHistoryFilterMode.REGULAR -> !isTCall
+                CallHistoryFilterMode.T_CALLS -> isTCall
+            }
+        }
+
+        for (callLog in filteredLogs) {
             val model = CallLogModel(callLog)
             val alreadyDisplayed = list.any { wrapper ->
                 wrapper.callLogModel?.let { displayedModel ->

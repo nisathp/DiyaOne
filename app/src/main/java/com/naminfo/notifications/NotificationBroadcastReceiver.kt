@@ -35,7 +35,8 @@ class NotificationBroadcastReceiver : BroadcastReceiver() {
             handleCallIntent(intent, notificationId, action)
         } else if (
             action == NotificationsManager.INTENT_REPLY_MESSAGE_NOTIF_ACTION ||
-            action == NotificationsManager.INTENT_MARK_MESSAGE_AS_READ_NOTIF_ACTION
+            action == NotificationsManager.INTENT_MARK_MESSAGE_AS_READ_NOTIF_ACTION ||
+            action == NotificationsManager.INTENT_TOGGLE_TRANSLATION_NOTIF_ACTION
         ) {
             handleChatIntent(context, intent, notificationId, action)
         } else if (
@@ -162,6 +163,9 @@ class NotificationBroadcastReceiver : BroadcastReceiver() {
                     )
                     notificationManager.cancel(NotificationsManager.CHAT_TAG, notificationId)
                 }
+            } else if (action == NotificationsManager.INTENT_TOGGLE_TRANSLATION_NOTIF_ACTION) {
+                Log.i("$TAG Toggling translation for notif id [$notificationId]")
+                coreContext.notificationsManager.toggleNotificationTranslation(room, notificationId)
             }
         }
     }

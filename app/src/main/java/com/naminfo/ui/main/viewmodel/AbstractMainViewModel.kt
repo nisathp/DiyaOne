@@ -115,7 +115,7 @@ open class AbstractMainViewModel
             messages: Array<out ChatMessage>
         ) {
             val visibleMessages = messages.filter {
-                it != null && !CustomImdn.isReceipt(it)
+                it != null && !CustomImdn.isHiddenControlMessage(it)
             }.toTypedArray()
 
             if (visibleMessages.isEmpty()) return
@@ -294,7 +294,9 @@ open class AbstractMainViewModel
     @WorkerThread
     fun computeUnreadMessagesCount() {
         val account = LinphoneUtils.getDefaultAccount()
-        val count = account?.unreadChatMessageCount ?: coreContext.core.unreadChatMessageCount
+        val count = coreContext.core.chatRooms
+            .filter { account == null || LinphoneUtils.getAccountForAddress(it.localAddress) == account }
+            .sumOf(CustomImdn::visibleUnreadMessagesCount)
         val moreThanOne = count > 1
         Log.i(
             "$TAG There ${if (moreThanOne) "are" else "is"} [$count] unread ${if (moreThanOne) "messages" else "message"}"
