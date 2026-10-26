@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="local_file_transfer_server_url" translatable="false">http://192.168.1.82:8090/hft.php</string>
+    <string name="local_file_transfer_server_url" translatable="false">http://203.95.216.67:8018/hft.php</string>
     <string name="global_file_transfer_server_url" translatable="false">https://www.linphone.org:444/lft.php</string>
 </resources>

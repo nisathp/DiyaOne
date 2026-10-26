@@ -1,6 +1,7 @@
 package com.naminfo.ui.main.history.adapter
 
 import android.content.Context
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -105,7 +106,7 @@ class HistoryListAdapter :
                 SUGGESTION_TYPE
             }
         } catch (ioobe: IndexOutOfBoundsException) {
-
+            Log.d(TAG, "getItemViewType: ")
         }
         return CALL_LOG_TYPE
     }
