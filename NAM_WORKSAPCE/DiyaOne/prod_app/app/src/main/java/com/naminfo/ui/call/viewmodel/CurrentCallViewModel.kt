@@ -1135,13 +1135,8 @@ class CurrentCallViewModel
         terminatedByUser = false
         currentCall = call
         if (call.dir == Call.Dir.Incoming && LinphoneUtils.isCallIncoming(call.state) && isTranslationCall(call)) {
-            val promptKey = call.callLog.callId?.takeIf { it.isNotBlank() }
-                ?: call.callLog.refKey?.takeIf { it.isNotBlank() }
-                ?: "${call.remoteAddress.asStringUriOnly()}-${System.identityHashCode(call)}"
-            if (incomingTCallLanguagePrompts.add(promptKey)) {
-                Log.i("$TAG Showing language preference for incoming T Call [${call.remoteAddress.asStringUriOnly()}]")
-                showIncomingTCallLanguageDialogEvent.postValue(Event(call))
-            }
+            Log.i("$TAG Showing language preference for incoming T Call [${call.remoteAddress.asStringUriOnly()}]")
+            showIncomingTCallLanguageDialogEvent.postValue(Event(call))
         }
         callStatsModel.update(call, call.audioStats)
         callMediaEncryptionModel.update(call)

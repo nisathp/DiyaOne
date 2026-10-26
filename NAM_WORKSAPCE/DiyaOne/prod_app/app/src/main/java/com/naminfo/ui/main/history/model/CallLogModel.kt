@@ -112,15 +112,13 @@ class CallLogModel
             friendRefKey = friend.refKey
             friendExists = coreContext.contactsManager.isContactAvailable(friend)
         }
-        displayedAddress = when {
-            remoteUsername.startsWith("T_", ignoreCase = true) -> {
-                val phoneNumber = remoteUsername.substringAfter('_')
-                "${if (isVideoCall) "tvc_" else "tac_"}$phoneNumber"
-            }
-            isTCall && !remoteUsername.startsWith("tac_", ignoreCase = true) &&
-                !remoteUsername.startsWith("tvc_", ignoreCase = true) ->
-                "${if (isVideoCall) "tvc_" else "tac_"}$remoteUsername"
-            else -> remoteUsername
+        val cleanNumber = remoteUsername
+            .replace(Regex("^(T_|tac_|tvc_)", RegexOption.IGNORE_CASE), "")
+            .trim()
+        displayedAddress = cleanNumber.ifEmpty { remoteUsername }
+
+        if (!friendExists && (remoteUsername.startsWith("T_", true) || remoteUsername.startsWith("tac_", true) || remoteUsername.startsWith("tvc_", true))) {
+            avatarModel.name.postValue(cleanNumber)
         }
 
         displayedName = if (isCustomConference) {
