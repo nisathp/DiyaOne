@@ -215,11 +215,7 @@ class HistoryViewModel
         Log.i("[Call Diagnostics] HISTORY UI -> Action: [T Call Button Clicked]")
         coreContext.postOnCoreThread { core ->
             if (!::address.isInitialized) return@postOnCoreThread
-            if (corePreferences.callLanguage == CallLanguage.NONE) {
-                showTCallLanguageDialogEvent.postValue(Event(address))
-            } else {
-                startTAudioCall(address)
-            }
+            showTCallLanguageDialogEvent.postValue(Event(address))
         }
     }
 

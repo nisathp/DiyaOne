@@ -113,6 +113,7 @@
                     android:layout_marginEnd="16dp"
                     android:layout_marginTop="10dp"
                     android:text="@string/settings_calls_title"
+
                     android:drawableEnd="@{viewModel.expandCalls ? @drawable/caret_up : @drawable/caret_down, default=@drawable/caret_up}"
                     android:drawableTint="?attr/color_main2_600"
                     android:background="@drawable/squircle_transparent_button_background"

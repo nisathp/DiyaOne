@@ -525,11 +525,7 @@ class ContactViewModel
             }
 
             val preferredAddress = getPreferredCallAddress() ?: return@postOnCoreThread
-            if (corePreferences.callLanguage == CallLanguage.NONE) {
-                showTCallLanguageDialogEvent.postValue(Event(preferredAddress))
-            } else {
-                startTAudioCall(preferredAddress)
-            }
+            showTCallLanguageDialogEvent.postValue(Event(preferredAddress))
         }
     }
 

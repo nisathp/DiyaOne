@@ -297,22 +297,18 @@ class HistoryListFragment : AbstractMainFragment() {
     }
 
     private fun showTranslationCallFlow(model: CallLogModel) {
-        if (corePreferences.callLanguage == CallLanguage.NONE) {
-            val languages = CallLanguage.entries.filter { it != CallLanguage.NONE }
-            AlertDialog.Builder(requireContext())
-                .setTitle(R.string.t_call_select_language_title)
-                .setItems(languages.map { it.label }.toTypedArray()) { dialog, which ->
-                    languages.getOrNull(which)?.let { language ->
-                        corePreferences.callLanguage = language
-                        showTranslationCallTypeDialog(model)
-                    }
-                    dialog.dismiss()
+        val languages = CallLanguage.entries.filter { it != CallLanguage.NONE }
+        AlertDialog.Builder(requireContext())
+            .setTitle(R.string.t_call_select_language_title)
+            .setItems(languages.map { it.label }.toTypedArray()) { dialog, which ->
+                languages.getOrNull(which)?.let { language ->
+                    corePreferences.callLanguage = language
+                    showTranslationCallTypeDialog(model)
                 }
-                .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
-                .show()
-        } else {
-            showTranslationCallTypeDialog(model)
-        }
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
     }
 
     private fun showTranslationCallTypeDialog(model: CallLogModel) {

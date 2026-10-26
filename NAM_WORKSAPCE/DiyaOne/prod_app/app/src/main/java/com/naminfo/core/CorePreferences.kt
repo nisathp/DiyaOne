@@ -457,7 +457,7 @@ class CorePreferences
         get() = config.getString(
             "ui",
             "assistant_third_party_sip_account_domain",
-            "203.95.216.68"
+            "203.95.216.67"
         )!!
 
     @get:AnyThread

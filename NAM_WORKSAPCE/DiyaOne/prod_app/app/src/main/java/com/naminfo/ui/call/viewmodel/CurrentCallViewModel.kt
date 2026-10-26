@@ -635,7 +635,7 @@ class CurrentCallViewModel
             }
             if (call != null) {
                 Log.i("$TAG Answering call [${call.remoteAddress.asStringUriOnly()}]")
-                if (isTranslationCall(call) && corePreferences.callLanguage == CallLanguage.NONE) {
+                if (isTranslationCall(call)) {
                     Log.i("$TAG Asking for preferred language before answering incoming T Call")
                     showIncomingTCallLanguageDialogEvent.postValue(Event(call))
                     return@postOnCoreThread
