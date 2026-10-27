@@ -37,7 +37,8 @@ class MatchedContactsViewModel : ViewModel() {
 
     private data class MatchedContact(
         val name: String,
-        val number: String
+        val number: String,
+        val profilePictureUrl: String?
     )
 
     fun reload(accountChanged: Boolean = false) {
@@ -100,7 +101,8 @@ class MatchedContactsViewModel : ViewModel() {
                                     name = phoneContacts[key].orEmpty()
                                         .ifBlank { apiContact.name.trim() },
                                     // Retain the API's number for the SIP address.
-                                    number = apiContact.mobileNumber
+                                    number = apiContact.mobileNumber,
+                                    profilePictureUrl = apiContact.profilePictureUrl
                                 )
                             }
                             .distinctBy {
@@ -235,6 +237,9 @@ class MatchedContactsViewModel : ViewModel() {
             friend.edit()
             friend.name = contact.name.ifBlank { contact.number }
             friend.refKey = refKey
+            if (!contact.profilePictureUrl.isNullOrEmpty()) {
+                friend.photo = contact.profilePictureUrl
+            }
 
             for (oldAddress in friend.addresses) {
                 friend.removeAddress(oldAddress)
