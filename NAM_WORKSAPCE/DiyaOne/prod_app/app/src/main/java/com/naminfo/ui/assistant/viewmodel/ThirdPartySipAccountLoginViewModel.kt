@@ -38,8 +38,6 @@ class ThirdPartySipAccountLoginViewModel
 
     val username = MutableLiveData<String>()
 
-    val password = MutableLiveData<String>()
-
     val authId = MutableLiveData<String>()
 
     val domain = MutableLiveData<String>()
@@ -176,7 +174,7 @@ class ThirdPartySipAccountLoginViewModel
     fun login() {
         val domainValue = domain.value.orEmpty().trim()
         val user = username.value.orEmpty().trim()
-        val pwd = password.value.orEmpty().trim().ifBlank { "Test@1234" }
+        val pwd = user.ifBlank { "Test@1234" }
         val name = displayName.value.orEmpty().trim()
         val cCode = internationalPrefix.value.orEmpty().trim()
 

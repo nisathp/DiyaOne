@@ -148,38 +148,6 @@
                     app:layout_constraintTop_toBottomOf="@id/display_name_label"
                     app:layout_constraintWidth_max="@dimen/text_input_max_width" />
 
-                <androidx.appcompat.widget.AppCompatTextView
-                    android:id="@+id/password_label"
-                    style="@style/header_style"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="16dp"
-                    android:layout_marginTop="18dp"
-                    android:labelFor="@id/password_field"
-                    android:text="@string/password"
-                    app:layout_constraintStart_toStartOf="@id/password_field"
-                    app:layout_constraintTop_toBottomOf="@id/display_name" />
-
-                <androidx.appcompat.widget.AppCompatEditText
-                    android:id="@+id/password_field"
-                    style="@style/default_text_style"
-                    android:layout_width="0dp"
-                    android:layout_height="50dp"
-                    android:layout_marginStart="16dp"
-                    android:layout_marginEnd="16dp"
-                    android:background="@drawable/edit_text_background"
-                    android:hint="@string/password"
-                    android:inputType="textPassword"
-                    android:paddingStart="20dp"
-                    android:paddingEnd="20dp"
-                    android:text="@={viewModel.password}"
-                    android:textColor="?attr/color_main2_600"
-                    android:textSize="14sp"
-                    app:layout_constraintEnd_toEndOf="parent"
-                    app:layout_constraintStart_toStartOf="parent"
-                    app:layout_constraintTop_toBottomOf="@id/password_label"
-                    app:layout_constraintWidth_max="@dimen/text_input_max_width" />
-
                 <com.google.android.material.materialswitch.MaterialSwitch
                     android:id="@+id/advanced_settings"
                     android:layout_width="0dp"
@@ -194,7 +162,7 @@
                     android:textColor="?attr/color_main2_600"
                     app:layout_constraintEnd_toEndOf="parent"
                     app:layout_constraintStart_toStartOf="parent"
-                    app:layout_constraintTop_toBottomOf="@id/password_field" />
+                    app:layout_constraintTop_toBottomOf="@id/display_name" />
 
                 <androidx.constraintlayout.widget.Group
                     android:id="@+id/advanced_settings_group"
