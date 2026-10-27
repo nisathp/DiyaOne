@@ -343,6 +343,9 @@ class ContactsListViewModel
                             name = contact.name
                             refKey = "mobion:${contact.mobileNumber}"
                             isSubscribesEnabled = true
+                            if (!contact.profilePictureUrl.isNullOrEmpty()) {
+                                photo = contact.profilePictureUrl
+                            }
                             addAddress(address)
                             addPhoneNumberWithLabel(
                                 Factory.instance().createFriendPhoneNumber(

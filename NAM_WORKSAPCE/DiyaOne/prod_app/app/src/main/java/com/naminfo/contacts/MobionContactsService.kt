@@ -4,6 +4,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.io.StringReader
+import org.json.JSONArray
+import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import org.linphone.core.tools.Log
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
@@ -17,7 +19,11 @@ object MobionContactsService {
     private const val CONFERENCES_URL =
         "https://mobionglobal.com/fs_webservice/WebService.asmx/GroupSetting_View"
 
-    data class Contact(val name: String, val mobileNumber: String)
+    data class Contact(
+        val name: String,
+        val mobileNumber: String,
+        val profilePictureUrl: String? = null
+    )
 
     data class Conference(
         val id: String,
@@ -27,6 +33,58 @@ object MobionContactsService {
     )
 
     fun fetchContacts(): List<Contact> {
+        val apiBase = corePreferences.apiDomain?.takeIf { it.isNotBlank() } ?: "http://192.168.1.72/Diyaone"
+        val urlStr = "$apiBase/api/users?page=1&pageSize=50"
+        val connection = URL(urlStr).openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 15_000
+        connection.readTimeout = 20_000
+        connection.setRequestProperty("Accept", "application/json")
+        val token = corePreferences.authToken
+        if (!token.isNullOrEmpty()) {
+            connection.setRequestProperty("Authorization", "Bearer $token")
+        }
+
+        return try {
+            if (connection.responseCode in 200..299) {
+                connection.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+                    val responseJson = reader.readText()
+                    Log.i("$TAG /api/users response:\n$responseJson")
+
+                    val jsonArray = JSONArray(responseJson)
+                    val contacts = mutableListOf<Contact>()
+                    for (i in 0 until jsonArray.length()) {
+                        val obj = jsonArray.getJSONObject(i)
+                        val name = obj.optString("name").trim()
+                        val mobileNo = PhoneContactNumbers.normalize(
+                            obj.optString("mobileNo").ifEmpty { obj.optString("subscriberId") }
+                        )
+                        val rawPic = obj.optString("profilePictureUrl")
+                        val profilePictureUrl = rawPic.takeIf { it.isNotEmpty() && it != "null" }
+                        if (mobileNo.length == 10) {
+                            contacts.add(Contact(name, mobileNo, profilePictureUrl))
+                        }
+                    }
+                    if (contacts.isNotEmpty()) {
+                        Log.i("$TAG Parsed [${contacts.size}] JSON contacts with profile pictures")
+                        return contacts
+                    }
+                }
+            }
+            fetchMobionXmlContacts()
+        } catch (e: Exception) {
+            Log.w("$TAG Failed to fetch JSON contacts, trying fallback XML: $e")
+            try {
+                fetchMobionXmlContacts()
+            } catch (ignored: Exception) {
+                emptyList()
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun fetchMobionXmlContacts(): List<Contact> {
         val connection = URL(CONTACTS_URL).openConnection() as HttpURLConnection
         connection.requestMethod = "GET"
         connection.connectTimeout = 15_000
@@ -45,7 +103,7 @@ object MobionContactsService {
                 val parser = XmlPullParserFactory.newInstance().newPullParser()
                 parser.setInput(StringReader(responseXml))
                 parseContacts(parser).also { contacts ->
-                    Log.i("$TAG Parsed [${contacts.size}] valid contacts")
+                    Log.i("$TAG Parsed [${contacts.size}] valid XML contacts")
                 }
             }
         } finally {
@@ -101,7 +159,7 @@ object MobionContactsService {
                 }
                 event == XmlPullParser.END_TAG && parser.name == "Table" -> {
                     if (mobileNumber.length == 10) {
-                        contacts[mobileNumber] = Contact(name, mobileNumber)
+                        contacts[mobileNumber] = Contact(name, mobileNumber, null)
                     }
                 }
             }
