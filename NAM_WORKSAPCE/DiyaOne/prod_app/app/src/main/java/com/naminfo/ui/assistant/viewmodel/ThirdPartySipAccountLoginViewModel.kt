@@ -4,7 +4,15 @@ import androidx.annotation.UiThread
 import androidx.annotation.WorkerThread
 import androidx.lifecycle.MediatorLiveData
 import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.viewModelScope
 import java.util.Locale
+import java.net.HttpURLConnection
+import java.net.URL
+import java.io.OutputStreamWriter
+import org.json.JSONObject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
@@ -29,6 +37,8 @@ class ThirdPartySipAccountLoginViewModel
     }
 
     val username = MutableLiveData<String>()
+
+    val password = MutableLiveData<String>()
 
     val authId = MutableLiveData<String>()
 
@@ -164,128 +174,141 @@ class ThirdPartySipAccountLoginViewModel
 
     @UiThread
     fun login() {
-        coreContext.postOnCoreThread { core ->
-            core.loadConfigFromXml(corePreferences.thirdPartyDefaultValuesPath)
+        val domainValue = domain.value.orEmpty().trim()
+        val user = username.value.orEmpty().trim()
+        val pwd = password.value.orEmpty().trim().ifBlank { "Test@1234" }
+        val name = displayName.value.orEmpty().trim()
+        val cCode = internationalPrefix.value.orEmpty().trim()
 
-            // Remove sip: in front of domain, just in case...
-            val domainValue = domain.value.orEmpty().trim()
-            val domainWithoutSip = if (domainValue.startsWith("sip:")) {
-                domainValue.substring("sip:".length)
-            } else {
-                domainValue
-            }
-            val domainAddress = Factory.instance().createAddress("sip:$domainWithoutSip")
-            val port = domainAddress?.port ?: -1
-            if (port != -1) {
-                Log.w("$TAG It seems a port [$port] was set in the domain [$domainValue], removing it from SIP identity but setting it to proxy server URI")
-            }
-            val domain = domainAddress?.domain ?: domainWithoutSip
+        registrationInProgress.value = true
 
-            // Allow to enter SIP identity instead of simply username
-            // in case identity domain doesn't match proxy domain
-            var user = username.value.orEmpty().trim()
-            if (user.startsWith("sip:")) {
-                user = user.substring("sip:".length)
-            } else if (user.startsWith("sips:")) {
-                user = user.substring("sips:".length)
-            }
-            if (user.contains("@")) {
-                user = user.split("@")[0]
-            }
+        viewModelScope.launch {
+            performSignupAndSignin(domainValue, user, pwd, name, cCode)
 
-            val userId = authId.value.orEmpty().trim()
+            coreContext.postOnCoreThread { core ->
+                core.loadConfigFromXml(corePreferences.thirdPartyDefaultValuesPath)
 
-            Log.i("$TAG Parsed username is [$user], user ID [$userId] and domain [$domain]")
-            val identity = "sip:$user@$domain"
-            val identityAddress = Factory.instance().createAddress(identity)
-            if (identityAddress == null) {
-                Log.e("$TAG Can't parse [$identity] as Address!")
-                showRedToast(R.string.assistant_login_cant_parse_address_toast, R.drawable.warning_circle)
-                return@postOnCoreThread
-            }
-            Log.i("$TAG Computed SIP identity is [${identityAddress.asStringUriOnly()}]")
-
-            val accounts = core.accountList
-            val found = accounts.find {
-                it.params.identityAddress?.weakEqual(identityAddress) == true
-            }
-            if (found != null) {
-                Log.w("$TAG An account with the same identity address [${found.params.identityAddress?.asStringUriOnly()}] already exists, do not add it again!")
-                showRedToast(R.string.assistant_account_login_already_connected_error, R.drawable.warning_circle)
-                return@postOnCoreThread
-            }
-
-            newlyCreatedAuthInfo = Factory.instance().createAuthInfo(
-                user,
-                userId,
-                user,
-                null,
-                null,
-                domainAddress?.domain ?: domainValue
-            )
-            core.addAuthInfo(newlyCreatedAuthInfo)
-
-            val accountParams = core.createAccountParams()
-
-            if (displayName.value.orEmpty().isNotEmpty()) {
-                identityAddress.displayName = displayName.value.orEmpty().trim()
-            }
-            val profileSection = "saved_profile_${identityAddress.asStringUriOnly()}"
-            if (identityAddress.displayName.isNullOrBlank()) {
-                identityAddress.displayName = core.config.getString(profileSection, "display_name", null)
-            }
-            accountParams.pictureUri = core.config.getString(profileSection, "picture_uri", null)
-            accountParams.identityAddress = identityAddress
-
-            val outboundProxyValue = outboundProxy.value.orEmpty().trim()
-            val outboundProxyAddress = if (outboundProxyValue.isNotEmpty()) {
-                val server = if (outboundProxyValue.startsWith("sip:")) {
-                    outboundProxyValue
+                // Remove sip: in front of domain, just in case...
+                val domainWithoutSip = if (domainValue.startsWith("sip:")) {
+                    domainValue.substring("sip:".length)
                 } else {
-                    "sip:$outboundProxyValue"
+                    domainValue
                 }
-                Factory.instance().createAddress(server)
-            } else {
-                null
-            }
-            if (outboundProxyAddress != null) {
-                outboundProxyAddress.transport = when (transport.value.orEmpty().trim()) {
+                val domainAddress = Factory.instance().createAddress("sip:$domainWithoutSip")
+                val port = domainAddress?.port ?: -1
+                if (port != -1) {
+                    Log.w("$TAG It seems a port [$port] was set in the domain [$domainValue], removing it from SIP identity but setting it to proxy server URI")
+                }
+                val domain = domainAddress?.domain ?: domainWithoutSip
+
+                // Allow to enter SIP identity instead of simply username
+                // in case identity domain doesn't match proxy domain
+                var parsedUser = user
+                if (parsedUser.startsWith("sip:")) {
+                    parsedUser = parsedUser.substring("sip:".length)
+                } else if (parsedUser.startsWith("sips:")) {
+                    parsedUser = parsedUser.substring("sips:".length)
+                }
+                if (parsedUser.contains("@")) {
+                    parsedUser = parsedUser.split("@")[0]
+                }
+
+                val userId = authId.value.orEmpty().trim()
+
+                Log.i("$TAG Parsed username is [$parsedUser], user ID [$userId] and domain [$domain]")
+                val identity = "sip:$parsedUser@$domain"
+                val identityAddress = Factory.instance().createAddress(identity)
+                if (identityAddress == null) {
+                    Log.e("$TAG Can't parse [$identity] as Address!")
+                    showRedToast(R.string.assistant_login_cant_parse_address_toast, R.drawable.warning_circle)
+                    registrationInProgress.postValue(false)
+                    return@postOnCoreThread
+                }
+                Log.i("$TAG Computed SIP identity is [${identityAddress.asStringUriOnly()}]")
+
+                val accounts = core.accountList
+                val found = accounts.find {
+                    it.params.identityAddress?.weakEqual(identityAddress) == true
+                }
+                if (found != null) {
+                    Log.w("$TAG An account with the same identity address [${found.params.identityAddress?.asStringUriOnly()}] already exists, do not add it again!")
+                    showRedToast(R.string.assistant_account_login_already_connected_error, R.drawable.warning_circle)
+                    registrationInProgress.postValue(false)
+                    return@postOnCoreThread
+                }
+
+                newlyCreatedAuthInfo = Factory.instance().createAuthInfo(
+                    parsedUser,
+                    userId,
+                    pwd,
+                    null,
+                    null,
+                    domainAddress?.domain ?: domainValue
+                )
+                core.addAuthInfo(newlyCreatedAuthInfo)
+
+                val accountParams = core.createAccountParams()
+
+                if (displayName.value.orEmpty().isNotEmpty()) {
+                    identityAddress.displayName = displayName.value.orEmpty().trim()
+                }
+                val profileSection = "saved_profile_${identityAddress.asStringUriOnly()}"
+                if (identityAddress.displayName.isNullOrBlank()) {
+                    identityAddress.displayName = core.config.getString(profileSection, "display_name", null)
+                }
+                accountParams.pictureUri = core.config.getString(profileSection, "picture_uri", null)
+                accountParams.identityAddress = identityAddress
+
+                val outboundProxyValue = outboundProxy.value.orEmpty().trim()
+                val outboundProxyAddress = if (outboundProxyValue.isNotEmpty()) {
+                    val server = if (outboundProxyValue.startsWith("sip:")) {
+                        outboundProxyValue
+                    } else {
+                        "sip:$outboundProxyValue"
+                    }
+                    Factory.instance().createAddress(server)
+                } else {
+                    null
+                }
+                if (outboundProxyAddress != null) {
+                    outboundProxyAddress.transport = when (transport.value.orEmpty().trim()) {
+                        TransportType.Tcp.name.uppercase(Locale.getDefault()) -> TransportType.Tcp
+                        TransportType.Tls.name.uppercase(Locale.getDefault()) -> TransportType.Tls
+                        else -> TransportType.Udp
+                    }
+                    Log.i("$TAG Created outbound proxy server SIP address [${outboundProxyAddress.asStringUriOnly()}]")
+                    accountParams.setRoutesAddresses(arrayOf(outboundProxyAddress))
+                }
+
+                val proxyServerValue = proxy.value.orEmpty().trim()
+                val proxyServerAddress = if (proxyServerValue.isNotEmpty()) {
+                    val server = if (proxyServerValue.startsWith("sip:")) {
+                        proxyServerValue
+                    } else {
+                        "sip:$proxyServerValue"
+                    }
+                    Factory.instance().createAddress(server)
+                } else {
+                    outboundProxyAddress ?: domainAddress ?: Factory.instance().createAddress("sip:$domainWithoutSip")
+                }
+                proxyServerAddress?.transport = when (transport.value.orEmpty().trim()) {
                     TransportType.Tcp.name.uppercase(Locale.getDefault()) -> TransportType.Tcp
                     TransportType.Tls.name.uppercase(Locale.getDefault()) -> TransportType.Tls
                     else -> TransportType.Udp
                 }
-                Log.i("$TAG Created outbound proxy server SIP address [${outboundProxyAddress.asStringUriOnly()}]")
-                accountParams.setRoutesAddresses(arrayOf(outboundProxyAddress))
-            }
+                Log.i("$TAG Created proxy server SIP address [${proxyServerAddress?.asStringUriOnly()}]")
+                accountParams.serverAddress = proxyServerAddress
+                Log.i("$TAG Is outbound proxy enabled ? [${accountParams.isOutboundProxyEnabled}]")
 
-            val proxyServerValue = proxy.value.orEmpty().trim()
-            val proxyServerAddress = if (proxyServerValue.isNotEmpty()) {
-                val server = if (proxyServerValue.startsWith("sip:")) {
-                    proxyServerValue
-                } else {
-                    "sip:$proxyServerValue"
-                }
-                Factory.instance().createAddress(server)
-            } else {
-                outboundProxyAddress ?: domainAddress ?: Factory.instance().createAddress("sip:$domainWithoutSip")
-            }
-            proxyServerAddress?.transport = when (transport.value.orEmpty().trim()) {
-                TransportType.Tcp.name.uppercase(Locale.getDefault()) -> TransportType.Tcp
-                TransportType.Tls.name.uppercase(Locale.getDefault()) -> TransportType.Tls
-                else -> TransportType.Udp
-            }
-            Log.i("$TAG Created proxy server SIP address [${proxyServerAddress?.asStringUriOnly()}]")
-            accountParams.serverAddress = proxyServerAddress
-            Log.i("$TAG Is outbound proxy enabled ? [${accountParams.isOutboundProxyEnabled}]")
+                // The login country selection must not add a prefix to dialpad calls.
+                accountParams.internationalPrefix = ""
+                accountParams.internationalPrefixIsoCountryCode = ""
 
-            // The login country selection must not add a prefix to dialpad calls.
-            accountParams.internationalPrefix = ""
-            accountParams.internationalPrefixIsoCountryCode = ""
-
-            newlyCreatedAccount = core.createAccount(accountParams)
-            registrationInProgress.postValue(true)
-            core.addListener(coreListener)
-            core.addAccount(newlyCreatedAccount)
+                newlyCreatedAccount = core.createAccount(accountParams)
+                registrationInProgress.postValue(true)
+                core.addListener(coreListener)
+                core.addAccount(newlyCreatedAccount)
+            }
         }
     }
 
@@ -299,6 +322,77 @@ class ThirdPartySipAccountLoginViewModel
         val mobileNumber = username.value.orEmpty().trim()
         return true // mobileNumber.matches(Regex("[6-9]\\d{9}")) && domain.value.orEmpty().isNotEmpty()
     }*/
+
+    private suspend fun performSignupAndSignin(domainValue: String, subscriberId: String, passwordStr: String, displayNameStr: String, countryCodeStr: String) = withContext(Dispatchers.IO) {
+        val cleanDomain = domainValue.removePrefix("http://").removePrefix("https://").removeSuffix("/")
+        val apiBase = if (cleanDomain.contains("/Diyaone", true)) {
+            "http://$cleanDomain"
+        } else {
+            "http://$cleanDomain/Diyaone"
+        }
+
+        val password = passwordStr.ifBlank { "Test@1234" }
+        val names = displayNameStr.trim().split(" ", limit = 2)
+        val firstName = names.getOrNull(0)?.takeIf { it.isNotBlank() } ?: subscriberId
+        val lastName = names.getOrNull(1).orEmpty()
+        val countryCode = if (countryCodeStr.startsWith("+")) countryCodeStr else "+$countryCodeStr"
+
+        // 1. Signup API
+        try {
+            val signupUrl = URL("$apiBase/api/users")
+            val signupConn = signupUrl.openConnection() as HttpURLConnection
+            signupConn.requestMethod = "POST"
+            signupConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            signupConn.connectTimeout = 10000
+            signupConn.readTimeout = 10000
+            signupConn.doOutput = true
+
+            val signupBody = JSONObject().apply {
+                put("subscriberId", subscriberId)
+                put("password", password)
+                put("firstName", firstName)
+                put("lastName", lastName)
+                put("countryCode", countryCode)
+                put("mobileNo", subscriberId)
+            }
+
+            OutputStreamWriter(signupConn.outputStream).use { it.write(signupBody.toString()) }
+            val signupCode = signupConn.responseCode
+            Log.i("$TAG Signup API response code: $signupCode")
+            signupConn.disconnect()
+        } catch (e: Exception) {
+            Log.w("$TAG Signup API exception (user might already exist): $e")
+        }
+
+        // 2. Signin API
+        try {
+            val signinUrl = URL("$apiBase/api/auth/signin")
+            val signinConn = signinUrl.openConnection() as HttpURLConnection
+            signinConn.requestMethod = "POST"
+            signinConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            signinConn.connectTimeout = 10000
+            signinConn.readTimeout = 10000
+            signinConn.doOutput = true
+
+            val signinBody = JSONObject().apply {
+                put("subscriberId", subscriberId)
+                put("password", password)
+            }
+
+            OutputStreamWriter(signinConn.outputStream).use { it.write(signinBody.toString()) }
+            val signinCode = signinConn.responseCode
+            if (signinCode in 200..299) {
+                val responseText = signinConn.inputStream.bufferedReader().use { it.readText() }
+                Log.i("$TAG Signin API success: $responseText")
+            } else {
+                val errorText = signinConn.errorStream?.bufferedReader()?.use { it.readText() }
+                Log.e("$TAG Signin API failed [$signinCode]: $errorText")
+            }
+            signinConn.disconnect()
+        } catch (e: Exception) {
+            Log.e("$TAG Signin API exception: $e")
+        }
+    }
 
     @UiThread
     fun toggleAdvancedSettingsExpand() {
