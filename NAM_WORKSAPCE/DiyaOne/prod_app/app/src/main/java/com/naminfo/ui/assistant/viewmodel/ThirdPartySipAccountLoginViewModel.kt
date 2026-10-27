@@ -382,6 +382,16 @@ class ThirdPartySipAccountLoginViewModel
             if (signinCode in 200..299) {
                 val responseText = signinConn.inputStream.bufferedReader().use { it.readText() }
                 Log.i("$TAG Signin API success: $responseText")
+                try {
+                    val json = JSONObject(responseText)
+                    val token = json.optString("token").ifEmpty { json.optString("accessToken") }
+                    val refreshToken = json.optString("refreshToken")
+                    if (token.isNotEmpty()) corePreferences.authToken = token
+                    if (refreshToken.isNotEmpty()) corePreferences.refreshToken = refreshToken
+                    corePreferences.apiDomain = apiBase
+                } catch (e: Exception) {
+                    Log.w("$TAG Failed to parse signin response JSON: $e")
+                }
             } else {
                 val errorText = signinConn.errorStream?.bufferedReader()?.use { it.readText() }
                 Log.e("$TAG Signin API failed [$signinCode]: $errorText")

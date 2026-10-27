@@ -21,15 +21,20 @@ import com.naminfo.ui.main.model.AccountModel
 import com.naminfo.ui.main.model.isEndToEndEncryptionMandatory
 import com.naminfo.ui.main.settings.model.AccountDeviceModel
 import com.naminfo.utils.Event
-// Add these imports. No kotlin.coroutines imports are needed.
+import java.net.HttpURLConnection
+import java.net.URL
+import java.io.OutputStreamWriter
+import org.json.JSONObject
 
 import androidx.annotation.*
 import androidx.lifecycle.*
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.linphone.core.*
 import org.linphone.core.Core
@@ -263,6 +268,8 @@ class AccountProfileViewModel
 
         viewModelScope.launch {
             try {
+                performLogout()
+
                 withTimeout(30_000L) {
                     unregisterAndRemoveAccount()
                 }
@@ -281,6 +288,45 @@ class AccountProfileViewModel
             } finally {
                 signOutInProgress.value = false
             }
+        }
+    }
+
+    private suspend fun performLogout() = withContext(Dispatchers.IO) {
+        val apiBase = corePreferences.apiDomain
+        val refreshToken = corePreferences.refreshToken
+        val token = corePreferences.authToken
+
+        if (apiBase.isNullOrEmpty()) return@withContext
+
+        try {
+            val logoutUrl = URL("$apiBase/api/auth/logout")
+            val conn = logoutUrl.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            if (!token.isNullOrEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer $token")
+            }
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            conn.doOutput = true
+
+            val body = JSONObject().apply {
+                if (!refreshToken.isNullOrEmpty()) {
+                    put("refreshToken", refreshToken)
+                }
+            }
+
+            OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
+            val code = conn.responseCode
+            Log.i("$TAG Logout API response code: $code")
+            conn.disconnect()
+
+            // Clear stored tokens
+            corePreferences.authToken = null
+            corePreferences.refreshToken = null
+            corePreferences.apiDomain = null
+        } catch (e: Exception) {
+            Log.w("$TAG Logout API exception: $e")
         }
     }
 

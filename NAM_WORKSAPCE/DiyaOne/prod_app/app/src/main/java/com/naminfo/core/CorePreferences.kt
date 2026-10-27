@@ -549,6 +549,27 @@ class CorePreferences
         }
     }
 
+    var authToken: String?
+        get() = config.getString("app", "auth_token", null)
+        set(value) {
+            config.setString("app", "auth_token", value ?: "")
+            config.sync()
+        }
+
+    var refreshToken: String?
+        get() = config.getString("app", "refresh_token", null)
+        set(value) {
+            config.setString("app", "refresh_token", value ?: "")
+            config.sync()
+        }
+
+    var apiDomain: String?
+        get() = config.getString("app", "api_domain", null)
+        set(value) {
+            config.setString("app", "api_domain", value ?: "")
+            config.sync()
+        }
+
     // Cached Translation Persistence
     fun getPersistedTranslation(cacheKey: String): String? {
         val key = "cached_translation_${cacheKey.replace("[^a-zA-Z0-9_]".toRegex(), "_")}"
