@@ -1,5 +1,7 @@
 package com.naminfo.ui.main.viewmodel
 
+import android.os.Handler
+import android.os.Looper
 import androidx.annotation.UiThread
 import androidx.annotation.WorkerThread
 import androidx.lifecycle.MutableLiveData
@@ -14,12 +16,20 @@ import com.naminfo.ui.GenericViewModel
 import com.naminfo.ui.main.model.AccountModel
 import com.naminfo.ui.main.model.ShortcutModel
 import com.naminfo.utils.Event
+import java.time.Duration
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 class DrawerMenuViewModel
     @UiThread
     constructor() : GenericViewModel() {
     companion object {
         private const val TAG = "[Drawer Menu ViewModel]"
+
+        val DATE_FORMATTER: DateTimeFormatter = DateTimeFormatter
+            .ofPattern("dd MMM yyyy, hh:mm:ss a")
+            .withZone(ZoneId.systemDefault())
     }
 
     val accounts = MutableLiveData<ArrayList<AccountModel>>()
@@ -33,6 +43,10 @@ class DrawerMenuViewModel
     val shortcuts = MutableLiveData<ArrayList<ShortcutModel>>()
 
     val hideQuitButton = MutableLiveData<Boolean>()
+
+    val tokenExpirySummary = MutableLiveData("")
+
+    val showTokenExpiry = MutableLiveData(false)
 
     val startAssistantEvent: MutableLiveData<Event<Boolean>> by lazy {
         MutableLiveData()
@@ -100,6 +114,15 @@ class DrawerMenuViewModel
         }
     }
 
+    private val tokenExpiryHandler = Handler(Looper.getMainLooper())
+
+    private val tokenExpiryUpdater = object : Runnable {
+        override fun run() {
+            updateTokenExpirySummary()
+            tokenExpiryHandler.postDelayed(this, 1000)
+        }
+    }
+
     init {
         coreContext.postOnCoreThread { core ->
             core.addListener(coreListener)
@@ -112,16 +135,56 @@ class DrawerMenuViewModel
             computeAccountsList()
             computeShortcuts()
         }
+        tokenExpiryHandler.post(tokenExpiryUpdater)
     }
 
     @UiThread
     override fun onCleared() {
+        tokenExpiryHandler.removeCallbacks(tokenExpiryUpdater)
         coreContext.postOnCoreThread { core ->
             core.removeListener(coreListener)
             accounts.value.orEmpty().forEach(AccountModel::destroy)
         }
 
         super.onCleared()
+    }
+
+    private var isTokenExpiryExpanded = false
+
+    @UiThread
+    fun toggleTokenExpiryExpanded() {
+        isTokenExpiryExpanded = !isTokenExpiryExpanded
+        updateTokenExpirySummary()
+    }
+
+    private fun updateTokenExpirySummary() {
+        val accessExpiry = corePreferences.accessTokenExpiresAt
+        val refreshExpiry = corePreferences.refreshTokenExpiresAt
+        val lines = listOfNotNull(
+            tokenExpiryLine("Access token", accessExpiry),
+            tokenExpiryLine("Refresh token", refreshExpiry)
+        )
+        tokenExpirySummary.postValue(lines.joinToString("\n"))
+        showTokenExpiry.postValue(isTokenExpiryExpanded && lines.isNotEmpty())
+    }
+
+    private fun tokenExpiryLine(label: String, rawExpiry: String?): String? {
+        if (rawExpiry.isNullOrBlank()) return null
+        val expiry = runCatching { Instant.parse(rawExpiry) }.getOrNull()
+            ?: return "$label expires: $rawExpiry"
+        val formattedDate = DATE_FORMATTER.format(expiry)
+        val remaining = Duration.between(Instant.now(), expiry)
+        val countdown = if (remaining.isNegative || remaining.isZero) {
+            "Expired"
+        } else {
+            val seconds = remaining.seconds
+            val days = seconds / 86_400
+            val hours = (seconds % 86_400) / 3_600
+            val minutes = (seconds % 3_600) / 60
+            val secondsPart = seconds % 60
+            "%dd %02dh %02dm %02ds remaining".format(days, hours, minutes, secondsPart)
+        }
+        return "$label: $formattedDate\n$countdown"
     }
 
     @UiThread
@@ -165,10 +228,16 @@ class DrawerMenuViewModel
 
         val list = arrayListOf<AccountModel>()
         for (account in coreContext.core.accountList) {
-            val model = AccountModel(account) { model ->
-                // onClicked
-                openAccountProfileEvent.postValue(Event(model))
-            }
+            val model = AccountModel(
+                account = account,
+                onMenuClicked = { model ->
+                    // onClicked
+                    openAccountProfileEvent.postValue(Event(model))
+                },
+                onLoginTimeClickedAction = {
+                    toggleTokenExpiryExpanded()
+                }
+            )
             list.add(model)
 
             if (account == coreContext.core.defaultAccount) {
@@ -214,4 +283,5 @@ class DrawerMenuViewModel
         }
         shortcuts.postValue(shortcutsList)
     }
+
 }

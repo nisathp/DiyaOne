@@ -263,6 +263,12 @@ class CallActivity : GenericActivity() {
             }
         }
 
+        callViewModel.showActiveTCallLanguageDialogEvent.observe(this) {
+            it.consume {
+                showActiveTCallLanguageDialog()
+            }
+        }
+
         callViewModel.requestCameraPermission.observe(this) {
             it.consume {
                 Log.w("$TAG Asking for CAMERA permission")
@@ -640,15 +646,44 @@ class CallActivity : GenericActivity() {
 
     private fun showIncomingTCallLanguageDialog(call: Call) {
         val languages = CallLanguage.entries.filter { it != CallLanguage.NONE }
-        AlertDialog.Builder(this)
+        var languageSelected = false
+        val dialog = AlertDialog.Builder(this)
             .setTitle(R.string.t_call_select_language_title)
             .setItems(languages.map { it.label }.toTypedArray()) { dialog, which ->
                 languages.getOrNull(which)?.let { language ->
+                    languageSelected = true
                     callViewModel.selectIncomingTCallLanguageAndAnswer(call, language)
                 }
                 dialog.dismiss()
             }
-            .setNegativeButton(android.R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .setNegativeButton(android.R.string.cancel) { dialog, _ ->
+                callViewModel.cancelIncomingTCallLanguageSelection(call)
+                dialog.dismiss()
+            }
+            .setOnCancelListener {
+                if (!languageSelected) {
+                    callViewModel.cancelIncomingTCallLanguageSelection(call)
+                }
+            }
+            .create()
+        dialog.show()
+    }
+
+    private fun showActiveTCallLanguageDialog() {
+        val languages = CallLanguage.entries.filter { it != CallLanguage.NONE }
+        val selectedIndex = languages.indexOf(corePreferences.callLanguage).coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle(R.string.t_call_change_language_title)
+            .setSingleChoiceItems(
+                languages.map { it.label }.toTypedArray(),
+                selectedIndex
+            ) { dialog, which ->
+                languages.getOrNull(which)?.let { language ->
+                    callViewModel.updateActiveTCallLanguage(language)
+                }
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
             .show()
     }
 

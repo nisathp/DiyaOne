@@ -27,6 +27,7 @@ import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.core.CustomImdn
+import com.naminfo.core.OutgoingMessageRetryManager
 import com.naminfo.translation.ChatTranslationLanguage
 import com.naminfo.ui.main.chat.DIYA_REPLY_MESSAGE_ID_HEADER
 import com.naminfo.ui.main.chat.decodeReplyPreviewEnvelope
@@ -389,6 +390,7 @@ class MessageModel
         coreContext.postOnCoreThread {
             Log.i("$TAG Re-sending message with ID [$id]")
             CustomImdn.prepareOutgoing(chatMessage)
+            OutgoingMessageRetryManager.watch(chatMessage)
             chatMessage.send()
         }
     }

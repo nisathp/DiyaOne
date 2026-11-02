@@ -9,7 +9,6 @@
             name="model"
             type="com.naminfo.ui.main.history.model.CallLogHistoryModel" />
     </data>
-
     <androidx.constraintlayout.widget.ConstraintLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

@@ -164,6 +164,20 @@ class ConversationViewModel
 
     private val chatRoomListener = object : ChatRoomListenerStub() {
         @WorkerThread
+        override fun onNewEvents(chatRoom: ChatRoom, eventLogs: Array<out EventLog>) {
+            // This callback includes locally-created outgoing messages. Relying only on
+            // onChatMessagesReceived() leaves a race where a freshly sent text or file is
+            // already in the Core but is missing from the open conversation UI.
+            val visibleEvents = eventLogs.filterNot {
+                CustomImdn.isHiddenControlMessage(it.chatMessage)
+            }
+            if (visibleEvents.isNotEmpty()) {
+                Log.i("$TAG Received [${visibleEvents.size}] new local or remote event(s)")
+                addEvents(visibleEvents.toTypedArray())
+            }
+        }
+
+        @WorkerThread
         override fun onConferenceJoined(chatRoom: ChatRoom, eventLog: EventLog) {
             Log.i("$TAG Conversation was joined")
             if (LinphoneUtils.isChatRoomAGroup(chatRoom)) {
@@ -390,9 +404,11 @@ class ConversationViewModel
             chatRoom.addListener(chatRoomListener)
             configureChatRoom()
         } else {
-            // This is required to have events displayed when fragment is recreated
-            // due to a rotation or theme switching between light & dark for example
-            updateEvents.postValue(Event(true))
+            // Rebuild the list from persistent Core history. A local send can race the
+            // initial UI insertion, so reusing the old in-memory list here would keep a
+            // message invisible even though it was successfully stored in the database.
+            Log.i("$TAG Reopening the same conversation, reloading persistent history")
+            computeEvents()
         }
     }
 
@@ -654,13 +670,36 @@ class ConversationViewModel
     @UiThread
     fun addSentMessageToEventsList(message: ChatMessage) {
         coreContext.postOnCoreThread {
-            val eventLog = message.eventLog
-            if (eventLog != null) {
-                Log.i("$TAG Adding sent message with ID [${message.messageId}] to events list")
-                addEvents(arrayOf(eventLog))
-            } else {
-                Log.e("$TAG Failed to get event log for sent message with ID [${message.messageId}]")
-            }
+            addSentMessageToEventsList(message, attempt = 0)
+        }
+    }
+
+    @WorkerThread
+    private fun addSentMessageToEventsList(message: ChatMessage, attempt: Int) {
+        val eventLog = message.eventLog
+        if (eventLog != null) {
+            Log.i("$TAG Adding sent message with ID [${message.messageId}] to events list")
+            addEvents(arrayOf(eventLog))
+            return
+        }
+
+        // Sending a message is asynchronous. Its event log can be attached after send()
+        // returns, especially for Basic SIP file transfers. Wait briefly rather than
+        // dropping the message bubble; onNewEvents() above provides a second path.
+        if (attempt < 5) {
+            Log.i(
+                "$TAG Sent message [${message.messageId}] has no event log yet, retrying UI insertion " +
+                    "(${attempt + 1}/5)"
+            )
+            coreContext.postOnCoreThreadDelayed(
+                { addSentMessageToEventsList(message, attempt + 1) },
+                150L
+            )
+        } else {
+            Log.w(
+                "$TAG Sent message [${message.messageId}] still has no event log; refreshing conversation history"
+            )
+            computeEvents()
         }
     }
 
@@ -750,7 +789,7 @@ class ConversationViewModel
 
         eventsList.forEach(EventLogModel::destroy)
 
-        val history = chatRoom.getHistoryEvents(MESSAGES_PER_PAGE)
+        val history = getDisplayHistoryEvents(MESSAGES_PER_PAGE)
         val list = getEventsListFromHistory(history)
         Log.i("$TAG Extracted [${list.size}] events from conversation history in database")
         eventsList = list
@@ -758,6 +797,20 @@ class ConversationViewModel
         isEmpty.postValue(eventsList.isEmpty())
         checkAndTranslateIncomingMessages()
     }
+
+    /**
+     * Basic SIP rooms persist messages in the message-history collection, whereas
+     * conference rooms expose their timeline through the generic event collection.
+     * Calling getHistoryEvents() for a Basic room returns an empty list on some SDK
+     * builds, which made Vivo's otherwise delivered messages invisible in the UI.
+     */
+    @WorkerThread
+    private fun getDisplayHistoryEvents(limit: Int): Array<EventLog> =
+        if (chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())) {
+            chatRoom.getHistoryMessageEvents(limit)
+        } else {
+            chatRoom.getHistoryEvents(limit)
+        }
 
     @WorkerThread
     private fun addEvents(eventLogs: Array<EventLog>) {

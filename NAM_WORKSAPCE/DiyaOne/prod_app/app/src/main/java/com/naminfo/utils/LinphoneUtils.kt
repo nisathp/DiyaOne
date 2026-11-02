@@ -34,6 +34,7 @@ import org.linphone.core.MediaDirection
 import org.linphone.core.Reason
 import org.linphone.core.tools.Log
 import com.naminfo.ui.main.contacts.model.ContactAvatarModel
+import com.naminfo.ui.main.chat.decodeReplyPreviewEnvelope
 import com.naminfo.ui.main.chat.resolveComposingNames
 import com.naminfo.ui.main.model.isEndToEndEncryptionMandatory
 
@@ -118,7 +119,7 @@ class LinphoneUtils {
                 room.account == account &&
                     room.hasCapability(ChatRoom.Capabilities.Basic.toInt()) &&
                     room.hasCapability(ChatRoom.Capabilities.OneToOne.toInt()) &&
-                    localAddress?.weakEqual(room.localAddress) == true &&
+                    localAddress?.let { basicChatAddressesMatch(it, room.localAddress) } == true &&
                     room.peerAddress.username == username &&
                     room.peerAddress.domain.orEmpty().trim().trimEnd('.').lowercase() in accountDomains
             }
@@ -640,6 +641,92 @@ class LinphoneUtils {
             return chatRoom.identifier ?: ""
         }
 
+        /**
+         * Resolves the identifier persisted by the chat UI to the room owned by the Core.
+         *
+         * Basic SIP rooms don't have a server-issued identifier.  Depending on whether the
+         * proxy supplied its default port, the same room can be represented with either no
+         * port or :5060.  Using searchChatRoomByIdentifier() for that composite identifier
+         * makes the native database look for a conference room that doesn't exist.
+         */
+        @WorkerThread
+        fun findChatRoomByConversationId(core: Core, conversationId: String): ChatRoom? {
+            core.chatRooms.firstOrNull { getConversationId(it) == conversationId }?.let { return it }
+
+            val addresses = conversationId.split("##", limit = 2)
+            if (addresses.size == 2) {
+                val peer = Factory.instance().createAddress(addresses[0])
+                val local = Factory.instance().createAddress(addresses[1])
+                if (peer != null && local != null) {
+                    core.chatRooms.firstOrNull { room ->
+                        room.hasCapability(ChatRoom.Capabilities.Basic.toInt()) &&
+                            basicChatAddressesMatch(room.peerAddress, peer) &&
+                            basicChatAddressesMatch(room.localAddress, local)
+                    }?.let { return it }
+
+                    // Empty Basic rooms are intentionally hidden from core.chatRooms until
+                    // their first message is sent. A contact can therefore create a room and
+                    // immediately navigate to it, while the list lookup above still cannot
+                    // see it. Ask the Core for that exact Basic room before declaring it gone.
+                    val account = core.accountList.firstOrNull { candidate ->
+                        candidate.params.identityAddress?.let { identity ->
+                            basicChatAddressesMatch(identity, local)
+                        } == true
+                    }
+                    if (account != null) {
+                        val params = core.createConferenceParams(null).apply {
+                            isChatEnabled = true
+                            isGroupEnabled = false
+                            this.account = account
+                            securityLevel = Conference.SecurityLevel.None
+                        }
+                        params.chatParams?.apply {
+                            backend = ChatRoom.Backend.Basic
+                            ephemeralLifetime = 0
+                        }
+                        val canonicalPeer = canonicalizeBasicChatAddress(peer, account)
+                        core.searchChatRoom(
+                            params,
+                            local,
+                            null,
+                            arrayOf(canonicalPeer)
+                        )?.let { return it }
+                    }
+                }
+
+                // This is a Basic-room composite identifier, not a conference identifier.
+                // Passing it to the native conference lookup emits an error and can leave the
+                // database unable to store the outgoing message event.
+                return null
+            }
+
+            // Conference/Flexisip rooms use a server-issued identifier.
+            return core.searchChatRoomByIdentifier(conversationId)
+        }
+
+        @WorkerThread
+        fun conversationIdMatchesChatRoom(conversationId: String, chatRoom: ChatRoom): Boolean {
+            if (conversationId == getConversationId(chatRoom)) return true
+            if (!chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())) return false
+
+            val addresses = conversationId.split("##", limit = 2)
+            if (addresses.size != 2) return false
+            val peer = Factory.instance().createAddress(addresses[0]) ?: return false
+            val local = Factory.instance().createAddress(addresses[1]) ?: return false
+            return basicChatAddressesMatch(chatRoom.peerAddress, peer) &&
+                basicChatAddressesMatch(chatRoom.localAddress, local)
+        }
+
+        @WorkerThread
+        private fun basicChatAddressesMatch(first: Address, second: Address): Boolean {
+            if (!first.username.equals(second.username, ignoreCase = true)) return false
+            if (!first.domain.equals(second.domain, ignoreCase = true)) return false
+
+            // A missing port and SIP's standard 5060 port identify the same Basic room.
+            return first.port == second.port ||
+                (first.port in arrayOf(0, 5060) && second.port in arrayOf(0, 5060))
+        }
+
         @WorkerThread
         fun isChatRoomAGroup(chatRoom: ChatRoom): Boolean {
             val oneToOne = chatRoom.hasCapability(ChatRoom.Capabilities.OneToOne.toInt())
@@ -727,6 +814,10 @@ class LinphoneUtils {
 
             // If message contains text, then use that
             var text = message.contents.find { content -> content.isText }?.utf8Text.orEmpty()
+            // DiyaOne's reply fallback envelope is transport metadata. The same description
+            // helper feeds the reply composer and quoted-message bubble, so decode it here
+            // before either UI can display its Base64 payload.
+            text = decodeReplyPreviewEnvelope(text)?.second ?: text
             var contentDescription = ""
 
             if (text.isEmpty()) {

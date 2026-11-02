@@ -2,6 +2,7 @@ package com.naminfo.ui.main.contacts.viewmodel
 
 import android.provider.ContactsContract
 import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.Observer
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.naminfo.DiyaOneApplication.Companion.coreContext
@@ -30,6 +31,10 @@ class MatchedContactsViewModel : ViewModel() {
     // Access only on the Core thread.
     private val models = mutableMapOf<String, ContactAvatarModel>()
 
+    private val mobionContactsRefreshObserver = Observer<Long> {
+        reload(forceRefresh = true)
+    }
+
     private data class AccountIdentity(
         val uri: String,
         val domain: String
@@ -41,21 +46,18 @@ class MatchedContactsViewModel : ViewModel() {
         val profilePictureUrl: String?
     )
 
-    fun reload(accountChanged: Boolean = false) {
-        if (loadJob?.isActive == true && !accountChanged) return
+    init {
+        MobionContactsService.contactsRefreshRequested.observeForever(mobionContactsRefreshObserver)
+    }
+
+    fun reload(accountChanged: Boolean = false, forceRefresh: Boolean = false) {
+        if (loadJob?.isActive == true && !accountChanged && !forceRefresh) return
 
         loadJob?.cancel()
         val requestGeneration = ++generation
 
         if (accountChanged) {
             contacts.value = emptyList()
-        }
-
-        if (!PhoneContactNumbers.hasPermission(coreContext.context)) {
-            contacts.value = emptyList()
-            loading.value = false
-            status.value = "Allow contacts permission to load your contacts."
-            return
         }
 
         loading.value = true
@@ -80,38 +82,34 @@ class MatchedContactsViewModel : ViewModel() {
                 }
 
                 val phoneContacts = withContext(Dispatchers.IO) {
-                    readPhoneContacts()
+                    if (PhoneContactNumbers.hasPermission(coreContext.context)) {
+                        readPhoneContacts()
+                    } else {
+                        emptyMap()
+                    }
                 }
 
-                val matches = if (phoneContacts.isEmpty()) {
-                    emptyList()
-                } else {
-                    withContext(Dispatchers.IO) {
-                        MobionContactsService.fetchContacts()
-                            .mapNotNull { apiContact ->
-                                val key = PhoneContactNumbers.normalize(
-                                    apiContact.mobileNumber
-                                )
-
-                                if (!phoneContacts.containsKey(key)) {
-                                    return@mapNotNull null
-                                }
-
-                                MatchedContact(
-                                    name = phoneContacts[key].orEmpty()
-                                        .ifBlank { apiContact.name.trim() },
-                                    // Retain the API's number for the SIP address.
-                                    number = apiContact.mobileNumber,
-                                    profilePictureUrl = apiContact.profilePictureUrl
-                                )
-                            }
-                            .distinctBy {
-                                PhoneContactNumbers.normalize(it.number)
-                            }
-                            .sortedBy {
-                                it.name.ifBlank { it.number }.lowercase()
-                            }
+                val matches = withContext(Dispatchers.IO) {
+                    MobionContactsService.fetchContacts(forceRefresh)
+                        // The server directory can contain subscribers that are
+                        // not in this phone's address book. Never show those.
+                        .filter { apiContact ->
+                            PhoneContactNumbers.normalize(apiContact.mobileNumber) in phoneContacts
+                        }
+                        .map { apiContact ->
+                            val key = PhoneContactNumbers.normalize(apiContact.mobileNumber)
+                            MatchedContact(
+                                name = phoneContacts[key].orEmpty()
+                                    .ifBlank { apiContact.name.trim() },
+                                // Retain the API's number for the SIP address.
+                                number = apiContact.mobileNumber,
+                                // Profile URLs are mapped in one `/users` call;
+                                // do not start one request per contact.
+                                profilePictureUrl = apiContact.profilePictureUrl
+                            )
                     }
+                        .distinctBy { PhoneContactNumbers.normalize(it.number) }
+                        .sortedBy { it.name.ifBlank { it.number }.lowercase() }
                 }
 
                 val result = onCoreThread { core ->
@@ -130,14 +128,12 @@ class MatchedContactsViewModel : ViewModel() {
 
                 contacts.value = result
                 status.value = when {
-                    phoneContacts.isEmpty() ->
-                        "No contacts with phone numbers in your phone book."
-
                     result.isEmpty() ->
-                        "None of your phone contacts are registered."
+                        "No registered contacts found."
 
                     else -> ""
                 }
+
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -239,6 +235,8 @@ class MatchedContactsViewModel : ViewModel() {
             friend.refKey = refKey
             if (!contact.profilePictureUrl.isNullOrEmpty()) {
                 friend.photo = contact.profilePictureUrl
+            } else {
+                friend.photo = null
             }
 
             for (oldAddress in friend.addresses) {
@@ -310,7 +308,7 @@ class MatchedContactsViewModel : ViewModel() {
 
     override fun onCleared() {
         loadJob?.cancel()
-
+        MobionContactsService.contactsRefreshRequested.removeObserver(mobionContactsRefreshObserver)
         coreContext.postOnCoreThread {
             models.values.forEach { it.destroy() }
             models.clear()

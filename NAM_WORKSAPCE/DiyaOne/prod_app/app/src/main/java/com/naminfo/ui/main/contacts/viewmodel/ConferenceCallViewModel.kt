@@ -4,6 +4,7 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.naminfo.DiyaOneApplication.Companion.coreContext
+import com.naminfo.core.ApiLogRepository
 import com.naminfo.utils.Event
 import java.net.HttpURLConnection
 import java.net.URL
@@ -166,6 +167,11 @@ class ConferenceCallViewModel : ViewModel() {
         val connection = URL(
             "$baseUrl/fs_webservice/WebService.asmx/TakeConference"
         ).openConnection() as HttpURLConnection
+        val logId = ApiLogRepository.begin(
+            "POST",
+            "$baseUrl/fs_webservice/WebService.asmx/TakeConference",
+            body.toString(Charsets.UTF_8)
+        )
 
         try {
             connection.requestMethod = "POST"
@@ -180,13 +186,17 @@ class ConferenceCallViewModel : ViewModel() {
 
             connection.outputStream.use { it.write(body) }
 
-            check(connection.responseCode in 200..299) {
-                "Conference API failed: HTTP ${connection.responseCode}"
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                val error = connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                ApiLogRepository.complete(logId, responseCode, error)
+                error("Conference API failed: HTTP $responseCode")
             }
 
             val xml = connection.inputStream
                 .bufferedReader(Charsets.UTF_8)
                 .use { it.readText() }
+            ApiLogRepository.complete(logId, responseCode, xml)
 
             val parser = XmlPullParserFactory.newInstance()
                 .newPullParser()
@@ -207,6 +217,9 @@ class ConferenceCallViewModel : ViewModel() {
             }
 
             return result.toString().trim()
+        } catch (error: Exception) {
+            ApiLogRepository.fail(logId, error)
+            throw error
         } finally {
             connection.disconnect()
         }

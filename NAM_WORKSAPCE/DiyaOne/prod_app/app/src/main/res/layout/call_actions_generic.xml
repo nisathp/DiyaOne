@@ -44,7 +44,26 @@
             app:tint="@color/bc_white"
             app:layout_constraintTop_toBottomOf="@id/call_actions_handle"
             app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintStart_toStartOf="parent"/>
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toStartOf="@id/change_tcall_language" />
+
+        <ImageView
+            android:id="@+id/change_tcall_language"
+            android:onClick="@{() -> viewModel.requestActiveTCallLanguageChange()}"
+            android:layout_width="@dimen/call_button_size"
+            android:layout_height="@dimen/call_button_size"
+            android:layout_marginEnd="16dp"
+            android:padding="@dimen/call_button_icon_padding"
+            android:visibility="@{viewModel.canChangeActiveTCallLanguage ? View.VISIBLE : View.GONE}"
+            android:enabled="@{!viewModel.isPaused &amp;&amp; !viewModel.isPausedByRemote}"
+            android:src="@drawable/globe"
+            android:background="@drawable/in_call_button_background_green"
+            android:contentDescription="@string/call_action_change_tcall_language"
+            app:tint="@color/in_call_button_tint_color"
+            app:layout_constraintTop_toBottomOf="@id/call_actions_handle"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintStart_toEndOf="@id/hang_up"
+            app:layout_constraintEnd_toStartOf="@id/toggle_video" />
 
         <ImageView
             android:onClick="@{() -> viewModel.toggleVideo()}"
@@ -63,7 +82,7 @@
             app:layout_constraintHorizontal_chainStyle="packed"
             app:layout_constraintTop_toBottomOf="@id/call_actions_handle"
             app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintStart_toEndOf="@id/hang_up"
+            app:layout_constraintStart_toEndOf="@id/change_tcall_language"
             app:layout_constraintEnd_toStartOf="@id/toggle_mute_mic" />
 
         <com.google.android.material.progressindicator.CircularProgressIndicator

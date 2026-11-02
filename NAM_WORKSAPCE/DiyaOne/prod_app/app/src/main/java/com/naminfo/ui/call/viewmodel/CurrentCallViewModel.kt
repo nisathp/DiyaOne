@@ -182,6 +182,15 @@ class CurrentCallViewModel
         MutableLiveData()
     }
 
+    // This action is intentionally exposed only to the B-party while an
+    // incoming translation call is connected. Normal calls must never invoke
+    // the translation controller endpoint.
+    val canChangeActiveTCallLanguage = MutableLiveData(false)
+
+    val showActiveTCallLanguageDialogEvent: MutableLiveData<Event<Boolean>> by lazy {
+        MutableLiveData()
+    }
+
     val requestCameraPermission: MutableLiveData<Event<Boolean>> by lazy {
         MutableLiveData()
     }
@@ -333,6 +342,7 @@ class CurrentCallViewModel
         @WorkerThread
         override fun onStateChanged(call: Call, state: Call.State, message: String) {
             Log.i("$TAG Call [${call.remoteAddress.asStringUriOnly()}] state changed [$state]")
+            updateActiveTCallLanguageControl(call)
             if (LinphoneUtils.isCallOutgoing(call.state)) {
                 isVideoEnabled.postValue(call.params.isVideoEnabled)
                 updateVideoDirection(call.params.videoDirection)
@@ -459,10 +469,13 @@ class CurrentCallViewModel
             state: Call.State,
             message: String
         ) {
+            if (LinphoneUtils.isCallEnding(call.state)) {
+                clearIncomingTCallLanguagePrompt(call)
+            }
+
             isOutgoingRinging.postValue(call.state == Call.State.OutgoingRinging)
             isIncomingEarlyMedia.postValue(call.state == Call.State.IncomingEarlyMedia)
             isOutgoingEarlyMedia.postValue(call.state == Call.State.OutgoingEarlyMedia)
-
             if (::currentCall.isInitialized) {
                 if (call != currentCall) {
                     if (call == core.currentCall && state != Call.State.Pausing) {
@@ -637,7 +650,7 @@ class CurrentCallViewModel
                 Log.i("$TAG Answering call [${call.remoteAddress.asStringUriOnly()}]")
                 if (isTranslationCall(call)) {
                     Log.i("$TAG Asking for preferred language before answering incoming T Call")
-                    showIncomingTCallLanguageDialogEvent.postValue(Event(call))
+                    requestIncomingTCallLanguagePrompt(call)
                     return@postOnCoreThread
                 }
                 coreContext.answerCall(call)
@@ -666,6 +679,10 @@ class CurrentCallViewModel
     @UiThread
     fun selectIncomingTCallLanguageAndAnswer(call: Call, language: CallLanguage) {
         corePreferences.callLanguage = language
+        // Queue the translation-controller update before accepting the TCall.
+        // Normal calls never reach this method because they don't show the
+        // incoming TCall language selector.
+        coreContext.syncIncomingTranslationCallLanguageBeforeAnswer(call)
         coreContext.postOnCoreThread {
             if (LinphoneUtils.isCallIncoming(call.state)) {
                 Log.i("$TAG Answering incoming T Call with selected language [${language.code}]")
@@ -673,6 +690,61 @@ class CurrentCallViewModel
             } else {
                 Log.w("$TAG Incoming T Call ended before language selection completed")
             }
+        }
+    }
+
+    @UiThread
+    fun requestActiveTCallLanguageChange() {
+        coreContext.postOnCoreThread {
+            if (!::currentCall.isInitialized ||
+                currentCall.dir != Call.Dir.Incoming ||
+                !isTranslationCall(currentCall) ||
+                !LinphoneUtils.isCallActive(currentCall.state)
+            ) {
+                Log.w("$TAG Ignoring active language selection for a non-active incoming TCall")
+                return@postOnCoreThread
+            }
+
+            showActiveTCallLanguageDialogEvent.postValue(Event(true))
+        }
+    }
+
+    @UiThread
+    fun updateActiveTCallLanguage(language: CallLanguage) {
+        if (language == CallLanguage.NONE) return
+
+        corePreferences.callLanguage = language
+        // CoreContext validates that this is a TCall and derives `attender`
+        // from the incoming direction before posting the request with this
+        // call's Linphone SIP Call-ID.
+        coreContext.syncActiveTranslationCallLanguage()
+    }
+
+    @UiThread
+    fun cancelIncomingTCallLanguageSelection(call: Call) {
+        // The user may dismiss the dialog and press Answer later. In that case,
+        // allow the same incoming call to request the language again.
+        clearIncomingTCallLanguagePrompt(call)
+    }
+
+    @WorkerThread
+    private fun requestIncomingTCallLanguagePrompt(call: Call) {
+        val promptKey = System.identityHashCode(call).toString()
+        val shouldShow = synchronized(incomingTCallLanguagePrompts) {
+            incomingTCallLanguagePrompts.add(promptKey)
+        }
+        if (!shouldShow) {
+            Log.i("$TAG Language selection is already visible for incoming T Call [${call.remoteAddress.asStringUriOnly()}]")
+            return
+        }
+
+        Log.i("$TAG Showing language preference for incoming T Call [${call.remoteAddress.asStringUriOnly()}]")
+        showIncomingTCallLanguageDialogEvent.postValue(Event(call))
+    }
+
+    private fun clearIncomingTCallLanguagePrompt(call: Call) {
+        synchronized(incomingTCallLanguagePrompts) {
+            incomingTCallLanguagePrompts.remove(System.identityHashCode(call).toString())
         }
     }
 
@@ -1134,9 +1206,9 @@ class CurrentCallViewModel
 
         terminatedByUser = false
         currentCall = call
+        updateActiveTCallLanguageControl(call)
         if (call.dir == Call.Dir.Incoming && LinphoneUtils.isCallIncoming(call.state) && isTranslationCall(call)) {
-            Log.i("$TAG Showing language preference for incoming T Call [${call.remoteAddress.asStringUriOnly()}]")
-            showIncomingTCallLanguageDialogEvent.postValue(Event(call))
+            requestIncomingTCallLanguagePrompt(call)
         }
         callStatsModel.update(call, call.audioStats)
         callMediaEncryptionModel.update(call)
@@ -1314,6 +1386,15 @@ class CurrentCallViewModel
                 }
             }.launchIn(viewModelScope)
         }
+    }
+
+    @WorkerThread
+    private fun updateActiveTCallLanguageControl(call: Call) {
+        canChangeActiveTCallLanguage.postValue(
+            call.dir == Call.Dir.Incoming &&
+                isTranslationCall(call) &&
+                LinphoneUtils.isCallActive(call.state)
+        )
     }
 
     @WorkerThread

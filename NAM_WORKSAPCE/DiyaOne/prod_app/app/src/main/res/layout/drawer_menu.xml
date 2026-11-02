@@ -14,6 +14,9 @@
             name="logsClickedListener"
             type="View.OnClickListener" />
         <variable
+            name="apiLogsClickedListener"
+            type="View.OnClickListener" />
+        <variable
             name="versionClickedListener"
             type="View.OnClickListener" />
         <variable
@@ -96,30 +99,52 @@
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintTop_toBottomOf="@id/brand_name"
-                app:layout_constraintBottom_toTopOf="@id/logs">
+                app:layout_constraintBottom_toTopOf="@id/api_logs">
 
                 <LinearLayout
+                    android:id="@+id/profile_section"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:orientation="vertical"
-                    entries="@{viewModel.accounts}"
-                    layout="@{@layout/account_list_cell}">
+                    android:orientation="vertical">
 
-                    <ImageView
-                        android:id="@+id/no_account_image"
+                    <LinearLayout
+                        android:id="@+id/accounts"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:src="@drawable/illu"
-                        android:layout_margin="10dp"
-                        android:contentDescription="@null" />
+                        android:orientation="vertical"
+                        entries="@{viewModel.accounts}"
+                        layout="@{@layout/account_list_cell}">
+
+                        <ImageView
+                            android:id="@+id/no_account_image"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:src="@drawable/illu"
+                            android:layout_margin="10dp"
+                            android:contentDescription="@null" />
+
+                        <androidx.appcompat.widget.AppCompatTextView
+                            style="@style/section_header_style"
+                            android:id="@+id/no_account_label"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="@string/drawer_menu_no_account_configured_yet"
+                            android:gravity="center" />
+                    </LinearLayout>
 
                     <androidx.appcompat.widget.AppCompatTextView
-                        style="@style/section_header_style"
-                        android:id="@+id/no_account_label"
+                        android:id="@+id/token_expiry_summary"
+                        style="@style/default_text_style"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:text="@string/drawer_menu_no_account_configured_yet"
-                        android:gravity="center" />
+                        android:layout_marginStart="22dp"
+                        android:layout_marginTop="8dp"
+                        android:layout_marginEnd="22dp"
+                        android:layout_marginBottom="8dp"
+                        android:text="@{viewModel.tokenExpirySummary}"
+                        android:textColor="?attr/color_main2_600"
+                        android:textSize="12sp"
+                        android:visibility="@{viewModel.showTokenExpiry ? View.VISIBLE : View.GONE}" />
 
                 </LinearLayout>
 
@@ -142,6 +167,24 @@
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintBottom_toTopOf="@id/separator" />
+
+            <androidx.appcompat.widget.AppCompatTextView
+                android:onClick="@{apiLogsClickedListener}"
+                style="@style/secondary_button_label_style"
+                android:id="@+id/api_logs"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="16dp"
+                android:layout_marginEnd="16dp"
+                android:layout_marginBottom="8dp"
+                android:text="@string/drawer_menu_api_logs"
+                android:drawableStart="@drawable/info"
+                android:drawablePadding="8dp"
+                app:drawableTint="@color/secondary_button_label_color"
+                app:layout_constraintWidth_max="@dimen/button_max_width"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintBottom_toTopOf="@id/logs" />
 
             <androidx.appcompat.widget.AppCompatTextView
                 android:onClick="@{logsClickedListener}"

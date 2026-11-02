@@ -15,6 +15,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
+import com.naminfo.core.ApiLogRepository
+import com.naminfo.core.MobionTlsCompatibility
+import com.naminfo.contacts.MobionContactsService
 import com.naminfo.R
 import org.linphone.core.Account
 import org.linphone.core.AuthInfo
@@ -34,13 +37,22 @@ class ThirdPartySipAccountLoginViewModel
     constructor() : GenericViewModel() {
     companion object {
         private const val TAG = "[Third Party SIP Account Login ViewModel]"
+        private const val MOBION_API_DOMAIN = "mobionglobal.com"
     }
+
+    private data class ApiAuthenticationResult(
+        val success: Boolean,
+        val failureReason: String? = null,
+        val profilePictureUrl: String? = null
+    )
 
     val username = MutableLiveData<String>()
 
     val authId = MutableLiveData<String>()
 
-    val domain = MutableLiveData<String>()
+    val apiDomain = MutableLiveData<String>()
+
+    val sipDomain = MutableLiveData<String>()
 
     val displayName = MutableLiveData<String>()
 
@@ -62,6 +74,10 @@ class ThirdPartySipAccountLoginViewModel
 
     val registrationInProgress = MutableLiveData<Boolean>()
 
+    // Once an attempted SIP registration has failed, make the next user action
+    // explicit. We do not keep re-creating accounts in the background.
+    val registrationFailed = MutableLiveData<Boolean>()
+
     val accountLoggedInEvent: MutableLiveData<Event<Boolean>> by lazy {
         MutableLiveData()
     }
@@ -78,7 +94,6 @@ class ThirdPartySipAccountLoginViewModel
 
     private lateinit var newlyCreatedAuthInfo: AuthInfo
     private lateinit var newlyCreatedAccount: Account
-
     private val coreListener = object : CoreListenerStub() {
         @WorkerThread
         override fun onAccountRegistrationStateChanged(
@@ -103,11 +118,15 @@ class ThirdPartySipAccountLoginViewModel
                     accountLoggedInEvent.postValue(Event(true))
                 } else if (state == RegistrationState.Failed) {
                     registrationInProgress.postValue(false)
+                    registrationFailed.postValue(true)
                     core.removeListener(this)
 
                     val error = when (account.error) {
                         Reason.Forbidden -> {
                             AppUtils.getString(R.string.assistant_account_login_forbidden_error)
+                        }
+                        Reason.IOError -> {
+                            AppUtils.getString(R.string.assistant_account_login_sip_server_unreachable_error)
                         }
                         else -> {
                             AppUtils.getFormattedString(
@@ -119,6 +138,12 @@ class ThirdPartySipAccountLoginViewModel
                     accountLoginErrorEvent.postValue(Event(error))
 
                     Log.e("$TAG Account failed to REGISTER [$message], removing it")
+                    // Explicitly disable registration before removing the account so
+                    // the app itself never schedules another REGISTER attempt. Any
+                    // packets already sent are SIP UDP transaction retransmissions.
+                    val disabledAccountParams = account.params.clone()
+                    disabledAccountParams.isRegisterEnabled = false
+                    account.params = disabledAccountParams
                     core.removeAuthInfo(newlyCreatedAuthInfo)
                     core.removeAccount(newlyCreatedAccount)
                 }
@@ -127,13 +152,17 @@ class ThirdPartySipAccountLoginViewModel
     }
 
     init {
-        expandAdvancedSettings.value = false
+        expandAdvancedSettings.value = true
         registrationInProgress.value = false
+        registrationFailed.value = false
 
         loginEnabled.addSource(username) {
             loginEnabled.value = isLoginButtonEnabled()
         }
-        loginEnabled.addSource(domain) {
+        loginEnabled.addSource(apiDomain) {
+            loginEnabled.value = isLoginButtonEnabled()
+        }
+        loginEnabled.addSource(sipDomain) {
             loginEnabled.value = isLoginButtonEnabled()
         }
 
@@ -152,7 +181,8 @@ class ThirdPartySipAccountLoginViewModel
                 }
             }
             countryDialPlans.postValue(orderedDialPlans)
-            domain.postValue(
+            apiDomain.postValue(MOBION_API_DOMAIN)
+            sipDomain.postValue(
                 corePreferences.thirdPartySipAccountDefaultDomain.ifBlank {
                     corePreferences.defaultDomain
                 }
@@ -172,16 +202,30 @@ class ThirdPartySipAccountLoginViewModel
 
     @UiThread
     fun login() {
-        val domainValue = domain.value.orEmpty().trim()
+        val apiBase = getBackendApiBaseUrl(apiDomain.value.orEmpty())
+        val domainValue = sipDomain.value.orEmpty().trim()
         val user = username.value.orEmpty().trim()
-        val pwd = user.ifBlank { "Test@1234" }
+        // For this operator flow, the registered mobile number is also the
+        // credential used by the API and the SIP account. Do not expose a
+        // separate password entry on the registration screen.
+        val pwd = user
         val name = displayName.value.orEmpty().trim()
         val cCode = internationalPrefix.value.orEmpty().trim()
 
         registrationInProgress.value = true
+        registrationFailed.value = false
 
         viewModelScope.launch {
-            performSignupAndSignin(domainValue, user, pwd, name, cCode)
+            val authentication = performSignupAndSignin(apiBase, user, pwd, name, cCode)
+            if (!authentication.success) {
+                registrationInProgress.value = false
+                registrationFailed.value = true
+                val reason = authentication.failureReason ?: "Unknown API error"
+                accountLoginErrorEvent.value = Event(
+                    AppUtils.getFormattedString(R.string.assistant_account_login_error, reason)
+                )
+                return@launch
+            }
 
             coreContext.postOnCoreThread { core ->
                 core.loadConfigFromXml(corePreferences.thirdPartyDefaultValuesPath)
@@ -220,6 +264,7 @@ class ThirdPartySipAccountLoginViewModel
                     Log.e("$TAG Can't parse [$identity] as Address!")
                     showRedToast(R.string.assistant_login_cant_parse_address_toast, R.drawable.warning_circle)
                     registrationInProgress.postValue(false)
+                    registrationFailed.postValue(true)
                     return@postOnCoreThread
                 }
                 Log.i("$TAG Computed SIP identity is [${identityAddress.asStringUriOnly()}]")
@@ -232,6 +277,7 @@ class ThirdPartySipAccountLoginViewModel
                     Log.w("$TAG An account with the same identity address [${found.params.identityAddress?.asStringUriOnly()}] already exists, do not add it again!")
                     showRedToast(R.string.assistant_account_login_already_connected_error, R.drawable.warning_circle)
                     registrationInProgress.postValue(false)
+                    registrationFailed.postValue(true)
                     return@postOnCoreThread
                 }
 
@@ -254,7 +300,8 @@ class ThirdPartySipAccountLoginViewModel
                 if (identityAddress.displayName.isNullOrBlank()) {
                     identityAddress.displayName = core.config.getString(profileSection, "display_name", null)
                 }
-                accountParams.pictureUri = core.config.getString(profileSection, "picture_uri", null)
+                accountParams.pictureUri = authentication.profilePictureUrl
+                    ?: core.config.getString(profileSection, "picture_uri", null)
                 accountParams.identityAddress = identityAddress
 
                 val outboundProxyValue = outboundProxy.value.orEmpty().trim()
@@ -312,7 +359,9 @@ class ThirdPartySipAccountLoginViewModel
 
     @UiThread
     private fun isLoginButtonEnabled(): Boolean {
-        return username.value.orEmpty().isNotBlank() && domain.value.orEmpty().isNotBlank()
+        return username.value.orEmpty().isNotBlank() &&
+            apiDomain.value.orEmpty().isNotBlank() &&
+            sipDomain.value.orEmpty().isNotBlank()
     }
 
    /* @UiThread
@@ -321,28 +370,34 @@ class ThirdPartySipAccountLoginViewModel
         return true // mobileNumber.matches(Regex("[6-9]\\d{9}")) && domain.value.orEmpty().isNotEmpty()
     }*/
 
-    private suspend fun performSignupAndSignin(domainValue: String, subscriberId: String, passwordStr: String, displayNameStr: String, countryCodeStr: String) = withContext(Dispatchers.IO) {
-        val cleanDomain = domainValue.removePrefix("http://").removePrefix("https://").removeSuffix("/")
-        val apiBase = if (cleanDomain.contains("/Diyaone", true)) {
-            "http://$cleanDomain"
-        } else {
-            "http://$cleanDomain/Diyaone"
-        }
+    private suspend fun performSignupAndSignin(
+        apiBase: String,
+        subscriberId: String,
+        passwordStr: String,
+        displayNameStr: String,
+        countryCodeStr: String
+    ): ApiAuthenticationResult = withContext(Dispatchers.IO) {
 
-        val password = passwordStr.ifBlank { "Test@1234" }
+        // Certificate compatibility setup can be slow on some OEM builds. Run it on
+        // the login worker thread rather than blocking Application.onCreate().
+        MobionTlsCompatibility.install(coreContext.context)
+
+        val password = passwordStr
         val names = displayNameStr.trim().split(" ", limit = 2)
         val firstName = names.getOrNull(0)?.takeIf { it.isNotBlank() } ?: subscriberId
         val lastName = names.getOrNull(1).orEmpty()
         val countryCode = if (countryCodeStr.startsWith("+")) countryCodeStr else "+$countryCodeStr"
 
-        // 1. Signup API
+        // A new number is created first. A conflict means this is an existing user,
+        // so continue directly with sign-in instead of treating it as an error.
+        var signupLogId: Long? = null
         try {
-            val signupUrl = URL("$apiBase/api/users")
+            val signupUrl = URL("$apiBase/users")
             val signupConn = signupUrl.openConnection() as HttpURLConnection
             signupConn.requestMethod = "POST"
             signupConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-            signupConn.connectTimeout = 10000
-            signupConn.readTimeout = 10000
+            signupConn.connectTimeout = 5000
+            signupConn.readTimeout = 5000
             signupConn.doOutput = true
 
             val signupBody = JSONObject().apply {
@@ -354,17 +409,32 @@ class ThirdPartySipAccountLoginViewModel
                 put("mobileNo", subscriberId)
             }
 
+            signupLogId = ApiLogRepository.begin("POST", signupUrl.toString(), signupBody.toString())
             OutputStreamWriter(signupConn.outputStream).use { it.write(signupBody.toString()) }
             val signupCode = signupConn.responseCode
-            Log.i("$TAG Signup API response code: $signupCode")
+            val signupError = signupConn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            ApiLogRepository.complete(requireNotNull(signupLogId), signupCode, signupError)
             signupConn.disconnect()
+
+            val userAlreadyExists = signupCode == HttpURLConnection.HTTP_CONFLICT ||
+                signupError.contains("already", ignoreCase = true) ||
+                signupError.contains("exist", ignoreCase = true)
+            when {
+                signupCode in 200..299 -> Log.i("$TAG Signup API succeeded with HTTP $signupCode")
+                userAlreadyExists -> Log.i("$TAG Signup reports existing user (HTTP $signupCode), signing in")
+                else -> {
+                    Log.w("$TAG Signup API returned HTTP $signupCode, attempting signin fallback")
+                }
+            }
         } catch (e: Exception) {
-            Log.w("$TAG Signup API exception (user might already exist): $e")
+            ApiLogRepository.fail(signupLogId ?: ApiLogRepository.begin("POST", "$apiBase/users"), e)
+            Log.w("$TAG Signup API unavailable (${e.javaClass.simpleName}: ${e.message}), attempting signin fallback")
         }
 
-        // 2. Signin API
+        // Sign in both newly-created and existing users before registering SIP.
+        var signinLogId: Long? = null
         try {
-            val signinUrl = URL("$apiBase/api/auth/signin")
+            val signinUrl = URL("$apiBase/auth/signin")
             val signinConn = signinUrl.openConnection() as HttpURLConnection
             signinConn.requestMethod = "POST"
             signinConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
@@ -377,29 +447,78 @@ class ThirdPartySipAccountLoginViewModel
                 put("password", password)
             }
 
+            signinLogId = ApiLogRepository.begin("POST", signinUrl.toString(), signinBody.toString())
             OutputStreamWriter(signinConn.outputStream).use { it.write(signinBody.toString()) }
             val signinCode = signinConn.responseCode
             if (signinCode in 200..299) {
                 val responseText = signinConn.inputStream.bufferedReader().use { it.readText() }
-                Log.i("$TAG Signin API success: $responseText")
+                ApiLogRepository.complete(requireNotNull(signinLogId), signinCode, responseText)
+                Log.i("$TAG Signin API succeeded with HTTP $signinCode")
+                var profilePictureUrl: String? = null
                 try {
                     val json = JSONObject(responseText)
                     val token = json.optString("token").ifEmpty { json.optString("accessToken") }
                     val refreshToken = json.optString("refreshToken")
+                    val accessTokenExpiresAt = json.optString("accessTokenExpiresAt")
+                    val refreshTokenExpiresAt = json.optString("refreshTokenExpiresAt")
                     if (token.isNotEmpty()) corePreferences.authToken = token
                     if (refreshToken.isNotEmpty()) corePreferences.refreshToken = refreshToken
+                    corePreferences.accessTokenExpiresAt = accessTokenExpiresAt.ifEmpty { null }
+                    corePreferences.refreshTokenExpiresAt = refreshTokenExpiresAt.ifEmpty { null }
                     corePreferences.apiDomain = apiBase
+                    val now = java.text.SimpleDateFormat("dd MMM yyyy, hh:mm a", java.util.Locale.getDefault()).format(java.util.Date())
+                    corePreferences.loginTime = now
+                    // This single-user endpoint is intentionally used only for
+                    // the account that just signed in. Contact photos come from
+                    // the single bulk `/users` map, never N individual calls.
+                    profilePictureUrl = MobionContactsService.fetchProfilePictureUrl(subscriberId)
                 } catch (e: Exception) {
                     Log.w("$TAG Failed to parse signin response JSON: $e")
                 }
+                signinConn.disconnect()
+                return@withContext ApiAuthenticationResult(
+                    success = true,
+                    profilePictureUrl = profilePictureUrl
+                )
             } else {
-                val errorText = signinConn.errorStream?.bufferedReader()?.use { it.readText() }
-                Log.e("$TAG Signin API failed [$signinCode]: $errorText")
+                val errorText = signinConn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                ApiLogRepository.complete(requireNotNull(signinLogId), signinCode, errorText)
+                Log.e("$TAG Signin API failed with HTTP $signinCode")
+                signinConn.disconnect()
+                return@withContext ApiAuthenticationResult(false, "Signin API HTTP $signinCode")
             }
-            signinConn.disconnect()
         } catch (e: Exception) {
-            Log.e("$TAG Signin API exception: $e")
+            ApiLogRepository.fail(signinLogId ?: ApiLogRepository.begin("POST", "$apiBase/auth/signin"), e)
+            val errorMsg = if (e is java.net.SocketTimeoutException) {
+                "Server Connection Timeout"
+            } else {
+                "Signin API unavailable (${e.javaClass.simpleName})"
+            }
+            Log.e("$TAG Signin API unavailable: ${e.javaClass.simpleName}")
+            return@withContext ApiAuthenticationResult(false, errorMsg)
         }
+    }
+
+    private fun getBackendApiBaseUrl(rawApiDomain: String): String {
+        val input = rawApiDomain.trim().trimEnd('/')
+        val baseUrl = when {
+            input.startsWith("http://", ignoreCase = true) ||
+                input.startsWith("https://", ignoreCase = true) -> input
+            isIpAddressOrLocalhost(input) -> "http://$input"
+            else -> "https://$input"
+        }
+
+        return when {
+            baseUrl.endsWith("/Diyaone/api", ignoreCase = true) -> baseUrl
+            baseUrl.endsWith("/Diyaone", ignoreCase = true) -> "$baseUrl/api"
+            else -> "$baseUrl/Diyaone/api"
+        }
+    }
+
+    private fun isIpAddressOrLocalhost(value: String): Boolean {
+        val host = value.substringBefore('/').substringBefore(':')
+        return host.equals("localhost", ignoreCase = true) ||
+            host.matches(Regex("\\d{1,3}(?:\\.\\d{1,3}){3}"))
     }
 
     @UiThread

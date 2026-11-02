@@ -455,18 +455,34 @@ private fun loadContactPictureWithCoil(
 
         val image = model.picturePath.value.orEmpty()
         if (image.isNotEmpty()) {
+            // Keep a stable initials avatar in recycled list cells until the
+            // remote profile image is ready, and expose the image fetch with a
+            // small ring around that avatar.
+            imageView.load(getErrorImageLoader(context, model, size, textSize))
+            imageView.setAvatarLoading(true)
             imageView.load(image) {
                 transformations(CircleCropTransformation())
                 listener(
+                    onSuccess = { _, _ ->
+                        imageView.setAvatarLoading(false)
+                    },
                     onError = { _, _ ->
+                        imageView.setAvatarLoading(false)
                         imageView.load(getErrorImageLoader(context, model, size, textSize))
                     }
                 )
             }
         } else {
+            imageView.setAvatarLoading(false)
             imageView.load(getErrorImageLoader(context, model, size, textSize))
         }
     }
+}
+
+@UiThread
+private fun ImageView.setAvatarLoading(isLoading: Boolean) {
+    (parent as? View)?.findViewById<View>(R.id.avatar_loading)?.visibility =
+        if (isLoading) View.VISIBLE else View.GONE
 }
 
 private fun getErrorImageLoader(

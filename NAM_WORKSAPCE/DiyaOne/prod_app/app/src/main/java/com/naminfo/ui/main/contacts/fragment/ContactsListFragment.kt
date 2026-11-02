@@ -125,9 +125,11 @@ class ContactsListFragment : AbstractMainFragment() {
         binding.favouritesContactsList.visibility = View.GONE
         binding.favouritesContactsList.adapter = null
 
-        // Loading happens automatically; no refresh button is needed.
-        binding.contactsListSwipeRefresh.isEnabled = false
+        binding.contactsListSwipeRefresh.isEnabled = true
         binding.contactsListSwipeRefresh.isRefreshing = false
+        binding.contactsListSwipeRefresh.setOnRefreshListener {
+            matchedViewModel.reload(forceRefresh = true)
+        }
 
         binding.matchedContactsList?.apply {
             layoutManager = LinearLayoutManager(requireContext())

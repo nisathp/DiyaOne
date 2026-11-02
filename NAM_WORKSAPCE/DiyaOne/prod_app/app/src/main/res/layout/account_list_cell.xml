@@ -63,7 +63,6 @@
             android:id="@+id/register_status"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginBottom="10dp"
             android:paddingStart="8dp"
             android:paddingEnd="8dp"
             android:paddingTop="4dp"
@@ -78,6 +77,24 @@
             app:layout_constraintStart_toStartOf="@id/name"
             app:layout_constraintEnd_toStartOf="@id/menu"
             app:layout_constraintTop_toBottomOf="@id/name"
+            app:layout_constraintBottom_toTopOf="@id/login_time"/>
+
+        <androidx.appcompat.widget.AppCompatTextView
+            style="@style/default_text_style_300"
+            android:id="@+id/login_time"
+            android:onClick="@{() -> model.onLoginTimeClicked()}"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:layout_marginBottom="10dp"
+            android:text="@{model.loginTime}"
+            android:textColor="?attr/color_main2_600"
+            android:textSize="11sp"
+            android:visibility="@{model.loginTime.empty ? View.GONE : View.VISIBLE, default=gone}"
+            app:layout_constraintHorizontal_bias="0"
+            app:layout_constraintStart_toStartOf="@id/name"
+            app:layout_constraintEnd_toStartOf="@id/menu"
+            app:layout_constraintTop_toBottomOf="@id/register_status"
             app:layout_constraintBottom_toTopOf="@id/separator"/>
 
         <androidx.appcompat.widget.AppCompatTextView

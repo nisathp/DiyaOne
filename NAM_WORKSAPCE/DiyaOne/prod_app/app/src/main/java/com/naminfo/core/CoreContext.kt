@@ -43,6 +43,7 @@ import com.naminfo.utils.Event
 import com.naminfo.utils.FileUtils
 import com.naminfo.utils.LinphoneUtils
 import com.naminfo.ui.main.history.model.TranslationCallHistoryMetadata
+import com.naminfo.translation.CallLanguageSyncApi
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -219,6 +220,7 @@ class CoreContext
             Log.i("$TAG SIP registration callback state=[$state] message=[$message]")
             if (state != RegistrationState.Ok) return
             if (account == core.defaultAccount) {
+                OutgoingMessageRetryManager.onSipRegistrationRestored()
                 // Core may start before the user creates the first SIP account.
                 // In that case onCoreStarted() has nothing to configure, so
                 // enable push once the account has actually registered.
@@ -377,10 +379,21 @@ class CoreContext
                 "$TAG Call [${call.remoteAddress.asStringUriOnly()}] state changed [$currentState]"
             )
             if (currentState == Call.State.End || currentState == Call.State.Error || currentState == Call.State.Released) {
-                SipTraceRepository.onCallCompleted(call.callLog.callId ?: call.callLog.refKey)
+                val callId = call.callLog.callId ?: call.callLog.refKey
+                SipTraceRepository.onCallCompleted(callId)
+                CallLanguageSyncApi.clear(callId)
             }
             when (currentState) {
                 Call.State.IncomingReceived -> {
+                    if (isLinphoneFallbackAddress(call.remoteAddress)) {
+                        Log.e(
+                            "$TAG Blocking incoming call with Linphone fallback identity " +
+                                "[${call.remoteAddress.asStringUriOnly()}]"
+                        )
+                        call.decline(Reason.Declined)
+                        notifyFallbackIdentityBlocked()
+                        return
+                    }
                     val isTCall = isTranslationCall(call)
                     val isVideo = LinphoneUtils.isVideoEnabled(call)
                     if (isTCall) {
@@ -402,6 +415,8 @@ class CoreContext
                     }
                 }
                 Call.State.IncomingEarlyMedia -> {
+                    Log.i("[Call Diagnostics] INCOMMING EARLYMEDIA STATE -> IncomingEarlyMedia")
+
                     if (core.ringDuringIncomingEarlyMedia) {
                         val speaker = core.audioDevices.find {
                             it.type == AudioDevice.Type.Speaker
@@ -431,9 +446,12 @@ class CoreContext
                 }
                 Call.State.OutgoingProgress -> {
                     Log.i("[Call Diagnostics] OUTGOING STATE -> OutgoingProgress (Connecting to server / waiting for ringing - Scenario 1)")
+                    syncTranslationCallLanguage(call, "caller")
                 }
                 Call.State.OutgoingRinging -> {
                     Log.i("[Call Diagnostics] OUTGOING STATE -> OutgoingRinging (Received 180 Ringing from server - Scenario 2)")
+                    // Retry here if the SIP Call-ID was not available at OutgoingProgress.
+                    syncTranslationCallLanguage(call, "caller")
                     if (corePreferences.routeAudioToBluetoothWhenPossible) {
                         Log.i("$TAG Trying to route audio to either bluetooth, hearing aid, headphones or headset if available")
                         AudioUtils.routeAudioToAnyConnectedAudioDeviceOtherThanEarpieceAndSpeaker(call)
@@ -447,6 +465,9 @@ class CoreContext
                     }
                 }
                 Call.State.Connected -> {
+                    if (call.dir == Call.Dir.Incoming) {
+                        syncTranslationCallLanguage(call, "attender")
+                    }
                     postOnMainThread {
                         showCallActivity()
                     }
@@ -470,6 +491,12 @@ class CoreContext
                     }
                 }
                 Call.State.StreamsRunning -> {
+                    // Some incoming calls expose the Linphone SIP Call-ID only
+                    // after media starts. Retry with that exact value rather
+                    // than ever falling back to an internal refKey.
+                    if (call.dir == Call.Dir.Incoming) {
+                        syncTranslationCallLanguage(call, "attender")
+                    }
                     if (previousCallState == Call.State.Connected) {
                         if (corePreferences.automaticallyStartCallRecording && !call.params.isRecording) {
                             if (call.conference == null) { // TODO: FIXME: Conference recordings are currently disabled
@@ -595,6 +622,22 @@ class CoreContext
                         return
                     }
 
+                    // DiyaOne's operator SIP accounts use the 10-digit mobile
+                    // number as both the SIP username and password. FreeSWITCH
+                    // can request a second Digest auth-info object with its own
+                    // realm after REGISTER has started; fill that object here
+                    // instead of interrupting a successful sign-in with a dialog.
+                    val mobileNumber = authInfo.username.orEmpty()
+                    if (mobileNumber.length == 10 && mobileNumber.all(Char::isDigit)) {
+                        authInfo.password = mobileNumber
+                        core.addAuthInfo(authInfo)
+                        Log.i(
+                            "$TAG Reused mobile number as SIP password for Digest challenge " +
+                                "for account [${authInfo.username}@${authInfo.domain}]"
+                        )
+                        return
+                    }
+
                     val identity = "${authInfo.username}@${authInfo.domain}"
                     Log.i(
                         "$TAG Authentication requested method is HttpDigest, showing dialog asking user for password for identity [$identity]"
@@ -671,6 +714,7 @@ class CoreContext
             message: String
         ) {
             SipTraceRepository.onLogMessageWritten(message)
+            FileTransferApiLogger.onNativeLog(message)
             if (logcatEnabled) {
                 when (level) {
                     LogLevel.Error -> android.util.Log.e(domain, message)
@@ -717,7 +761,9 @@ class CoreContext
         if (BuildConfig.CRASHLYTICS_ENABLED) {
             Log.i("$TAG Crashlytics is enabled, registering logging service listener")
             try {
-                FirebaseCrashlytics.getInstance()
+                // The backend setting can otherwise leave reports queued on a device.
+                // This explicit opt-in is intentional for this production diagnostic build.
+                FirebaseCrashlytics.getInstance().setCrashlyticsCollectionEnabled(true)
             } catch (e: Exception) {
                 Log.e("$TAG Failed to instantiate Crashlytics: $e")
                 crashlyticsEnabled = false
@@ -745,6 +791,12 @@ class CoreContext
         coreThread = Handler(looper)
 
         core = Factory.instance().createCoreWithConfig(corePreferences.config, context)
+        enableSrtpByDefault()
+        // `disable_ringing` only controls the ringtone for incoming calls. The outgoing
+        // ringback tone has to be configured separately for the caller to hear it after
+        // the remote endpoint starts ringing (SIP 180 Ringing).
+        core.ringback = corePreferences.outgoingCallRingbackSound
+        Log.i("$TAG Outgoing call ringback configured [${core.ringback}]")
         // Keep outgoing chat messages in Linphone's history and retry them when a
         // broken channel becomes usable again, including queued file transfers.
         core.messageAutomaticResendingDelay = 5
@@ -804,14 +856,44 @@ class CoreContext
         SipTraceRepository.setLocalIdentity(core.defaultAccount?.params?.identityAddress?.username)
 
         computeUserAgent()
-        if (BuildConfig.DEBUG) {
-            val localFileTransferServer = context.getString(com.naminfo.R.string.local_file_transfer_server_url)
-            if (localFileTransferServer.isNotBlank()) {
-                core.fileTransferServer = localFileTransferServer
-            }
+        val localFileTransferServer = context.getString(com.naminfo.R.string.local_file_transfer_server_url)
+        if (localFileTransferServer.isNotBlank()) {
+            core.fileTransferServer = localFileTransferServer
+            Log.i("$TAG File transfer server configured as [$localFileTransferServer]")
         }
         Log.i("$TAG Core has been configured with user-agent [${core.userAgent}], starting it")
         core.start()
+    }
+
+    /** Set the media-encryption default before any account registers or call is created. */
+    @WorkerThread
+    private fun enableSrtpByDefault() {
+        if (core.config.getBool("app", "srtp_default_initialized", false)) {
+            Log.i("$TAG Keeping user's selected media encryption [${core.mediaEncryption}]")
+            return
+        }
+
+        if (!core.isMediaEncryptionSupported(MediaEncryption.SRTP)) {
+            Log.e("$TAG SRTP is not supported by this SDK build")
+            return
+        }
+
+        core.mediaEncryption = MediaEncryption.SRTP
+        core.config.setBool("app", "srtp_default_initialized", true)
+        Log.i("$TAG Default media encryption set to SDES-SRTP")
+    }
+
+    /** Use the FreeSWITCH-compatible SDES-SRTP suite only while SRTP is selected in Settings. */
+    @WorkerThread
+    private fun applySelectedSrtp(params: CallParams, direction: String) {
+        if (core.mediaEncryption != MediaEncryption.SRTP) {
+            Log.i("$TAG Keeping selected media encryption [${core.mediaEncryption}] for $direction call")
+            return
+        }
+
+        params.mediaEncryption = MediaEncryption.SRTP
+        params.srtpSuites = arrayOf(SrtpSuite.AESCM128HMACSHA180)
+        Log.i("$TAG Offering SDES-SRTP for $direction call")
     }
 
     @WorkerThread
@@ -1150,6 +1232,11 @@ class CoreContext
         localAddress: Address? = null,
         skipNetworkReachabilityTest: Boolean = false
     ) {
+        if (isLinphoneFallbackAddress(address)) {
+            Log.e("$TAG Refusing outgoing call to Linphone fallback identity [${address.asStringUriOnly()}]")
+            notifyFallbackIdentityBlocked()
+            return
+        }
         val isTranslationCallRequest = isTranslationCallUsername(address.username.orEmpty())
         if (isTranslationCallRequest && corePreferences.callLanguage.code.isNullOrBlank()) {
             Log.e("$TAG Can't start a T Call without a selected call language")
@@ -1201,6 +1288,31 @@ class CoreContext
             Log.i("$TAG No local address given, using default account [${defaultAccount?.params?.identityAddress?.asStringUriOnly()}]")
         }
 
+        // Never send an anonymous fallback INVITE. Without an active account
+        // liblinphone uses sip:linphone.android@<local-ip> as the From header,
+        // which FreeSWITCH cannot associate with the signed-in subscriber.
+        val outgoingAccount = params.account
+        if (outgoingAccount == null) {
+            Log.e("$TAG No SIP account is available; refusing to send an anonymous outgoing INVITE")
+            notifyFallbackIdentityBlocked()
+            return
+        }
+        if (isLinphoneFallbackAddress(outgoingAccount.params.identityAddress)) {
+            Log.e(
+                "$TAG Refusing outgoing call because configured account uses a Linphone fallback identity " +
+                    "[${outgoingAccount.params.identityAddress?.asStringUriOnly()}]"
+            )
+            notifyFallbackIdentityBlocked()
+            return
+        }
+        if (outgoingAccount.state != RegistrationState.Ok) {
+            Log.e(
+                "$TAG SIP account [${outgoingAccount.params.identityAddress?.asStringUriOnly()}] " +
+                    "is not registered (state=${outgoingAccount.state}); refusing outgoing INVITE"
+            )
+            return
+        }
+
         // Cached contacts, call logs and chat rooms may still contain the old Linphone domain.
         // Resolve it here so every audio/video call entry point uses the configured SIP server.
         val destination = if (address.domain.equals("sip.linphone.org", ignoreCase = true)) {
@@ -1217,16 +1329,10 @@ class CoreContext
         } else {
             address
         }
-        val activeServerDomain = params.account?.params?.domain
-            ?: corePreferences.thirdPartySipAccountDefaultDomain
-                .removePrefix("sips:").removePrefix("sip:").substringBefore(":")
-
-        // The local FreeSWITCH profile requires SDES-SRTP. Apply this to calls
-        // sent to that server only, without changing media encryption for other SIP accounts.
-        if (!forceZRTP && destination.domain.equals(activeServerDomain, ignoreCase = true)) {
-            params.mediaEncryption = MediaEncryption.SRTP
-            params.srtpSuites = arrayOf(SrtpSuite.AESCM128HMACSHA180)
-            Log.i("$TAG Offering SDES-SRTP for FreeSWITCH call on domain [$activeServerDomain]")
+        // SDES-SRTP is the app default. Keep an explicit ZRTP request intact, but otherwise
+        // offer the same SRTP suite for every outgoing SIP call.
+        if (!forceZRTP) {
+            applySelectedSrtp(params, "outgoing")
         }
         params.recordFile = LinphoneUtils.getRecordingFilePathForAddress(destination)
         Log.i(
@@ -1241,6 +1347,26 @@ class CoreContext
 
         core.inviteAddressWithParams(destination, params)
         Log.i("$TAG Starting call to [${destination.asStringUriOnly()}]")
+    }
+
+    @WorkerThread
+    private fun isLinphoneFallbackAddress(address: Address?): Boolean {
+        // The domain can be sip.linphone.org or a local IPv4/IPv6 address,
+        // depending on which fallback path liblinphone took. The username is
+        // the stable invalid marker in both cases.
+        return address?.username.equals("linphone.android", ignoreCase = true)
+    }
+
+    @AnyThread
+    private fun notifyFallbackIdentityBlocked() {
+        showRedToastEvent.postValue(
+            Event(
+                Pair(
+                    com.naminfo.R.string.call_blocked_invalid_fallback_identity,
+                    com.naminfo.R.drawable.warning_circle
+                )
+            )
+        )
     }
 
     /** A current RegistrationState.Ok is valid readiness even if refresh emits no new callback. */
@@ -1277,14 +1403,20 @@ class CoreContext
                         put("callId", callId)
                         put("readyToken", readyToken)
                     }.toString()
+                    val logId = ApiLogRepository.begin("POST", "https://androidpushnotification.vercel.app/api/call-ready", body)
                     OutputStreamWriter(conn.outputStream).use { it.write(body) }
                     val responseCode = conn.responseCode
+                    val response = (if (responseCode in 200..299) conn.inputStream else conn.errorStream)
+                        ?.bufferedReader()?.use { it.readText() }
+                    ApiLogRepository.complete(logId, responseCode, response)
                     acknowledged = responseCode in 200..299
                     Log.i(
                         "$TAG Call-ready HTTP response for [$callId], attempt=[${attempt + 1}], " +
                                 "status=[$responseCode], elapsedMs=[${android.os.SystemClock.elapsedRealtime() - startedAt}]"
                     )
                 } catch (e: Exception) {
+                    ApiLogRepository.begin("POST", "https://androidpushnotification.vercel.app/api/call-ready")
+                        .also { ApiLogRepository.fail(it, e) }
                     Log.w("$TAG Call-ready ACK attempt ${attempt + 1} failed: ${e.message}")
                 } finally {
                     conn?.disconnect()
@@ -1324,6 +1456,7 @@ class CoreContext
                     put("phoneNumber", phoneNumber)
                     put("fcmToken", fcmToken.trim())
                 }
+                val logId = ApiLogRepository.begin("POST", url.toString(), jsonBody.toString())
 
                 OutputStreamWriter(conn.outputStream).use { writer ->
                     writer.write(jsonBody.toString())
@@ -1331,8 +1464,13 @@ class CoreContext
                 }
 
                 val code = conn.responseCode
+                val response = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                    ?.bufferedReader()?.use { it.readText() }
+                ApiLogRepository.complete(logId, code, response)
                 Log.i("$TAG Token auto-save to Firestore backend for [$phoneNumber] status: $code")
             } catch (e: Exception) {
+                ApiLogRepository.begin("POST", "https://androidpushnotification.vercel.app/api/save-token")
+                    .also { ApiLogRepository.fail(it, e) }
                 Log.e("$TAG Error saving token to Firestore backend: $e")
             }
         }.start()
@@ -1401,17 +1539,32 @@ class CoreContext
             return
         }
 
+        // Mirror the caller's default on the B-party answer. This ensures the 200 OK offers
+        // SDES-SRTP too, rather than relying only on the incoming INVITE's parameters.
+        applySelectedSrtp(params, "incoming answer")
+
+        // `Call-ID` itself is generated and owned by the SIP stack.  Do not
+        // attempt to overwrite it: send the B-party's actual SIP Call-ID as a
+        // separate response header for FreeSWITCH to correlate the B leg.
+        val bPartyCallId = call.callLog.callId
+        if (!bPartyCallId.isNullOrBlank()) {
+            params.addCustomHeader("X-B-CALLID", bPartyCallId)
+            Log.i("$TAG Added B-party call ID header to 200 OK: X-B-CALLID=[$bPartyCallId]")
+        } else {
+            Log.w("$TAG B-party SIP Call-ID isn't available; X-B-CALLID won't be added to 200 OK")
+        }
+
         if (isTranslationCall(call)) {
             addTCallLanguageHeaders(params)
-            // Custom headers on CallParams are documented for INVITE requests.
-            // Set them on the incoming call itself as well so Linphone includes
-            // them in the 200 OK response generated when accepting this call.
-            call.setParams(params)
         }
+
+        // Apply response headers to the incoming call before acceptWithParams(),
+        // so Linphone includes them in the generated 200 OK.
+        call.setParams(params)
 
         params.recordFile = LinphoneUtils.getRecordingFilePathForAddress(call.remoteAddress)
 
-        /*if (LinphoneUtils.checkIfNetworkHasLowBandwidth(context)) {
+     /*   if (LinphoneUtils.checkIfNetworkHasLowBandwidth(context)) {
             Log.w("$TAG Enabling low bandwidth mode!")
             params.isLowBandwidthEnabled = true
         }*/
@@ -1462,6 +1615,45 @@ class CoreContext
 
         params.addCustomHeader("X-User-Language", language)
         Log.i("$TAG Added T Call language header: X-User-Language=[$language]")
+    }
+
+    /** Sends the active T-call's selected language to the controller. */
+    @AnyThread
+    fun syncActiveTranslationCallLanguage() {
+        postOnCoreThread { core ->
+            val call = core.currentCall ?: return@postOnCoreThread
+            if (!isTranslationCall(call) || !LinphoneUtils.isCallActive(call.state)) return@postOnCoreThread
+            val party = if (call.dir == Call.Dir.Outgoing) "caller" else "attender"
+            syncTranslationCallLanguage(call, party)
+        }
+    }
+
+    /**
+     * Sends the attender's language as soon as they confirm it and press Answer
+     * for an incoming TCall. The Connected-state callback below remains a
+     * safe retry in case the SIP Call-ID was not available yet.
+     */
+    @AnyThread
+    fun syncIncomingTranslationCallLanguageBeforeAnswer(call: Call) {
+        postOnCoreThread {
+            if (call.dir != Call.Dir.Incoming || !isTranslationCall(call)) return@postOnCoreThread
+            syncTranslationCallLanguage(call, "attender")
+        }
+    }
+
+    @WorkerThread
+    private fun syncTranslationCallLanguage(call: Call, party: String) {
+        if (!isTranslationCall(call)) return
+        val sipCallId = call.callLog.callId
+        if (sipCallId.isNullOrBlank()) {
+            Log.w("$TAG Skipping language sync: Linphone SIP Call-ID isn't available yet")
+            return
+        }
+        CallLanguageSyncApi.update(
+            callId = sipCallId,
+            party = party,
+            language = corePreferences.callLanguage.code
+        )
     }
 
     @WorkerThread

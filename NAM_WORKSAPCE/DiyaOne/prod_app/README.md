@@ -5,6 +5,27 @@ This document details all backend API calls made within the **DiyaOneMCX** appli
 ---
 
 ## Summary of APIs
+Current app-ல் HTTP API calls இவை:
+
+| # | Method | Full path | பயன்பாடு |
+|---|---|---|---|
+| 1 | POST | `https://mobionglobal.com/Diyaone/api/users` | Signup |
+| 2 | POST | `https://mobionglobal.com/Diyaone/api/auth/signin` | Existing/new user signin; access + refresh token பெறும் |
+| 3 | POST | `https://mobionglobal.com/Diyaone/api/auth/logout` | Logout |
+| 4 | GET | `https://mobionglobal.com/Diyaone/api/users?page=1&pageSize=50` | Profile URL mapping மட்டும் |
+| 5 | GET | `https://mobionglobal.com/Diyaone/api/users/{subscriberId}` | ஒரு contact profile URL fallback |
+| 6 | GET | `https://mobionglobal.com/fs_webservice/WebService.asmx/Get_MobionNumber` | முழு XML contact directory — 34 contacts |
+| 7 | GET | `https://mobionglobal.com/fs_webservice/WebService.asmx/GroupSetting_View?Number={registeredNumber}` | Conference/group details |
+| 8 | SIP REGISTER | `sip:{mobileNumber}@203.95.216.67` | SIP account registration; இது HTTP API இல்லை |
+
+API domain field-ல் user கொடுக்கும் host/IP இருந்தால் முதல் 5 paths:
+
+`https://{api-domain-or-ip}/Diyaone/api/...`
+
+ஆக மாறும்.
+
+Profile-picture upload endpoint (`/users/profile-picture`) app-ல் தற்போது call செய்யப்படவில்லை. Profile image load-க்கு #4 மட்டும் primary mapping; #5 fallback உள்ளது.
+
 
 1. [Get Mobion Contacts API](#1-get-mobion-contacts-api)
 2. [Get Conferences View API](#2-get-conferences-view-api)

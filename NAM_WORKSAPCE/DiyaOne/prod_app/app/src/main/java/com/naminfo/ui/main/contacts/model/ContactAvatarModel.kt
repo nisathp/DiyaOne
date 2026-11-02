@@ -113,7 +113,9 @@ class ContactAvatarModel
         isFavourite.postValue(friend.starred)
         initials.postValue(AppUtils.getInitials(friend.name.orEmpty()))
         showTrust.postValue(true)
-        picturePath.postValue(getAvatarUri(friend).toString())
+        // `null.toString()` becomes the literal "null", which Coil treats as a remote image
+        // request and can leave a stale avatar visible after a server-side DELETE.
+        picturePath.postValue(getAvatarUri(friend)?.toString().orEmpty())
 
         name.postValue(friend.name)
         computePresence(address)
@@ -184,6 +186,10 @@ class ContactAvatarModel
         }
 
         val refKey = friend.refKey
+        // Mobion entries use the authenticated `/users` profile-picture map as their sole
+        // image source. Once the server URL is removed, render initials rather than reviving a
+        // possibly unrelated Android-address-book photo.
+        if (refKey?.startsWith("mobion:") == true) return null
         if (refKey != null) {
             try {
                 return friend.getNativeContactPictureUri()

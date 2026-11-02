@@ -112,6 +112,7 @@
                             android:layout_marginTop="10dp"
                             layout="@layout/contact_avatar_big"
                             bind:model="@{viewModel.accountModel}"
+                            bind:deleteInProgress="@{viewModel.profilePictureDeleteInProgress}"
                             app:layout_constraintEnd_toEndOf="parent"
                             app:layout_constraintStart_toStartOf="parent"
                             app:layout_constraintTop_toTopOf="parent" />
@@ -527,6 +528,16 @@
                 </androidx.constraintlayout.widget.ConstraintLayout>
 
             </ScrollView>
+
+            <include
+                layout="@layout/operation_in_progress"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                bind:visibility="@{viewModel.signOutInProgress}"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent" />
 
         </androidx.constraintlayout.widget.ConstraintLayout>
 

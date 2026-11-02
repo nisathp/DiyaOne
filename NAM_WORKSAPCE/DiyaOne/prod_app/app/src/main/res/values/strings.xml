@@ -50,6 +50,8 @@
     <string name="device_id">Device ID</string>
     <string name="sip_address_display_name">Display name</string>
     <string name="sip_address_domain">Domain</string>
+    <string name="assistant_sip_account_api_domain">API domain</string>
+    <string name="assistant_sip_account_sip_domain">SIP domain</string>
     <string name="username">Username</string>
     <string name="authentication_id">Authentication ID (if different)</string>
     <string name="password">Password</string>
@@ -192,6 +194,9 @@
     <string name="assistant_account_register_unexpected_error">Unexpected error occurred, please try again later</string>
     <string name="assistant_account_login_forbidden_error">Invalid username</string>
     <string name="assistant_account_login_error">Failed to login: error code is %s</string>
+    <string name="assistant_account_retry">Retry</string>
+    <string name="assistant_account_login_sip_server_unreachable_error">SIP server did not respond. Check that the SIP server and UDP port 5060 are reachable.</string>
+    <string name="call_blocked_invalid_fallback_identity">Call blocked: invalid Linphone fallback identity detected. Sign in and wait for SIP registration.</string>
     <string name="assistant_permissions_title">Grant permissions</string>
     <string name="assistant_permissions_grant_all_of_them">OK</string>
     <string name="assistant_permissions_skip_permissions">Do it later</string>
@@ -226,6 +231,13 @@
     <string name="drawer_menu_add_account">Add an account</string>
     <string name="drawer_menu_invite">Invite</string>
     <string name="drawer_menu_logs">Logs</string>
+    <string name="drawer_menu_api_logs">API Logs</string>
+    <string name="api_logs_title">API Logs</string>
+    <string name="api_logs_search">Search API URL, request or response</string>
+    <string name="api_logs_empty">No API calls yet.</string>
+    <string name="api_logs_copied">API logs copied</string>
+    <string name="api_logs_clear_title">Clear API logs?</string>
+    <string name="api_logs_clear_message">This clears the API request and response history from this session.</string>
     <string name="sip_logs_title">SIP Logs</string>
     <string name="sip_logs_subtitle">Call signalling captured by this phone. Open Logs on the other phone to compare its side.</string>
     <string name="sip_logs_empty">No SIP call messages yet. Place or receive a call and check again.</string>
@@ -1149,6 +1161,8 @@
     <string name="history_filter_t_calls" translatable="false">T Calls</string>
     <string name="settings_calls_call_language_title" translatable="false">Call language</string>
     <string name="t_call_select_language_title" translatable="false">Select your language for T Call</string>
+    <string name="t_call_change_language_title" translatable="false">Change T Call language</string>
+    <string name="call_action_change_tcall_language" translatable="false">Language</string>
     <string name="t_call_option_audio" translatable="false">Audio Call</string>
     <string name="t_call_option_video" translatable="false">Video Call</string>
 

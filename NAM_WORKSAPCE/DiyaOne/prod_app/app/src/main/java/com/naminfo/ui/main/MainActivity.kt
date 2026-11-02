@@ -247,7 +247,7 @@ class MainActivity : GenericActivity() {
         viewModel.showNewAccountToastEvent.observe(this) {
             it.consume {
                 val message = getString(R.string.new_account_configured_toast)
-                showGreenToast(message, R.drawable.user_circle)
+               // showGreenToast(message, R.drawable.user_circle)
             }
         }
 

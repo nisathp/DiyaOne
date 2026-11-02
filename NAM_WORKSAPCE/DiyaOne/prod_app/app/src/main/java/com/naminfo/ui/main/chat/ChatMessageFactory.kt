@@ -72,8 +72,12 @@ internal fun createOutgoingTextMessage(
     }
     if (text.isNotEmpty() || replyTo != null) {
         val outgoingText = if (replyTo != null && replyTo.messageId.isNotBlank()) {
-            val previewText = replyTo.contents.firstOrNull { it.isText && !it.isFile }
+            val rawPreviewText = replyTo.contents.firstOrNull { it.isText && !it.isFile }
                 ?.utf8Text.orEmpty().trim()
+            // A reply has a compact fallback envelope at the beginning of its body. Never
+            // encode that envelope again when replying to a reply: doing so nests Base64 data
+            // on every turn and sends a growing block of unreadable text to the peer.
+            val previewText = decodeReplyPreviewEnvelope(rawPreviewText)?.second ?: rawPreviewText
             val sender = replyTo.fromAddress.asStringUriOnly()
                 .ifBlank {
                     replyTo.fromAddress.displayName

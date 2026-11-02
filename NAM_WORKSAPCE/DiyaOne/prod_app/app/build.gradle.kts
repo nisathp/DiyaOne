@@ -19,12 +19,15 @@ plugins {
 val packageName = "com.naminfo"
 val useDifferentPackageNameForDebugBuild = true
 
-val sdkPath = providers.gradleProperty("LinphoneSdkBuildDir").get()
+val sdkPath = providers.gradleProperty("LinphoneSdkBuildDir").orNull ?: ""
 val googleServices = File(projectDir.absolutePath + "/google-services.json")
 val linphoneLibs = File("$sdkPath/libs/")
 val linphoneDebugLibs = File("$sdkPath/libs-debug/")
 val firebaseCloudMessagingAvailable = googleServices.exists()
-val crashlyticsAvailable = googleServices.exists() && linphoneLibs.exists() && linphoneDebugLibs.exists()
+// Crash reporting only needs the Firebase configuration. Native symbol upload is
+// optional and requires a locally-built Linphone SDK, so keep it separate.
+val crashlyticsAvailable = googleServices.exists()
+val nativeCrashSymbolUploadAvailable = sdkPath.isNotEmpty() && linphoneLibs.exists() && linphoneDebugLibs.exists()
 
 if (firebaseCloudMessagingAvailable) {
     println("google-services.json found, enabling Firebase CloudMessaging feature")
@@ -33,38 +36,45 @@ if (firebaseCloudMessagingAvailable) {
     println("google-services.json not found, disabling Firebase CloudMessaging feature")
 }
 if (crashlyticsAvailable) {
-    println("google-services.json found and Linphone SDK libs-debug folder found, enabling Crashlytics feature")
+    println("google-services.json found, enabling Crashlytics feature")
     apply<CrashlyticsPlugin>()
 } else {
-    println("Crashlytics has been disabled because either google-services.json file wasn't found or local Linphone SDK build folder isn't configured")
+    println("Crashlytics has been disabled because google-services.json wasn't found")
 }
 
 var gitVersion = "2.0.4"
 var gitBranch = ""
 try {
-    val gitDescribe = ProcessBuilder()
+    val gitDescribeProcess = ProcessBuilder()
         .command("git", "describe", "--abbrev=0")
         .directory(project.rootDir)
         .start()
-        .inputStream.bufferedReader().use(BufferedReader::readText)
-        .trim()
+    val gitDescribe = gitDescribeProcess.inputStream.bufferedReader().use(BufferedReader::readText).trim()
     println("Git describe: $gitDescribe")
 
-    val gitCommitsCount = ProcessBuilder()
-        .command("git", "rev-list", "$gitDescribe..HEAD", "--count")
-        .directory(project.rootDir)
-        .start()
-        .inputStream.bufferedReader().use(BufferedReader::readText)
-        .trim()
-    println("Git commits count: $gitCommitsCount")
+    if (gitDescribe.isNotEmpty()) {
+        val gitCommitsCount = ProcessBuilder()
+            .command("git", "rev-list", "$gitDescribe..HEAD", "--count")
+            .directory(project.rootDir)
+            .start()
+            .inputStream.bufferedReader().use(BufferedReader::readText)
+            .trim().toIntOrNull() ?: 0
+        println("Git commits count: $gitCommitsCount")
 
-    val gitCommitHash = ProcessBuilder()
-        .command("git", "rev-parse", "--short", "HEAD")
-        .directory(project.rootDir)
-        .start()
-        .inputStream.bufferedReader().use(BufferedReader::readText)
-        .trim()
-    println("Git commit hash: $gitCommitHash")
+        val gitCommitHash = ProcessBuilder()
+            .command("git", "rev-parse", "--short", "HEAD")
+            .directory(project.rootDir)
+            .start()
+            .inputStream.bufferedReader().use(BufferedReader::readText)
+            .trim()
+        println("Git commit hash: $gitCommitHash")
+
+        gitVersion = if (gitCommitsCount == 0) {
+            gitDescribe
+        } else {
+            "$gitDescribe.$gitCommitsCount+$gitCommitHash"
+        }
+    }
 
     gitBranch = ProcessBuilder()
         .command("git", "name-rev", "--name-only", "HEAD")
@@ -73,15 +83,8 @@ try {
         .inputStream.bufferedReader().use(BufferedReader::readText)
         .trim()
     println("Git branch name: $gitBranch")
-
-    gitVersion =
-        if (gitCommitsCount.toInt() == 0) {
-            gitDescribe
-        } else {
-            "$gitDescribe.$gitCommitsCount+$gitCommitHash"
-        }
 } catch (e: Exception) {
-    println("Git not found [$e], using $gitVersion")
+    println("Git calculation warning [$e], using default $gitVersion")
 }
 println("Computed git version: $gitVersion")
 
@@ -109,7 +112,7 @@ android {
         minSdk = 28
         targetSdk = 36
         versionCode = 602006 // 6.02.006
-        versionName = "2.1.2"
+        versionName = "2.2.0"
 
         manifestPlaceholders["appAuthRedirectScheme"] = packageName
 
@@ -137,8 +140,8 @@ android {
     }
 
     signingConfigs {
-        create("release") {
-            if (keystorePropertiesFile.exists()) {
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
                 val keyStorePath = keystoreProperties["storeFile"] as? String
                 if (keyStorePath != null) {
                     val keyStore = project.file(keyStorePath)
@@ -152,9 +155,9 @@ android {
                         println("Keystore [$keyStorePath] doesn't exist!")
                     }
                 }
-            } else {
-                println("keystore.properties file doesn't exist!")
             }
+        } else {
+            println("keystore.properties file doesn't exist!")
         }
     }
 
@@ -183,7 +186,7 @@ android {
                 if (useDifferentPackageNameForDebugBuild) "$packageName.debug" else packageName
             )
 
-            if (crashlyticsAvailable) {
+            if (nativeCrashSymbolUploadAvailable) {
                 val path = File("$sdkPath/libs-debug/").toString()
                 configure<CrashlyticsExtension> {
                     nativeSymbolUploadEnabled = true
@@ -200,7 +203,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            signingConfig = signingConfigs.getByName("release")
+            val keystorePropertiesFile = rootProject.file("keystore.properties")
+            if (keystorePropertiesFile.exists()) {
+                signingConfig = signingConfigs.findByName("release")
+            }
 
             val appVersion = gitVersion
             val appBranch = gitBranch
@@ -210,7 +216,7 @@ android {
             resValue("string", "file_provider", "$packageName.fileprovider")
             resValue("string", "linphone_openid_callback_scheme", packageName)
 
-            if (crashlyticsAvailable) {
+            if (nativeCrashSymbolUploadAvailable) {
                 val path = File("$sdkPath/libs-debug/").toString()
                 configure<CrashlyticsExtension> {
                     nativeSymbolUploadEnabled = true
@@ -277,6 +283,7 @@ dependencies {
 
     // https://github.com/coil-kt/coil/blob/main/LICENSE.txt Apache v2.0
     implementation(libs.coil)
+    implementation(libs.coil.network.okhttp)
     implementation(libs.coil.gif)
     implementation(libs.coil.svg)
     implementation(libs.coil.video)
@@ -336,7 +343,7 @@ configure<org.jlleitschuh.gradle.ktlint.KtlintExtension> {
 }
 project.tasks.preBuild.dependsOn("ktlintFormat")
 
-if (crashlyticsAvailable) {
+if (nativeCrashSymbolUploadAvailable) {
     afterEvaluate {
         tasks.getByName("assembleDebug").finalizedBy(
             tasks.getByName("uploadCrashlyticsSymbolFileDebug"),

@@ -12,6 +12,9 @@
         <variable
             name="hidePresence"
             type="Boolean" />
+        <variable
+            name="deleteInProgress"
+            type="Boolean" />
     </data>
 
     <androidx.constraintlayout.widget.ConstraintLayout
@@ -28,6 +31,20 @@
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toTopOf="parent" />
+
+        <com.google.android.material.progressindicator.CircularProgressIndicator
+            android:id="@+id/avatar_loading"
+            android:layout_width="@dimen/avatar_big_size"
+            android:layout_height="@dimen/avatar_big_size"
+            android:visibility="@{deleteInProgress ? View.VISIBLE : View.GONE, default=gone}"
+            app:indicatorColor="?attr/color_main2_500"
+            app:indicatorSize="@dimen/avatar_big_size"
+            app:trackColor="@android:color/transparent"
+            app:trackThickness="2dp"
+            app:layout_constraintBottom_toBottomOf="@id/avatar"
+            app:layout_constraintEnd_toEndOf="@id/avatar"
+            app:layout_constraintStart_toStartOf="@id/avatar"
+            app:layout_constraintTop_toTopOf="@id/avatar" />
 
         <ImageView
             android:id="@+id/trust_overlay"

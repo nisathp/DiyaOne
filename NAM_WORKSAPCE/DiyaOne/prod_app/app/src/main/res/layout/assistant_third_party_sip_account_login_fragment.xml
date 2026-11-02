@@ -169,38 +169,70 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:visibility="@{viewModel.expandAdvancedSettings ? View.VISIBLE : View.GONE, default=gone}"
-                    app:constraint_referenced_ids="domain_label,domain,transport_label,transport,transport_caret" />
+                    app:constraint_referenced_ids="api_domain_label,api_domain,sip_domain_label,sip_domain,transport_label,transport,transport_caret" />
 
                 <androidx.appcompat.widget.AppCompatTextView
-                    android:id="@+id/domain_label"
+                    android:id="@+id/api_domain_label"
                     style="@style/header_style"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginStart="16dp"
                     android:layout_marginTop="16dp"
-                    android:labelFor="@id/domain"
-                    android:text="@{@string/sip_address_domain + `*`}"
-                    app:layout_constraintStart_toStartOf="@id/domain"
+                    android:labelFor="@id/api_domain"
+                    android:text="@{@string/assistant_sip_account_api_domain + `*`}"
+                    app:layout_constraintStart_toStartOf="@id/api_domain"
                     app:layout_constraintTop_toBottomOf="@id/advanced_settings" />
 
                 <androidx.appcompat.widget.AppCompatEditText
-                    android:id="@+id/domain"
+                    android:id="@+id/api_domain"
                     style="@style/default_text_style"
                     android:layout_width="0dp"
                     android:layout_height="50dp"
                     android:layout_marginStart="16dp"
                     android:layout_marginEnd="16dp"
                     android:background="@drawable/edit_text_background"
-                    android:hint="@string/sip_address_domain"
+                    android:hint="@string/assistant_sip_account_api_domain"
                     android:inputType="text|textUri"
                     android:paddingStart="20dp"
                     android:paddingEnd="20dp"
-                    android:text="@={viewModel.domain}"
+                    android:text="@={viewModel.apiDomain}"
                     android:textColor="?attr/color_main2_600"
                     android:textSize="14sp"
                     app:layout_constraintEnd_toEndOf="parent"
                     app:layout_constraintStart_toStartOf="parent"
-                    app:layout_constraintTop_toBottomOf="@id/domain_label"
+                    app:layout_constraintTop_toBottomOf="@id/api_domain_label"
+                    app:layout_constraintWidth_max="@dimen/text_input_max_width" />
+
+                <androidx.appcompat.widget.AppCompatTextView
+                    android:id="@+id/sip_domain_label"
+                    style="@style/header_style"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginTop="18dp"
+                    android:labelFor="@id/sip_domain"
+                    android:text="@{@string/assistant_sip_account_sip_domain + `*`}"
+                    app:layout_constraintStart_toStartOf="@id/sip_domain"
+                    app:layout_constraintTop_toBottomOf="@id/api_domain" />
+
+                <androidx.appcompat.widget.AppCompatEditText
+                    android:id="@+id/sip_domain"
+                    style="@style/default_text_style"
+                    android:layout_width="0dp"
+                    android:layout_height="50dp"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginEnd="16dp"
+                    android:background="@drawable/edit_text_background"
+                    android:hint="@string/assistant_sip_account_sip_domain"
+                    android:inputType="text|textUri"
+                    android:paddingStart="20dp"
+                    android:paddingEnd="20dp"
+                    android:text="@={viewModel.sipDomain}"
+                    android:textColor="?attr/color_main2_600"
+                    android:textSize="14sp"
+                    app:layout_constraintEnd_toEndOf="parent"
+                    app:layout_constraintStart_toStartOf="parent"
+                    app:layout_constraintTop_toBottomOf="@id/sip_domain_label"
                     app:layout_constraintWidth_max="@dimen/text_input_max_width" />
 
                 <androidx.appcompat.widget.AppCompatTextView
@@ -213,7 +245,7 @@
                     android:labelFor="@id/transport"
                     android:text="@string/assistant_sip_account_transport_protocol"
                     app:layout_constraintStart_toStartOf="@id/transport"
-                    app:layout_constraintTop_toBottomOf="@id/domain" />
+                    app:layout_constraintTop_toBottomOf="@id/sip_domain" />
 
                 <androidx.appcompat.widget.AppCompatSpinner
                     android:id="@+id/transport"
@@ -256,7 +288,7 @@
                     android:layout_marginBottom="@dimen/screen_bottom_margin"
                     android:enabled="@{viewModel.loginEnabled &amp;&amp; !viewModel.registrationInProgress, default=false}"
                     android:onClick="@{() -> viewModel.login()}"
-                    android:text="@string/assistant_account_register"
+                    android:text="@{viewModel.registrationFailed ? @string/assistant_account_retry : @string/assistant_account_register}"
                     app:layout_constraintEnd_toEndOf="parent"
                     app:layout_constraintStart_toStartOf="parent"
                     app:layout_constraintTop_toBottomOf="@id/transport"

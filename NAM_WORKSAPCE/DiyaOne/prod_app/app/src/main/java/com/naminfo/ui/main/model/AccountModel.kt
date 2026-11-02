@@ -27,7 +27,8 @@ class AccountModel
     @WorkerThread
     constructor(
     val account: Account,
-    private val onMenuClicked: ((model: AccountModel) -> Unit)? = null
+    private val onMenuClicked: ((model: AccountModel) -> Unit)? = null,
+    private val onLoginTimeClickedAction: ((model: AccountModel) -> Unit)? = null
 ) : AbstractAvatarModel() {
     companion object {
         private const val TAG = "[Account Model]"
@@ -42,6 +43,8 @@ class AccountModel
     val registrationStateLabel = MutableLiveData<String>()
 
     val registrationStateSummary = MutableLiveData<String>()
+
+    val loginTime = MutableLiveData<String>()
 
     val isDefault = MutableLiveData<Boolean>()
 
@@ -69,6 +72,11 @@ class AccountModel
                     com.naminfo.DiyaOneApplication.coreContext.saveTokenToFirestoreBackend(phone, prid)
                 }
                 com.naminfo.DiyaOneApplication.coreContext.fetchAndSyncFcmToken()
+
+                if (com.naminfo.DiyaOneApplication.corePreferences.loginTime.isNullOrEmpty()) {
+                    val now = java.text.SimpleDateFormat("dd MMM yyyy, hh:mm a", java.util.Locale.getDefault()).format(java.util.Date())
+                    com.naminfo.DiyaOneApplication.corePreferences.loginTime = now
+                }
             }
         }
 
@@ -165,6 +173,11 @@ class AccountModel
     @UiThread
     fun openMenu() {
         onMenuClicked?.invoke(this)
+    }
+
+    @UiThread
+    fun onLoginTimeClicked() {
+        onLoginTimeClickedAction?.invoke(this)
     }
 
     @UiThread
@@ -287,6 +300,13 @@ class AccountModel
         computeNotificationsCount()
 
         updateRegistrationState()
+
+        val savedLoginTime = com.naminfo.DiyaOneApplication.corePreferences.loginTime.orEmpty()
+        if (savedLoginTime.isNotEmpty()) {
+            loginTime.postValue("Login: $savedLoginTime")
+        } else {
+            loginTime.postValue("")
+        }
     }
 }
 

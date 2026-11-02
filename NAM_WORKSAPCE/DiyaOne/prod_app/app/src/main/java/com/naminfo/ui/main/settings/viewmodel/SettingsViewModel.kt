@@ -570,6 +570,8 @@ class SettingsViewModel
     fun updateCallLanguage(language: CallLanguage) {
         corePreferences.callLanguage = language
         selectedCallLanguage.value = language
+        // If a T Call is already connected, propagate the new language now.
+        coreContext.syncActiveTranslationCallLanguage()
     }
 
     @UiThread
@@ -923,6 +925,9 @@ class SettingsViewModel
         coreContext.postOnCoreThread { core ->
             val mediaEncryption = mediaEncryptionValues[index]
             core.mediaEncryption = mediaEncryption
+            // A deliberate Settings choice (including None) must survive the app restart
+            // instead of being replaced by the first-run SRTP default.
+            core.config.setBool("app", "srtp_default_initialized", true)
 
             if (mediaEncryption == MediaEncryption.None) {
                 core.isMediaEncryptionMandatory = false

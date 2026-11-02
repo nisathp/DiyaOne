@@ -77,6 +77,12 @@ class DrawerMenuFragment : GenericMainFragment() {
             (requireActivity() as MainActivity).closeDrawerMenu()
         }
 
+        binding.setApiLogsClickedListener {
+            val navController = (requireActivity() as MainActivity).findNavController()
+            navController.navigate(R.id.action_global_apiLogsFragment)
+            (requireActivity() as MainActivity).closeDrawerMenu()
+        }
+
         binding.setVersionClickedListener {
             (requireActivity() as MainActivity).closeDrawerMenu()
             AlertDialog.Builder(requireContext())

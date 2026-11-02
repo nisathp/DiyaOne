@@ -26,6 +26,7 @@ import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.contacts.getListOfSipAddressesAndPhoneNumbers
+import com.naminfo.ui.main.contacts.model.ContactAvatarModel
 import org.linphone.core.Address
 import org.linphone.core.ChatRoom
 import org.linphone.core.ChatRoomListenerStub
@@ -49,6 +50,31 @@ class ConversationForwardMessageViewModel
     val operationInProgress = MutableLiveData<Boolean>()
 
     override val showAddressSuggestions = false
+
+    // A forward destination must not be restricted to the recent MagicSearch
+    // results.  Let the picker enumerate every local/app contact so a message
+    // can be forwarded to a contact even when no previous conversation exists.
+    override val limitContactSearch = false
+
+    // Mobion contacts are synchronized as local Friends; don't apply a remote
+    // directory domain filter while enumerating them.
+    override val contactSearchDomain = ""
+
+    // Keep the forward destination list aligned with the Contacts tab and the
+    // new-chat picker.  The generic search service does not necessarily know
+    // about every Mobion contact until this app-owned list has synchronized it.
+    private var matchedFriends = emptySet<Friend>()
+
+    @UiThread
+    fun setMatchedContacts(contacts: List<ContactAvatarModel>) {
+        coreContext.postOnCoreThread {
+            matchedFriends = contacts.map { it.friend }.toSet()
+            refreshContactSearch()
+        }
+    }
+
+    @WorkerThread
+    override fun shouldIncludeFriend(friend: Friend): Boolean = friend in matchedFriends
 
     val chatRoomCreatedEvent: MutableLiveData<Event<String>> by lazy {
         MutableLiveData()

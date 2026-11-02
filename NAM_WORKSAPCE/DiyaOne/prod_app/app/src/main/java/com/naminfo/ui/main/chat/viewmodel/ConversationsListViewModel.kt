@@ -192,7 +192,17 @@ class ConversationsListViewModel
         } else {
             account?.filterChatRooms(filter)
         }
-        for (chatRoom in chatRooms.orEmpty()) {
+        // FreeSWITCH can expose the same one-to-one SIP peer through more than one
+        // underlying chat room (for example after an offline delivery is replayed).
+        // Keep the newest room in the UI, otherwise the user sees duplicate rows for
+        // the same person and the same last message.
+        val displayedOneToOnePeers = mutableSetOf<String>()
+        for (chatRoom in chatRooms.orEmpty().sortedByDescending { it.lastUpdateTime }) {
+            val peerKey = getOneToOnePeerKey(chatRoom)
+            if (peerKey != null && !displayedOneToOnePeers.add(peerKey)) {
+                Log.w("$TAG Skipping duplicate one-to-one conversation for peer [$peerKey]")
+                continue
+            }
             val model = ConversationModel(chatRoom)
             list.add(ConversationModelWrapper(model))
         }
@@ -229,11 +239,16 @@ class ConversationsListViewModel
         }
 
         val currentList = conversations.value.orEmpty()
+        val peerKey = getOneToOnePeerKey(chatRoom)
         val found = currentList.find {
             it.conversationModel?.chatRoom?.identifier == identifier
+        } ?: peerKey?.let { key ->
+            currentList.find { wrapper ->
+                wrapper.conversationModel?.chatRoom?.let(::getOneToOnePeerKey) == key
+            }
         }
         if (found != null) {
-            Log.w("$TAG Created chat room with identifier [$identifier] is already in the list, skipping")
+            Log.w("$TAG Created chat room with identifier [$identifier] is already represented in the list, skipping")
             return
         }
 
@@ -290,6 +305,23 @@ class ConversationsListViewModel
             it.conversationModel?.chatRoom?.lastUpdateTime
         }
         conversations.postValue(sortedList)
+    }
+
+    /**
+     * Stable UI identity for a one-to-one SIP peer. FreeSWITCH may use an alias domain
+     * or create a replacement room after a message is queued while the peer is offline.
+     * The usernames are the registered phone identities, so they remain stable across
+     * those room variants. Group rooms must remain separate and therefore return null.
+     */
+    @WorkerThread
+    private fun getOneToOnePeerKey(chatRoom: ChatRoom): String? {
+        if (!chatRoom.hasCapability(ChatRoom.Capabilities.OneToOne.toInt())) return null
+
+        val localUsername = chatRoom.localAddress.username
+            ?: chatRoom.account?.params?.identityAddress?.username
+            ?: return null
+        val peerUsername = chatRoom.peerAddress.username ?: return null
+        return "${localUsername.lowercase()}::${peerUsername.lowercase()}"
     }
 
     @WorkerThread

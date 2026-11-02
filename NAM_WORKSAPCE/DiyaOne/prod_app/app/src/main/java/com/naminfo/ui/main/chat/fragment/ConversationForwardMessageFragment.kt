@@ -19,21 +19,25 @@
  */
 package com.naminfo.ui.main.chat.fragment
 
+import android.Manifest
 import android.app.Dialog
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.UiThread
 import androidx.core.view.doOnPreDraw
 import androidx.lifecycle.ViewModelProvider
 import androidx.navigation.fragment.findNavController
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.naminfo.R
+import com.naminfo.contacts.PhoneContactNumbers
 import org.linphone.core.tools.Log
 import com.naminfo.databinding.ChatMessageForwardFragmentBinding
 import com.naminfo.ui.main.adapter.ConversationsContactsAndSuggestionsListAdapter
 import com.naminfo.ui.main.chat.viewmodel.ConversationForwardMessageViewModel
+import com.naminfo.ui.main.contacts.viewmodel.MatchedContactsViewModel
 import com.naminfo.ui.main.contacts.model.ContactNumberOrAddressModel
 import com.naminfo.ui.main.contacts.model.NumberOrAddressPickerDialogModel
 import com.naminfo.ui.main.fragment.SlidingPaneChildFragment
@@ -44,11 +48,14 @@ import com.naminfo.utils.RecyclerViewHeaderDecoration
 class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
     companion object {
         private const val TAG = "[Conversation Forward Message Fragment]"
+        private const val PERMISSION_REQUESTED = "forward_contacts_permission_requested"
     }
 
     private lateinit var binding: ChatMessageForwardFragmentBinding
 
     private lateinit var viewModel: ConversationForwardMessageViewModel
+
+    private lateinit var matchedViewModel: MatchedContactsViewModel
 
     private lateinit var adapter: ConversationsContactsAndSuggestionsListAdapter
 
@@ -56,10 +63,23 @@ class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
 
     private var disableConsumingEventOnPause = false
 
+    private var contactsPermissionRequested = false
+    private var permissionRequestInProgress = false
+
+    private val contactsPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        permissionRequestInProgress = false
+        if (::matchedViewModel.isInitialized) matchedViewModel.reload()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         adapter = ConversationsContactsAndSuggestionsListAdapter()
+        contactsPermissionRequested = savedInstanceState
+            ?.getBoolean(PERMISSION_REQUESTED)
+            ?: false
     }
 
     override fun goBack(): Boolean {
@@ -87,6 +107,7 @@ class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
         binding.lifecycleOwner = viewLifecycleOwner
 
         viewModel = ViewModelProvider(this)[ConversationForwardMessageViewModel::class.java]
+        matchedViewModel = ViewModelProvider(requireActivity())[MatchedContactsViewModel::class.java]
         binding.viewModel = viewModel
         observeToastEvents(viewModel)
 
@@ -117,6 +138,10 @@ class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
             (view.parent as? ViewGroup)?.doOnPreDraw {
                 startPostponedEnterTransition()
             }
+        }
+
+        matchedViewModel.contacts.observe(viewLifecycleOwner) { contacts ->
+            viewModel.setMatchedContacts(contacts)
         }
 
         viewModel.chatRoomCreatedEvent.observe(viewLifecycleOwner) {
@@ -172,6 +197,27 @@ class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (!::matchedViewModel.isInitialized || permissionRequestInProgress) return
+
+        if (PhoneContactNumbers.hasPermission(requireContext())) {
+            matchedViewModel.reload()
+        } else if (!contactsPermissionRequested) {
+            contactsPermissionRequested = true
+            permissionRequestInProgress = true
+            matchedViewModel.reload()
+            contactsPermissionLauncher.launch(Manifest.permission.READ_CONTACTS)
+        } else {
+            matchedViewModel.reload()
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(PERMISSION_REQUESTED, contactsPermissionRequested)
+        super.onSaveInstanceState(outState)
+    }
+
     private fun showNumberOrAddressPickerDialog(list: List<ContactNumberOrAddressModel>) {
         val numberOrAddressModel = NumberOrAddressPickerDialogModel(list)
         val dialog =
@@ -189,4 +235,5 @@ class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
 
         dialog.show()
     }
+
 }

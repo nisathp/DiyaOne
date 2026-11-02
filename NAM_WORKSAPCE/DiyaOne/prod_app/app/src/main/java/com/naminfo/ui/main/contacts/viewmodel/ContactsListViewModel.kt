@@ -3,6 +3,7 @@ package com.naminfo.ui.main.contacts.viewmodel
 import androidx.annotation.UiThread
 import androidx.annotation.WorkerThread
 import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.Observer
 import androidx.lifecycle.viewModelScope
 import java.io.File
 import java.text.Collator
@@ -16,6 +17,7 @@ import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.contacts.ContactsManager.ContactsListener
 import com.naminfo.contacts.MobionContactsService
+import com.naminfo.contacts.PhoneContactNumbers
 import org.linphone.core.Friend
 import org.linphone.core.FriendList
 import org.linphone.core.FriendListListenerStub
@@ -36,6 +38,11 @@ class ContactsListViewModel
         private const val TAG = "[Contacts List ViewModel]"
         private const val MOBION_FRIEND_LIST = "Mobion contacts"
         private const val CONFERENCE_FRIEND_LIST = "Conference"
+
+        @JvmStatic
+        fun resetMobionSessionCache() {
+            MobionContactsService.clearContactsCache()
+        }
     }
 
     val contactsList = MutableLiveData<ArrayList<ContactAvatarModel>>()
@@ -80,6 +87,10 @@ class ContactsListViewModel
     private var firstLoad = true
 
     private val contactModels = hashMapOf<Friend, ContactAvatarModel>()
+
+    private val mobionContactsRefreshObserver = Observer<Long> {
+        refreshMobionContacts(forceRefresh = true)
+    }
 
     private val magicSearchListener = object : MagicSearchListenerStub() {
         @WorkerThread
@@ -165,12 +176,14 @@ class ContactsListViewModel
             applyFilter(currentFilter, domainFilter)
         }
 
-        // refreshMobionContacts()
+        refreshMobionContacts()
+        MobionContactsService.contactsRefreshRequested.observeForever(mobionContactsRefreshObserver)
         // refreshConferenceContacts()
     }
 
     @UiThread
     override fun onCleared() {
+        MobionContactsService.contactsRefreshRequested.removeObserver(mobionContactsRefreshObserver)
         coreContext.postOnCoreThread {
             magicSearch.removeListener(magicSearchListener)
             favouritesMagicSearch.removeListener(favouritesMagicSearchListener)
@@ -191,7 +204,7 @@ class ContactsListViewModel
 
     @UiThread
     fun applyCurrentDefaultAccountFilter() {
-        // refreshMobionContacts()
+        refreshMobionContacts()
         // refreshConferenceContacts()
         coreContext.postOnCoreThread {
             ensurePermanentConferenceContacts()
@@ -299,15 +312,21 @@ class ContactsListViewModel
         }
     }
 
-    private fun refreshMobionContacts() {
+    private fun refreshMobionContacts(forceRefresh: Boolean = false) {
         viewModelScope.launch {
             try {
-                val contacts = withContext(Dispatchers.IO) {
-                    MobionContactsService.fetchContacts()
+                val (contacts, nativePhoneNumbers) = withContext(Dispatchers.IO) {
+                    val phoneNumbers = if (PhoneContactNumbers.hasPermission(coreContext.context)) {
+                        PhoneContactNumbers.read(coreContext.context)
+                    } else {
+                        emptySet()
+                    }
+                    MobionContactsService.fetchContacts(forceRefresh) to phoneNumbers
                 }
-                Log.i("$TAG Fetched [${contacts.size}] contacts from Mobion")
+                val matchedContacts = contacts.filter { it.mobileNumber in nativePhoneNumbers }
+                Log.i("$TAG Fetched [${contacts.size}] contacts from Mobion, phonebook matches=[${matchedContacts.size}]")
 
-                if (contacts.isEmpty()) {
+                if (matchedContacts.isEmpty()) {
                     Log.w(
                         "$TAG Mobion returned an empty dataset; keeping the existing cached contacts"
                     )
@@ -333,7 +352,7 @@ class ContactsListViewModel
                                 "domain=[$sipDomain]"
                     )
 
-                    val friends = contacts.mapNotNull { contact ->
+                    val friends = matchedContacts.mapNotNull { contact ->
                         val address = core.interpretUrl(
                             "sip:${contact.mobileNumber}@$sipDomain",
                             false
@@ -343,9 +362,9 @@ class ContactsListViewModel
                             name = contact.name
                             refKey = "mobion:${contact.mobileNumber}"
                             isSubscribesEnabled = true
-                            if (!contact.profilePictureUrl.isNullOrEmpty()) {
-                                photo = contact.profilePictureUrl
-                            }
+                            // A null URL is meaningful after a remote delete; clear any old
+                            // local Friend photo instead of keeping a stale image.
+                            photo = contact.profilePictureUrl
                             addAddress(address)
                             addPhoneNumberWithLabel(
                                 Factory.instance().createFriendPhoneNumber(
@@ -387,6 +406,7 @@ class ContactsListViewModel
                     // this ViewModel also invalidates its own search and publishes the new list.
                     refreshSearchResults()
                 }
+
             } catch (exception: Exception) {
                 Log.e("$TAG Failed to fetch Mobion contacts: $exception")
             }
@@ -541,11 +561,9 @@ class ContactsListViewModel
         val conferences = arrayListOf<ContactAvatarModel>()
         val collator = Collator.getInstance(Locale.getDefault())
         val hideEmptyContacts = corePreferences.hideContactsWithoutPhoneNumberOrSipAddress
-        val nativePhoneNumbers = getNativePhoneNumbers()
-
         for (result in results) {
             val friend = result.friend ?: continue
-            if (!friend.refKey.orEmpty().startsWith("conference:permanent:")) {
+            if (friend.refKey.orEmpty().startsWith("conference:permanent:")) {
                 continue
             }
             if (friend != null) {
@@ -555,13 +573,6 @@ class ContactsListViewModel
                 if (!isMobionContact && !isConferenceContact) {
                     continue
                 }
-                if (isMobionContact && friend.phoneNumbers.none {
-                        normalizePhoneNumber(it) in nativePhoneNumbers
-                    }
-                ) {
-                    continue
-                }
-
                 if (hideEmptyContacts && friend.addresses.isEmpty() && friend.phoneNumbers.isEmpty()) {
                     Log.i("$TAG Friend [${friend.name}] has no SIP address nor phone number, do not show it")
                     continue
@@ -624,35 +635,6 @@ class ContactsListViewModel
         }
 
         Log.i("$TAG Processed [${results.size}] results into [${list.size} contacts]")
-    }
-
-    @WorkerThread
-    private fun getNativePhoneNumbers(): Set<String> {
-        if (coreContext.context.checkSelfPermission(android.Manifest.permission.READ_CONTACTS) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            return emptySet()
-        }
-
-        val nativeFriendList = coreContext.core.getFriendListByName(
-            com.naminfo.contacts.ContactLoader.NATIVE_ADDRESS_BOOK_FRIEND_LIST
-        ) ?: return emptySet()
-
-        return nativeFriendList.friends
-            .flatMap { it.phoneNumbers.asIterable() }
-            .map(::normalizePhoneNumber)
-            .filter(String::isNotEmpty)
-            .toSet()
-    }
-
-    private fun normalizePhoneNumber(number: String): String {
-        val digits = number.filter(Char::isDigit)
-        return when {
-            digits.length == 14 && digits.startsWith("0091") -> digits.drop(4)
-            digits.length == 12 && digits.startsWith("91") -> digits.drop(2)
-            digits.length == 11 && digits.startsWith("0") -> digits.drop(1)
-            else -> digits
-        }
     }
 
     @WorkerThread

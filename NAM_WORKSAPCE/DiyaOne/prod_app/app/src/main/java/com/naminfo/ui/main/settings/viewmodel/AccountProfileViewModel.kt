@@ -1,5 +1,6 @@
 package com.naminfo.ui.main.settings.viewmodel
 
+import android.net.Uri
 import androidx.annotation.UiThread
 import androidx.annotation.WorkerThread
 import androidx.lifecycle.MediatorLiveData
@@ -7,7 +8,10 @@ import androidx.lifecycle.MutableLiveData
 import java.util.Locale
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
+import com.naminfo.contacts.MobionContactsService
+import com.naminfo.core.ApiLogRepository
 import com.naminfo.R
+import com.naminfo.ui.main.contacts.viewmodel.ContactsListViewModel
 import org.linphone.core.Account
 import org.linphone.core.AccountDevice
 import org.linphone.core.AccountManagerServices
@@ -24,6 +28,8 @@ import com.naminfo.utils.Event
 import java.net.HttpURLConnection
 import java.net.URL
 import java.io.OutputStreamWriter
+import java.io.File
+import java.net.URLConnection
 import org.json.JSONObject
 
 import androidx.annotation.*
@@ -90,6 +96,9 @@ class AccountProfileViewModel
 
     val signOutInProgress = MutableLiveData(false)
     val signOutError = MutableLiveData("")
+
+    /** Keeps the existing avatar visible while the remote DELETE request is in flight. */
+    val profilePictureDeleteInProgress = MutableLiveData(false)
 
     private val accountManagerServicesListener = object : AccountManagerServicesRequestListenerStub() {
         @WorkerThread
@@ -269,6 +278,7 @@ class AccountProfileViewModel
         viewModelScope.launch {
             try {
                 performLogout()
+                ContactsListViewModel.resetMobionSessionCache()
 
                 withTimeout(30_000L) {
                     unregisterAndRemoveAccount()
@@ -296,10 +306,22 @@ class AccountProfileViewModel
         val refreshToken = corePreferences.refreshToken
         val token = corePreferences.authToken
 
-        if (apiBase.isNullOrEmpty()) return@withContext
+        if (apiBase.isNullOrEmpty()) {
+            // A legacy or partially completed sign-in may have tokens without
+            // an API endpoint. A local logout must still discard them.
+            corePreferences.authToken = null
+            corePreferences.refreshToken = null
+            corePreferences.accessTokenExpiresAt = null
+            corePreferences.refreshTokenExpiresAt = null
+            corePreferences.apiDomain = null
+            corePreferences.loginTime = null
+            corePreferences.loginTime = null
+            return@withContext
+        }
 
+        var logoutLogId: Long? = null
         try {
-            val logoutUrl = URL("$apiBase/api/auth/logout")
+            val logoutUrl = URL("${getApiBaseUrl(apiBase)}/auth/logout")
             val conn = logoutUrl.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
@@ -316,17 +338,35 @@ class AccountProfileViewModel
                 }
             }
 
+            logoutLogId = ApiLogRepository.begin("POST", logoutUrl.toString(), body.toString())
             OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
             val code = conn.responseCode
+            val response = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() }
+            ApiLogRepository.complete(requireNotNull(logoutLogId), code, response)
             Log.i("$TAG Logout API response code: $code")
             conn.disconnect()
-
-            // Clear stored tokens
+        } catch (e: Exception) {
+            ApiLogRepository.fail(logoutLogId ?: ApiLogRepository.begin("POST", "${getApiBaseUrl(apiBase)}/auth/logout"), e)
+            Log.w("$TAG Logout API exception: $e")
+        } finally {
+            // Logout is a local sign-out as well: do not retain credentials when
+            // the server is temporarily unreachable or closes the connection.
             corePreferences.authToken = null
             corePreferences.refreshToken = null
+            corePreferences.accessTokenExpiresAt = null
+            corePreferences.refreshTokenExpiresAt = null
             corePreferences.apiDomain = null
-        } catch (e: Exception) {
-            Log.w("$TAG Logout API exception: $e")
+            corePreferences.loginTime = null
+        }
+    }
+
+    private fun getApiBaseUrl(rawApiBase: String): String {
+        val apiBase = rawApiBase.trim().trimEnd('/')
+        return when {
+            apiBase.endsWith("/Diyaone/api", ignoreCase = true) -> apiBase
+            apiBase.endsWith("/Diyaone", ignoreCase = true) -> "$apiBase/api"
+            else -> "$apiBase/Diyaone/api"
         }
     }
 
@@ -536,6 +576,200 @@ class AccountProfileViewModel
                 account.params = copy
                 account.refreshRegister()
             }
+        }
+    }
+
+    /** Uploads the selected Settings profile image to the DiyaOne API. */
+    @UiThread
+    fun uploadProfilePicture(path: String) {
+        if (path.isBlank()) return
+
+        coreContext.postOnCoreThread { core ->
+            val subscriberId = (
+                if (::account.isInitialized) {
+                account.params.identityAddress?.username
+            } else {
+                null
+            }
+            )
+                ?: core.defaultAccount?.params?.identityAddress?.username
+            val apiBase = corePreferences.apiDomain
+            val accessToken = corePreferences.authToken
+
+            if (subscriberId.isNullOrBlank() || apiBase.isNullOrBlank() || accessToken.isNullOrBlank()) {
+                Log.w("$TAG Profile picture upload skipped: missing signed-in API session")
+                showFormattedRedToast(
+                    "Sign in again, then upload your profile picture.",
+                    R.drawable.warning_circle
+                )
+                return@postOnCoreThread
+            }
+
+            viewModelScope.launch {
+                val uploaded = withContext(Dispatchers.IO) {
+                    putProfilePicture(getApiBaseUrl(apiBase), accessToken, subscriberId, path)
+                }
+                if (uploaded) {
+                    Log.i("$TAG Profile picture uploaded for subscriber [$subscriberId]")
+                    // Reload active contact lists now, so the uploaded image does not wait for
+                    // a manual swipe-to-refresh.
+                    MobionContactsService.markProfilePictureUploaded(subscriberId)
+                    showFormattedGreenToast("Profile picture updated.", R.drawable.user_circle_check)
+                } else {
+                    showFormattedRedToast(
+                        "Couldn't upload profile picture. Please try again.",
+                        R.drawable.warning_circle
+                    )
+                }
+            }
+        }
+    }
+
+    /** Deletes the signed-in user's remote profile picture before clearing the local avatar. */
+    @UiThread
+    fun deleteProfilePicture() {
+        if (profilePictureDeleteInProgress.value == true) return
+
+        // Do not clear picturePath here: the current photo stays behind the spinner until
+        // the server confirms the deletion. The initials avatar is shown only after success.
+        profilePictureDeleteInProgress.value = true
+        coreContext.postOnCoreThread { core ->
+            val subscriberId = if (::account.isInitialized) {
+                account.params.identityAddress?.username
+            } else {
+                null
+            } ?: core.defaultAccount?.params?.identityAddress?.username
+            val apiBase = corePreferences.apiDomain
+            val accessToken = corePreferences.authToken
+
+            if (subscriberId.isNullOrBlank() || apiBase.isNullOrBlank() || accessToken.isNullOrBlank()) {
+                Log.w("$TAG Profile picture deletion skipped: missing signed-in API session")
+                profilePictureDeleteInProgress.postValue(false)
+                showFormattedRedToast(
+                    "Sign in again, then remove your profile picture.",
+                    R.drawable.warning_circle
+                )
+                return@postOnCoreThread
+            }
+
+            viewModelScope.launch {
+                try {
+                    val deleted = withContext(Dispatchers.IO) {
+                        deleteRemoteProfilePicture(getApiBaseUrl(apiBase), accessToken)
+                    }
+                    if (deleted) {
+                        Log.i("$TAG Profile picture deleted for subscriber [$subscriberId]")
+                        MobionContactsService.clearCachedProfilePicture(subscriberId)
+                        MobionContactsService.refreshContactsAfterProfilePictureChange()
+                        coreContext.postOnMainThread {
+                            setNewPicturePath("")
+                        }
+                        showFormattedGreenToast("Profile picture removed.", R.drawable.user_circle_check)
+                    } else {
+                        showFormattedRedToast(
+                            "Couldn't remove profile picture. Please try again.",
+                            R.drawable.warning_circle
+                        )
+                    }
+                } finally {
+                    profilePictureDeleteInProgress.value = false
+                }
+            }
+        }
+    }
+
+    private fun putProfilePicture(
+        apiBase: String,
+        accessToken: String,
+        subscriberId: String,
+        localPath: String
+    ): Boolean {
+        val filePath = Uri.parse(localPath).path ?: localPath.removePrefix("file:")
+        val image = File(filePath)
+        if (!image.isFile || image.length() == 0L) {
+            Log.e("$TAG Profile picture upload failed: local image is unavailable")
+            return false
+        }
+
+        val boundary = "DiyaOne-${System.currentTimeMillis()}"
+        val connection = URL("${apiBase.trimEnd('/')}/users/profile-picture")
+            .openConnection() as HttpURLConnection
+        connection.requestMethod = "PUT"
+        connection.connectTimeout = 15_000
+        connection.readTimeout = 30_000
+        connection.doOutput = true
+        connection.setRequestProperty("Authorization", "Bearer $accessToken")
+        connection.setRequestProperty("Accept", "application/json")
+        connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+        val logId = ApiLogRepository.begin(
+            "PUT",
+            "${apiBase.trimEnd('/')}/users/profile-picture",
+            "multipart: SubscriberId=$subscriberId, FILE=${image.name}"
+        )
+
+        return try {
+            connection.outputStream.buffered().use { output ->
+                fun writeText(value: String) = output.write(value.toByteArray(Charsets.UTF_8))
+                writeText("--$boundary\r\n")
+                writeText("Content-Disposition: form-data; name=\"SubscriberId\"\r\n\r\n")
+                writeText("$subscriberId\r\n")
+                writeText("--$boundary\r\n")
+                writeText(
+                    "Content-Disposition: form-data; name=\"FILE\"; filename=\"${image.name}\"\r\n"
+                )
+                val mimeType = URLConnection.guessContentTypeFromName(image.name) ?: "image/jpeg"
+                writeText("Content-Type: $mimeType\r\n\r\n")
+                image.inputStream().use { input -> input.copyTo(output) }
+                writeText("\r\n--$boundary--\r\n")
+            }
+
+            val responseCode = connection.responseCode
+            val response = (if (responseCode in 200..299) connection.inputStream else connection.errorStream)
+                ?.bufferedReader()?.use { it.readText() }
+            ApiLogRepository.complete(logId, responseCode, response)
+            if (responseCode !in 200..299) {
+                val message = response.orEmpty()
+                Log.e("$TAG Profile picture upload failed with HTTP $responseCode: $message")
+                false
+            } else {
+                true
+            }
+        } catch (error: Exception) {
+            ApiLogRepository.fail(logId, error)
+            Log.e("$TAG Profile picture upload failed: ${error.javaClass.simpleName}")
+            false
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun deleteRemoteProfilePicture(apiBase: String, accessToken: String): Boolean {
+        val endpoint = "${apiBase.trimEnd('/')}/users/profile-picture"
+        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        connection.requestMethod = "DELETE"
+        connection.connectTimeout = 15_000
+        connection.readTimeout = 30_000
+        connection.setRequestProperty("Authorization", "Bearer $accessToken")
+        connection.setRequestProperty("Accept", "application/json")
+        val logId = ApiLogRepository.begin("DELETE", endpoint)
+
+        return try {
+            val responseCode = connection.responseCode
+            val response = (if (responseCode in 200..299) connection.inputStream else connection.errorStream)
+                ?.bufferedReader()?.use { it.readText() }
+            ApiLogRepository.complete(logId, responseCode, response)
+            if (responseCode !in 200..299) {
+                Log.e("$TAG Profile picture deletion failed with HTTP $responseCode: ${response.orEmpty()}")
+                false
+            } else {
+                true
+            }
+        } catch (error: Exception) {
+            ApiLogRepository.fail(logId, error)
+            Log.e("$TAG Profile picture deletion failed: ${error.javaClass.simpleName}")
+            false
+        } finally {
+            connection.disconnect()
         }
     }
 

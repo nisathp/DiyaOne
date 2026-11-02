@@ -48,6 +48,7 @@ class AccountProfileFragment : GenericMainFragment() {
                     Log.i("$TAG Picture will be locally stored as [$localFileName]")
                     val path = FileUtils.getProperFilePath(localFileName)
                     viewModel.setNewPicturePath(path)
+                    viewModel.uploadProfilePicture(path)
                 } else {
                     Log.e("$TAG Failed to copy [$uri] to local storage")
                 }
@@ -87,7 +88,7 @@ class AccountProfileFragment : GenericMainFragment() {
         }
 
         binding.setDeleteImageClickListener {
-            viewModel.setNewPicturePath("")
+            viewModel.deleteProfilePicture()
         }
 
         binding.setCopySipUriClickListener {

@@ -63,6 +63,11 @@
         android:largeHeap="true"
         tools:targetApi="35">
 
+        <!-- Always upload fatal crashes and ANRs to Firebase Crashlytics. -->
+        <meta-data
+            android:name="firebase_crashlytics_collection_enabled"
+            android:value="true" />
+
         <!-- Required for chat message & call notifications to be displayed in Android auto -->
         <meta-data
             android:name="com.google.android.gms.car.application"

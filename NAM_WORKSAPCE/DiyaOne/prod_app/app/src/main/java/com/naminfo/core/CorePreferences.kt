@@ -506,6 +506,10 @@ class CorePreferences
     val messageReceivedInVisibleConversationNotificationSound: String
         get() = context.filesDir.absolutePath + "/share/sounds/linphone/incoming_chat.wav"
 
+    @get:AnyThread
+    val outgoingCallRingbackSound: String
+        get() = context.filesDir.absolutePath + "/share/sounds/linphone/ringback.wav"
+
     @get:AnyThread @set:WorkerThread
     var isMdmConfigured: Boolean
         get() = config.getBool("app", "mdm_configured", false)
@@ -563,10 +567,39 @@ class CorePreferences
             config.sync()
         }
 
+    var accessTokenExpiresAt: String?
+        get() = config.getString("app", "access_token_expires_at", null)
+        set(value) {
+            config.setString("app", "access_token_expires_at", value ?: "")
+            config.sync()
+        }
+
+    var refreshTokenExpiresAt: String?
+        get() = config.getString("app", "refresh_token_expires_at", null)
+        set(value) {
+            config.setString("app", "refresh_token_expires_at", value ?: "")
+            config.sync()
+        }
+
     var apiDomain: String?
         get() = config.getString("app", "api_domain", null)
         set(value) {
             config.setString("app", "api_domain", value ?: "")
+            config.sync()
+        }
+
+    var loginTime: String?
+        get() = config.getString("app", "login_time", null)
+        set(value) {
+            config.setString("app", "login_time", value ?: "")
+            config.sync()
+        }
+
+    /** Last successful directory response, retained only for offline fallback. */
+    var mobionContactsCache: String?
+        get() = config.getString("app", "mobion_contacts_cache", null)
+        set(value) {
+            config.setString("app", "mobion_contacts_cache", value ?: "")
             config.sync()
         }
 

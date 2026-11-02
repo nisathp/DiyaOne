@@ -1,6 +1,7 @@
 package com.naminfo.translation
 
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
+import com.naminfo.core.ApiLogRepository
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -69,6 +70,7 @@ object TranslationRepository {
             }
         }
 
+        var logId: Long? = null
         try {
             Log.i("$TAG Calling Translation API for messageId [$messageId], targetLang [${targetLanguage.apiValue}]")
             val requestJson = JSONObject().apply {
@@ -76,6 +78,7 @@ object TranslationRepository {
                 put("language", targetLanguage.apiValue)
                 put("message", originalText)
             }
+            logId = ApiLogRepository.begin("POST", API_URL, requestJson.toString())
 
             val url = URL(API_URL)
             val connection = (url.openConnection() as HttpURLConnection).apply {
@@ -96,6 +99,7 @@ object TranslationRepository {
             val responseCode = connection.responseCode
             if (responseCode == HttpURLConnection.HTTP_OK) {
                 val responseText = connection.inputStream.bufferedReader().use(BufferedReader::readText)
+                ApiLogRepository.complete(requireNotNull(logId), responseCode, responseText)
                 val responseJson = JSONObject(responseText)
                 val translatedMessage = if (responseJson.has("translated_message") && !responseJson.isNull("translated_message")) {
                     responseJson.getString("translated_message")
@@ -114,10 +118,13 @@ object TranslationRepository {
                 }
             } else {
                 val errorStream = connection.errorStream?.bufferedReader()?.use(BufferedReader::readText)
+                ApiLogRepository.complete(requireNotNull(logId), responseCode, errorStream)
                 Log.e("$TAG API HTTP Error [$responseCode]: $errorStream")
                 return@withContext Result.failure(IllegalStateException("HTTP $responseCode: $errorStream"))
             }
         } catch (e: Exception) {
+            // A request may fail before a connection response is available.
+            ApiLogRepository.fail(logId ?: ApiLogRepository.begin("POST", API_URL), e)
             Log.e("$TAG Exception during translation: $e")
             return@withContext Result.failure(e)
         } finally {

@@ -17,11 +17,14 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import com.naminfo.DiyaOneApplication.Companion.coreContext
+import com.naminfo.core.FileTransferApiLogger
+import com.naminfo.core.OutgoingMessageRetryManager
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.core.CustomComposing
 import com.naminfo.core.CustomImdn
 import org.linphone.core.ChatMessage
+import org.linphone.core.ChatMessageListenerStub
 import org.linphone.core.ChatRoom
 import org.linphone.core.ChatRoomListenerStub
 import org.linphone.core.EventLog
@@ -348,6 +351,8 @@ class SendMessageInConversationViewModel
                     if (isBasicChatRoom && contentAdded) {
                         val voiceMessage = chatRoom.createEmptyMessage()
                         voiceMessage.addContent(content)
+                        CustomImdn.prepareOutgoing(voiceMessage)
+                        OutgoingMessageRetryManager.watch(voiceMessage)
                         voiceMessage.send()
                         messageSentEvent.postValue(Event(voiceMessage))
                     } else {
@@ -386,6 +391,33 @@ class SendMessageInConversationViewModel
                         // the network returns. A ViewModel-owned queue loses all but
                         // its active item when the chat screen is recreated.
                         Log.i("$TAG Sending Basic SIP attachment [${attachment.fileName}]")
+                        val transferLogId = FileTransferApiLogger.beginUpload(
+                            core.fileTransferServer.orEmpty(),
+                            attachment.fileName,
+                            attachment.fileSize
+                        )
+                        fileMessage.addListener(object : ChatMessageListenerStub() {
+                            override fun onMsgStateChanged(
+                                changedMessage: ChatMessage,
+                                state: ChatMessage.State?
+                            ) {
+                                when (state) {
+                                    ChatMessage.State.FileTransferDone ->
+                                        FileTransferApiLogger.completeUpload(transferLogId)
+
+                                    ChatMessage.State.FileTransferError,
+                                    ChatMessage.State.NotDelivered ->
+                                        FileTransferApiLogger.failUpload(
+                                            transferLogId,
+                                            "File transfer ended with state $state"
+                                        )
+
+                                    else -> Unit
+                                }
+                            }
+                        })
+                        CustomImdn.prepareOutgoing(fileMessage)
+                        OutgoingMessageRetryManager.watch(fileMessage)
                         fileMessage.send()
                         messageSentEvent.postValue(Event(fileMessage))
                     } else {
@@ -402,6 +434,7 @@ class SendMessageInConversationViewModel
 
                 // Log.i("[Custom IMDN] Sending original message id=$customMessageId")
                 CustomImdn.prepareOutgoing(message)
+                OutgoingMessageRetryManager.watch(message)
                 message.send()
                 messageSentEvent.postValue(Event(message))
             }
@@ -585,6 +618,7 @@ class SendMessageInConversationViewModel
                 forwardedMessage.removeCustomHeader("X-Diya-Message-ID")
 
                 CustomImdn.prepareOutgoing(forwardedMessage)
+                OutgoingMessageRetryManager.watch(forwardedMessage)
 
                 Log.i(
                     "$TAG Sending forwarded message " +
