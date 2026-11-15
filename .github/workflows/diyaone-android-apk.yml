@@ -28,9 +28,12 @@ jobs:
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
-          distribution: jetbrains
+          distribution: temurin
           java-version: '21'
           cache: gradle
+
+      - name: Use CI Java runtime
+        run: rm gradle/gradle-daemon-jvm.properties
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
