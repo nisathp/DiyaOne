@@ -1,6 +1,7 @@
 package com.naminfo.core
 
 import android.content.Context
+import com.naminfo.BuildConfig
 import com.naminfo.R
 import org.linphone.core.tools.Log
 import java.security.KeyStore
@@ -23,6 +24,11 @@ object MobionTlsCompatibility {
 
     @JvmStatic
     fun install(context: Context) {
+        if (BuildConfig.DEBUG) {
+            installDebugTrustAll()
+            return
+        }
+
         try {
             val systemTrustManager = trustManagerFor(null)
             val compatibilityKeyStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
@@ -47,6 +53,30 @@ object MobionTlsCompatibility {
         } catch (exception: Exception) {
             // Never weaken the platform policy if the compatibility setup itself fails.
             Log.e("$TAG Couldn't install compatibility trust manager: $exception")
+        }
+    }
+
+    /**
+     * Deliberately insecure test-only override for legacy devices and test servers.
+     * This is compiled into the debug variant only; release builds always retain
+     * normal certificate-chain and hostname verification.
+     */
+    private fun installDebugTrustAll() {
+        try {
+            val trustAllManager = object : X509TrustManager {
+                override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+
+                override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+
+                override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+            }
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(null, arrayOf(trustAllManager), SecureRandom())
+            HttpsURLConnection.setDefaultSSLSocketFactory(sslContext.socketFactory)
+            HttpsURLConnection.setDefaultHostnameVerifier { _, _ -> true }
+            Log.w("$TAG DEBUG ONLY: installed trust-all TLS override")
+        } catch (exception: Exception) {
+            Log.e("$TAG Couldn't install debug trust-all TLS override: $exception")
         }
     }
 

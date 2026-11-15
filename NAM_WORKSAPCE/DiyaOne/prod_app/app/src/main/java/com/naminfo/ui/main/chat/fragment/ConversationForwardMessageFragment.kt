@@ -42,6 +42,7 @@ import com.naminfo.ui.main.contacts.model.ContactNumberOrAddressModel
 import com.naminfo.ui.main.contacts.model.NumberOrAddressPickerDialogModel
 import com.naminfo.ui.main.fragment.SlidingPaneChildFragment
 import com.naminfo.utils.DialogUtils
+import com.naminfo.utils.LinphoneUtils
 import com.naminfo.utils.RecyclerViewHeaderDecoration
 
 @UiThread
@@ -83,6 +84,7 @@ class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
     }
 
     override fun goBack(): Boolean {
+        viewModel.cancelForward()
         sharedViewModel.messageToForwardEvent.value?.consume {
             Log.w("$TAG Cancelling message forward")
             viewModel.showRedToast(R.string.conversation_message_forward_cancelled_toast, R.drawable.forward)
@@ -113,6 +115,10 @@ class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
 
         binding.setBackClickListener {
             goBack()
+        }
+
+        sharedViewModel.messageToForwardEvent.value?.peekContent()?.let { messageToForward ->
+            viewModel.captureMessageToForward(messageToForward)
         }
 
         binding.contactsList.setHasFixedSize(true)
@@ -157,6 +163,36 @@ class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
             }
         }
 
+        viewModel.singleForwardRoomCompletedEvent.observe(viewLifecycleOwner) {
+            it.consume { chatRoom ->
+                sharedViewModel.messageToForwardEvent.value?.consume {}
+                sharedViewModel.displayedChatRoom = chatRoom
+                viewModel.showGreenToast(R.string.conversation_message_forwarded_toast, R.drawable.forward)
+                val conversationId = LinphoneUtils.getConversationId(chatRoom)
+                Log.i("$TAG Forwarded to [$conversationId], navigating to target conversation")
+                if (findNavController().currentDestination?.id == R.id.conversationForwardMessageFragment) {
+                    val action = ConversationForwardMessageFragmentDirections.actionConversationForwardMessageFragmentToConversationFragment(
+                        conversationId
+                    )
+                    disableConsumingEventOnPause = true
+                    findNavController().navigate(action)
+                }
+            }
+        }
+
+        viewModel.multiForwardCompletedEvent.observe(viewLifecycleOwner) {
+            it.consume { count ->
+                sharedViewModel.messageToForwardEvent.value?.consume {}
+                viewModel.showFormattedGreenToast(
+                    getString(R.string.conversation_message_forwarded_multi_toast, count),
+                    R.drawable.forward
+                )
+                Log.i("$TAG Forwarded message to [$count] chats, returning to previous screen")
+                disableConsumingEventOnPause = true
+                findNavController().popBackStack()
+            }
+        }
+
         adapter.onClickedEvent.observe(viewLifecycleOwner) {
             it.consume { model ->
                 viewModel.handleClickOnModel(model)
@@ -188,7 +224,8 @@ class ConversationForwardMessageFragment : SlidingPaneChildFragment() {
         numberOrAddressPickerDialog?.dismiss()
         numberOrAddressPickerDialog = null
 
-        if (!disableConsumingEventOnPause) {
+        if (!disableConsumingEventOnPause && !permissionRequestInProgress && isRemoving) {
+            viewModel.cancelForward()
             sharedViewModel.messageToForwardEvent.value?.consume {
                 Log.w(
                     "$TAG Fragment is pausing, consuming forward event to prevent it from being used later"

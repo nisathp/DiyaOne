@@ -17,6 +17,8 @@ import org.linphone.core.ChatMessageReaction
 import org.linphone.core.ChatRoom
 import org.linphone.core.ChatRoom.HistoryFilter
 import org.linphone.core.ChatRoomListenerStub
+import org.linphone.core.Core
+import org.linphone.core.CoreListenerStub
 import org.linphone.core.EventLog
 import org.linphone.core.Friend
 import org.linphone.core.SearchDirection
@@ -146,8 +148,73 @@ class ConversationViewModel
 
     private var latestMatchModel: MessageModel? = null
 
+    // Callback EventLog wrappers can be invalidated by liblinphone while a Basic SIP room
+    // persists several attachments. Never dereference those callback objects directly.
+    // Re-read the durable history after the Core has finished its current callback instead.
+    private var historyRefreshScheduled = false
+
+    // Basic SIP chat rooms normally notify their own listener, but some
+    // FreeSWITCH/SDK timing combinations only emit the Core-level callback.
+    // Keep this fallback while the conversation is visible so a received
+    // message never needs a screen re-open before it is rendered.
+    private var coreListenerRegistered = false
+
+    // Some Basic SIP stacks can accept a MESSAGE yet temporarily fail to write its local
+    // event (storage id -1). Keep the live ChatMessage until history contains it, so the
+    // user immediately sees incoming and outgoing text/image instead of an empty conversation.
+    private val optimisticMessages = linkedMapOf<String, ChatMessage>()
+
     private val remoteComposingState = RemoteComposingState {
         coreContext.postOnCoreThread { computeComposingLabel() }
+    }
+
+    private val coreListener = object : CoreListenerStub() {
+        @WorkerThread
+        override fun onMessagesReceived(
+            core: Core,
+            room: ChatRoom,
+            messages: Array<out ChatMessage?>
+        ) {
+            if (!isDisplayedRoom(room)) return
+            var visibleAdded = false
+            for (msg in messages) {
+                if (msg == null || !LinphoneUtils.isDisplayableChatMessage(msg)) continue
+                visibleAdded = true
+                val key = messageKey(msg) ?: continue
+                optimisticMessages[key] = msg
+            }
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+            if (!visibleAdded) return
+
+            Log.i("$TAG Core receive fallback for active conversation, refreshing history")
+            // Do not inspect history in this callback: Core owns its native lock here.
+            refreshEventsFromHistorySoon()
+        }
+
+        @WorkerThread
+        override fun onChatRoomRead(core: Core, room: ChatRoom) {
+            if (!isDisplayedRoom(room)) return
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+        }
+    }
+
+    @WorkerThread
+    private fun isDisplayedRoom(candidate: ChatRoom): Boolean {
+        if (!isChatRoomInitialized()) return false
+        if (candidate == chatRoom) return true
+
+        // Basic SIP's Core callback can allocate a fresh ChatRoom JNI wrapper for
+        // the same peer/local addresses (e.g. with or without :5060). Reference
+        // equality drops the live update even though both rooms are one conversation.
+        val displayedId = LinphoneUtils.getConversationId(chatRoom)
+        return (displayedId.isNotBlank() && displayedId == LinphoneUtils.getConversationId(candidate)) ||
+            LinphoneUtils.areSameOneToOnePeer(chatRoom, candidate)
+    }
+
+    @WorkerThread
+    private fun getSiblingChatRooms(): List<ChatRoom> {
+        if (!isChatRoomInitialized()) return emptyList()
+        return LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
     }
 
     private val customComposingObserver: (String, String, Boolean) -> Unit = { roomKey, address, active ->
@@ -168,12 +235,15 @@ class ConversationViewModel
             // This callback includes locally-created outgoing messages. Relying only on
             // onChatMessagesReceived() leaves a race where a freshly sent text or file is
             // already in the Core but is missing from the open conversation UI.
-            val visibleEvents = eventLogs.filterNot {
-                CustomImdn.isHiddenControlMessage(it.chatMessage)
+            for (event in eventLogs) {
+                val msg = event.chatMessage ?: continue
+                if (CustomImdn.isHiddenControlMessage(msg)) continue
+                val key = messageKey(msg) ?: continue
+                optimisticMessages[key] = msg
             }
-            if (visibleEvents.isNotEmpty()) {
-                Log.i("$TAG Received [${visibleEvents.size}] new local or remote event(s)")
-                addEvents(visibleEvents.toTypedArray())
+            if (eventLogs.isNotEmpty()) {
+                Log.i("$TAG Received [${eventLogs.size}] new local or remote event(s), refreshing history")
+                refreshEventsFromHistorySoon()
             }
         }
 
@@ -222,15 +292,18 @@ class ConversationViewModel
 
         @WorkerThread
         override fun onChatMessagesReceived(chatRoom: ChatRoom, eventLogs: Array<EventLog>) {
-            val visibleEvents = eventLogs.filterNot {
-                CustomImdn.isHiddenControlMessage(it.chatMessage)
+            if (eventLogs.isEmpty()) return
+            Log.i("$TAG Received [${eventLogs.size}] new message(s), refreshing history")
+            for (event in eventLogs) {
+                val msg = event.chatMessage ?: continue
+                if (CustomImdn.isHiddenControlMessage(msg)) continue
+                val key = messageKey(msg) ?: continue
+                optimisticMessages[key] = msg
             }
-            if (visibleEvents.isEmpty()) return
-            Log.i("$TAG Received [${visibleEvents.size}] new message(s)")
             computeComposingLabel()
 
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
-            addEvents(visibleEvents.toTypedArray())
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+            refreshEventsFromHistorySoon()
         }
 
         @WorkerThread
@@ -338,7 +411,7 @@ class ConversationViewModel
                 messageDeletedEvent.postValue(Event(true))
             }
 
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
         }
 
         @WorkerThread
@@ -369,6 +442,7 @@ class ConversationViewModel
         coreContext.postOnCoreThread { core ->
             isEndToEndEncryptionAvailable.postValue(LinphoneUtils.isEndToEndEncryptedChatAvailable(core))
             coreContext.contactsManager.addListener(contactsListener)
+            coreContext.contactsManager.syncMobionDirectoryAsync()
             CustomComposing.addObserver(customComposingObserver)
         }
 
@@ -389,6 +463,10 @@ class ConversationViewModel
             coreContext.contactsManager.removeListener(contactsListener)
             CustomComposing.removeObserver(customComposingObserver)
             remoteComposingState.clear()
+            if (coreListenerRegistered) {
+                coreContext.core.removeListener(coreListener)
+                coreListenerRegistered = false
+            }
             if (isChatRoomInitialized()) {
                 chatRoom.removeListener(chatRoomListener)
             }
@@ -398,6 +476,10 @@ class ConversationViewModel
 
     @WorkerThread
     override fun beforeNotifyingChatRoomFound(sameOne: Boolean) {
+        if (!coreListenerRegistered) {
+            coreContext.core.addListener(coreListener)
+            coreListenerRegistered = true
+        }
         if (!sameOne) {
             Log.i("$TAG Conversation found and not the same as before, configuring it...")
             remoteComposingState.clear()
@@ -464,7 +546,7 @@ class ConversationViewModel
     fun updateUnreadMessageCount() {
         if (!isChatRoomInitialized()) return
         coreContext.postOnCoreThread {
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
         }
     }
 
@@ -481,7 +563,7 @@ class ConversationViewModel
             if (!isChatRoomInitialized()) return@postOnCoreThread
 
             Log.i("$TAG Clearing local message history for conversation [$conversationId]")
-            chatRoom.deleteHistory()
+            getSiblingChatRooms().forEach { it.deleteHistory() }
             eventsList.forEach(EventLogModel::destroy)
             eventsList = arrayListOf()
             updateEvents.postValue(Event(true))
@@ -540,12 +622,57 @@ class ConversationViewModel
         if (!isChatRoomInitialized()) return
 
         coreContext.postOnCoreThread {
-            if (CustomImdn.visibleUnreadMessagesCount(chatRoom) > 0) {
-                Log.i("$TAG Marking chat room as read")
-                chatRoom.markAsRead()
+            for (room in getSiblingChatRooms()) {
+                if (CustomImdn.visibleUnreadMessagesCount(room) > 0) {
+                    Log.i("$TAG Marking chat room as read")
+                    room.markAsRead()
+                }
+                CustomImdn.roomRead(room)
+                coreContext.notificationsManager.dismissChatNotification(room)
+            }
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+        }
+    }
+
+    /** Marks a batch of scrolled-into-view unread messages as read and emits displayed receipts. */
+    @UiThread
+    fun markMessagesAsRead(messages: List<MessageModel>) {
+        if (!isChatRoomInitialized() || messages.isEmpty()) return
+
+        messages.forEach { it.isRead = true }
+        val nativeMessages = messages.map { it.chatMessage }
+        coreContext.postOnCoreThread {
+            nativeMessages.forEach { message ->
+                message.markAsRead()
+                CustomImdn.messageRead(message)
+            }
+            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+        }
+    }
+
+    /**
+     * The receiver has made the latest page visible. Re-send displayed receipts once so
+     * messages whose first receipt arrived while A was offline can immediately change from
+     * a single to a double tick when SIP is available again.
+     */
+    @UiThread
+    fun refreshDisplayedReceipts() {
+        if (!isChatRoomInitialized()) return
+
+        coreContext.postOnCoreThread {
+            for (room in getSiblingChatRooms()) {
+                if (CustomImdn.visibleUnreadMessagesCount(room) > 0) {
+                    room.markAsRead()
+                }
+                CustomImdn.roomRead(room)
             }
 
-            coreContext.notificationsManager.dismissChatNotification(chatRoom)
+            val visibleMessages = eventsList
+                .asSequence()
+                .mapNotNull { (it.model as? MessageModel)?.chatMessage }
+                .toList()
+                .takeLast(MESSAGES_PER_PAGE)
+            CustomImdn.refreshDisplayedReceipts(chatRoom, visibleMessages)
         }
     }
 
@@ -603,20 +730,27 @@ class ConversationViewModel
             // Visible bubbles are not database offsets: receipts are filtered out.
             // Read strictly before the oldest displayed event instead.
             val oldestEvent = eventsList.firstOrNull()?.eventLog
-            val maxSize = chatRoom.historyEventsSize
+            val rooms = getSiblingChatRooms()
+            val isBasicRoom = rooms.any { it.hasCapability(ChatRoom.Capabilities.Basic.toInt()) }
+            val maxSize = rooms.sumOf { it.historyEventsSize }.coerceAtLeast(chatRoom.historyEventsSize)
             val mask = HistoryFilter.ChatMessage.toInt() or HistoryFilter.InfoNoDevice.toInt()
-            var requested = minOf(MESSAGES_PER_PAGE, maxSize)
+            var requested = if (isBasicRoom) {
+                (eventsList.size + MESSAGES_PER_PAGE).coerceAtLeast(MESSAGES_PER_PAGE)
+            } else {
+                minOf(MESSAGES_PER_PAGE, maxSize)
+            }
             Log.i("$TAG Loading older history before displayed events, visible count=$totalItemsCount")
 
             while (requested > 0) {
-                val history = if (oldestEvent == null) {
-                    chatRoom.getHistory(requested, mask)
+                val history = if (oldestEvent == null || isBasicRoom) {
+                    val fetchLimit = if (requested >= maxSize && maxSize > 0) 0 else requested
+                    getDisplayHistoryEvents(fetchLimit)
                 } else {
                     // getHistoryRangeNear includes the anchor as the final event.
                     chatRoom.getHistoryRangeNear(requested, 0, oldestEvent, mask)
                         .dropLast(1).toTypedArray()
                 }
-                val visible = filterMessageEvents(history, eventsList.map { it.eventLog })
+                val visible = filterMessageEvents(history, eventsList.mapNotNull { it.eventLog })
                 if (visible.isNotEmpty()) {
                     Log.i("$TAG Prepending [${visible.size}] previously undisplayed events")
                     prependEvents(visible)
@@ -624,7 +758,7 @@ class ConversationViewModel
                 }
 
                 // Skip receipt-only pages, but stop at the beginning of history.
-                if (history.size < requested || requested >= maxSize) break
+                if (maxSize <= 0 || requested >= maxSize || (!isBasicRoom && history.size < requested)) break
                 requested = minOf(requested + MESSAGES_PER_PAGE, maxSize)
             }
             Log.i("$TAG No older visible events to load")
@@ -649,18 +783,62 @@ class ConversationViewModel
     }
 
     @UiThread
-    fun loadDataUpUntilToMessageId(messageId: String?) {
-        messageId ?: return
+    fun loadDataUpUntilToMessageId(messageId: String?, candidateIds: List<String> = emptyList()) {
+        val references = (listOfNotNull(messageId) + candidateIds)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (references.isEmpty()) return
+        if (!isChatRoomInitialized()) return
 
         coreContext.postOnCoreThread {
+            val loadedIndex = eventsList.indexOfFirst { event ->
+                val messageModel = event.model as? MessageModel ?: return@indexOfFirst false
+                references.any(messageModel::matchesReplyReference)
+            }
+            if (loadedIndex >= 0) {
+                searchInProgress.postValue(false)
+                itemToScrollTo.postValue(loadedIndex)
+                return@postOnCoreThread
+            }
+
             searchInProgress.postValue(true)
-            val eventLog = chatRoom.findEventLog(messageId)
-            if (eventLog != null) {
-                Log.i("$TAG Found event log [$eventLog] with message ID [$messageId]")
-                loadMessagesUpTo(eventLog)
+            val rooms = getSiblingChatRooms()
+            var targetEvent: EventLog? = null
+            var targetRoom: ChatRoom? = null
+            var matchedReference: String? = null
+            for (room in rooms) {
+                for (ref in references) {
+                    val direct = room.findEventLog(ref)
+                    if (direct != null) {
+                        targetEvent = direct
+                        targetRoom = room
+                        matchedReference = ref
+                        break
+                    }
+                }
+                if (targetEvent != null) break
+
+                val byCustomId = getDisplayHistoryEventsForRoom(room, 0).lastOrNull { event ->
+                    val msg = event.chatMessage ?: return@lastOrNull false
+                    msg.messageId in references || CustomImdn.id(msg) in references
+                }
+                if (byCustomId != null) {
+                    targetEvent = byCustomId
+                    targetRoom = room
+                    matchedReference = byCustomId.chatMessage?.let { msg ->
+                        references.firstOrNull { ref -> msg.messageId == ref || CustomImdn.id(msg) == ref }
+                    } ?: references.first()
+                    break
+                }
+            }
+
+            if (targetEvent != null && targetRoom != null) {
+                Log.i("$TAG Found event log [$targetEvent] with message ID [$matchedReference]")
+                loadMessagesUpToTarget(rooms, targetRoom, targetEvent, matchedReference)
             } else {
                 Log.e(
-                    "$TAG Failed to find event log with message ID [$messageId] in chat room history!"
+                    "$TAG Failed to find event log with message IDs [$references] in chat room history!"
                 )
                 searchInProgress.postValue(false)
             }
@@ -670,42 +848,38 @@ class ConversationViewModel
     @UiThread
     fun addSentMessageToEventsList(message: ChatMessage) {
         coreContext.postOnCoreThread {
-            addSentMessageToEventsList(message, attempt = 0)
+            // In a multi-attachment Basic SIP send, message.eventLog can point to an EventLog
+            // that liblinphone has already released. Accessing eventLog.chatMessage then causes
+            // a native SIGSEGV. The normal Core callback above will refresh this message from
+            // persistent history; scheduling it here also covers callback ordering races.
+            val key = messageKey(message)
+            if (key != null) {
+                optimisticMessages[key] = message
+            }
+            Log.i("$TAG Scheduling sent message [${message.messageId}] history refresh")
+            refreshEventsFromHistorySoon()
         }
     }
 
     @WorkerThread
-    private fun addSentMessageToEventsList(message: ChatMessage, attempt: Int) {
-        val eventLog = message.eventLog
-        if (eventLog != null) {
-            Log.i("$TAG Adding sent message with ID [${message.messageId}] to events list")
-            addEvents(arrayOf(eventLog))
-            return
-        }
-
-        // Sending a message is asynchronous. Its event log can be attached after send()
-        // returns, especially for Basic SIP file transfers. Wait briefly rather than
-        // dropping the message bubble; onNewEvents() above provides a second path.
-        if (attempt < 5) {
-            Log.i(
-                "$TAG Sent message [${message.messageId}] has no event log yet, retrying UI insertion " +
-                    "(${attempt + 1}/5)"
-            )
-            coreContext.postOnCoreThreadDelayed(
-                { addSentMessageToEventsList(message, attempt + 1) },
-                150L
-            )
-        } else {
-            Log.w(
-                "$TAG Sent message [${message.messageId}] still has no event log; refreshing conversation history"
-            )
-            computeEvents()
-        }
+    private fun refreshEventsFromHistorySoon() {
+        if (historyRefreshScheduled) return
+        historyRefreshScheduled = true
+        coreContext.postOnCoreThreadDelayed(
+            {
+                historyRefreshScheduled = false
+                computeEvents()
+            },
+            150L
+        )
     }
 
     @WorkerThread
     private fun configureChatRoom() {
         if (!isChatRoomInitialized()) return
+
+        cachedTranslationConversationId = LinphoneUtils.getConversationId(chatRoom)
+        cachedPeerUsername = chatRoom.peerAddress.username.orEmpty()
 
         computeComposingLabel()
 
@@ -716,7 +890,7 @@ class ConversationViewModel
 
         computeConversationInfo()
 
-        unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+        unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
         computeEvents()
     }
 
@@ -789,8 +963,51 @@ class ConversationViewModel
 
         eventsList.forEach(EventLogModel::destroy)
 
-        val history = getDisplayHistoryEvents(MESSAGES_PER_PAGE)
-        val list = getEventsListFromHistory(history)
+        val rooms = getSiblingChatRooms()
+        var history = getDisplayHistoryEvents(MESSAGES_PER_PAGE)
+        rooms.forEach { room ->
+            room.unreadHistory.forEach { msg ->
+                if (msg != null && !CustomImdn.isHiddenControlMessage(msg)) {
+                    val key = messageKey(msg)
+                    if (key != null && !optimisticMessages.containsKey(key)) {
+                        optimisticMessages[key] = msg
+                    }
+                }
+            }
+        }
+        var list = getEventsListFromHistory(history)
+        // If trailing control/receipt events fill the entire first page (e.g. after reply/forward),
+        // widen to full history so valid chat messages aren't hidden as an empty screen.
+        if (list.isEmpty() && rooms.any { it.historyEventsSize > 0 }) {
+            list.forEach(EventLogModel::destroy)
+            history = getDisplayHistoryEvents(0)
+            list = getEventsListFromHistory(history)
+        }
+        val storedMessages = history.mapNotNull { it.chatMessage }
+        val storedMessageKeys = storedMessages.mapNotNull(::messageKey).toSet()
+        val storedCustomIds = storedMessages.mapNotNull {
+            CustomImdn.id(it) ?: it.getCustomHeader("X-Diya-Message-ID")?.takeIf(String::isNotBlank)
+        }.toSet()
+        val storedNativeIds = storedMessages.mapNotNull {
+            it.messageId.takeIf(String::isNotBlank)
+        }.toSet()
+        val storedFingerprints = storedMessages.mapNotNull(::incomingFingerprint).toSet()
+        optimisticMessages.entries.removeAll { (key, msg) ->
+            key in storedMessageKeys ||
+                (CustomImdn.id(msg) ?: msg.getCustomHeader("X-Diya-Message-ID")) in storedCustomIds ||
+                msg.messageId.takeIf(String::isNotBlank) in storedNativeIds ||
+                incomingFingerprint(msg) in storedFingerprints
+        }
+        optimisticMessages.values.forEach { message ->
+            if (LinphoneUtils.isDisplayableChatMessage(message)) {
+                Log.w("$TAG Showing optimistic message [${message.messageId}] because it isn't in Core history yet")
+                list.add(createOptimisticSentMessageModel(message))
+            }
+        }
+        list.sortWith(
+            // Kotlin's sort is stable, so native order remains the tiebreaker when timestamps match.
+            compareBy<EventLogModel> { (it.model as? MessageModel)?.timestampMillis ?: Long.MIN_VALUE }
+        )
         Log.i("$TAG Extracted [${list.size}] events from conversation history in database")
         eventsList = list
         updateEvents.postValue(Event(true))
@@ -805,11 +1022,20 @@ class ConversationViewModel
      * builds, which made Vivo's otherwise delivered messages invisible in the UI.
      */
     @WorkerThread
-    private fun getDisplayHistoryEvents(limit: Int): Array<EventLog> =
-        if (chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())) {
-            chatRoom.getHistoryMessageEvents(limit)
+    private fun getDisplayHistoryEvents(limit: Int): Array<EventLog> {
+        val rooms = getSiblingChatRooms()
+        if (rooms.size <= 1) {
+            return getDisplayHistoryEventsForRoom(chatRoom, limit)
+        }
+        return rooms.flatMap { getDisplayHistoryEventsForRoom(it, limit).asList() }.toTypedArray()
+    }
+
+    @WorkerThread
+    private fun getDisplayHistoryEventsForRoom(room: ChatRoom, limit: Int): Array<EventLog> =
+        if (room.hasCapability(ChatRoom.Capabilities.Basic.toInt())) {
+            room.getHistoryMessageEvents(limit)
         } else {
-            chatRoom.getHistoryEvents(limit)
+            room.getHistoryEvents(limit)
         }
 
     @WorkerThread
@@ -822,16 +1048,17 @@ class ConversationViewModel
 
         // Prevents message duplicates
         val eventsToAdd = arrayListOf<EventLog>()
-        eventsToAdd.addAll(filterMessageEvents(eventLogs, list.map { it.eventLog }))
+        eventsToAdd.addAll(filterMessageEvents(eventLogs, list.mapNotNull { it.eventLog }))
 
         val newList = getEventsListFromHistory(
             eventsToAdd.toTypedArray()
         )
         val newEvent = newList.firstOrNull()
 
-        if (lastEvent != null && lastEvent.model is MessageModel && newEvent != null && newEvent.model is MessageModel && shouldWeGroupTwoEvents(
-                newEvent.eventLog,
-                lastEvent.eventLog
+        if (lastEvent != null && lastEvent.model is MessageModel && newEvent != null && newEvent.model is MessageModel &&
+            newEvent.eventLog != null && lastEvent.eventLog != null && shouldWeGroupTwoEvents(
+                newEvent.eventLog!!,
+                lastEvent.eventLog!!
             )
         ) {
             lastEvent.model.groupedWithNextMessage.postValue(true)
@@ -854,16 +1081,17 @@ class ConversationViewModel
 
         // Prevents message duplicates
         val eventsToAdd = arrayListOf<EventLog>()
-        eventsToAdd.addAll(filterMessageEvents(eventLogs, eventsList.map { it.eventLog }))
+        eventsToAdd.addAll(filterMessageEvents(eventLogs, eventsList.mapNotNull { it.eventLog }))
 
         val newList = getEventsListFromHistory(
             eventsToAdd.toTypedArray()
         )
         val lastEvent = newList.lastOrNull()
 
-        if (lastEvent != null && lastEvent.model is MessageModel && firstEvent != null && firstEvent.model is MessageModel && shouldWeGroupTwoEvents(
-                firstEvent.eventLog,
-                lastEvent.eventLog
+        if (lastEvent != null && lastEvent.model is MessageModel && firstEvent != null && firstEvent.model is MessageModel &&
+            firstEvent.eventLog != null && lastEvent.eventLog != null && shouldWeGroupTwoEvents(
+                firstEvent.eventLog!!,
+                lastEvent.eventLog!!
             )
         ) {
             lastEvent.model.groupedWithNextMessage.postValue(true)
@@ -926,6 +1154,9 @@ class ConversationViewModel
                             }
                         }
                     }
+                },
+                { message -> // onFileTransferCompleted
+                    updateRepliesUpTo(message)
                 }
             )
             eventsList.add(model)
@@ -936,18 +1167,66 @@ class ConversationViewModel
         return eventsList
     }
 
-    @WorkerThread
-    private fun messageEventKey(event: EventLog): String? {
-        if (event.type != EventLog.Type.ConferenceChatMessage) return null
-        val message = event.chatMessage ?: return null
-        val customId = CustomImdn.id(message)
+    private fun canonicalAddressKey(address: org.linphone.core.Address?): String {
+        if (address == null) return ""
+        val username = address.username?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        if (username != null) {
+            if (username.none(Char::isLetter)) {
+                val normalized = com.naminfo.contacts.PhoneContactNumbers.normalize(username)
+                if (normalized.length >= 6) return normalized
+            }
+            return username
+        }
+        return address.asStringUriOnly().lowercase()
+    }
+
+    private fun extractCustomMessageId(message: ChatMessage): String? =
+        CustomImdn.id(message)
             ?: message.getCustomHeader("X-Diya-Message-ID")?.takeIf { it.isNotBlank() }
+
+    @WorkerThread
+    private fun messageKey(message: ChatMessage): String? {
+        val customId = extractCustomMessageId(message)
         val identity = if (customId != null) {
             "custom:$customId"
         } else {
             message.messageId.takeIf { it.isNotBlank() }?.let { "native:$it" } ?: return null
         }
-        return "${message.isOutgoing}|${message.fromAddress.asStringUriOnly()}|$identity"
+        val isOutgoing = message.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(message)
+        return "$isOutgoing|${canonicalAddressKey(message.fromAddress)}|$identity"
+    }
+
+    @WorkerThread
+    private fun messageEventKey(event: EventLog): String? {
+        return event.chatMessage?.let(::messageKey)
+    }
+
+    @WorkerThread
+    private fun createOptimisticSentMessageModel(message: ChatMessage): EventLogModel {
+        return EventLogModel(
+            message,
+            LinphoneUtils.isChatRoomAGroup(chatRoom),
+            false,
+            false,
+            searchFilter.value.orEmpty(),
+            { fileModel -> fileToDisplayEvent.postValue(Event(fileModel)) },
+            { sipUri -> sipUriToCallEvent.postValue(Event(sipUri)) },
+            { conferenceUri -> conferenceToJoinEvent.postValue(Event(conferenceUri)) },
+            { url -> openWebBrowserEvent.postValue(Event(url)) },
+            { friendRefKey -> contactToDisplayEvent.postValue(Event(friendRefKey)) },
+            { redToast -> showRedToastEvent.postValue(Event(redToast)) },
+            { id -> voiceRecordPlaybackEndedEvent.postValue(Event(id)) },
+            { filePath ->
+                viewModelScope.launch {
+                    withContext(Dispatchers.IO) {
+                        FileUtils.addContentToMediaStore(filePath)
+                    }
+                }
+            },
+            { completedMessage ->
+                updateRepliesUpTo(completedMessage)
+            }
+        )
     }
 
     @WorkerThread
@@ -956,16 +1235,51 @@ class ConversationViewModel
         existing: List<EventLog> = emptyList()
     ): Array<EventLog> {
         val seen = existing.mapNotNull { messageEventKey(it) }.toMutableSet()
+        // During an online/offline race, the durable queue can inject a local
+        // incoming copy while the original SIP MESSAGE is arriving. Older Basic
+        // SDKs occasionally lose the custom header on one of those two events,
+        // so the stable-ID check above cannot recognise the pair. Keep a very
+        // narrow five-second fingerprint keyed alongside any observed custom IDs
+        // so unkeyed copies still collapse while intentionally repeated messages
+        // with distinct custom IDs stay distinct.
+        val incomingFingerprintIds = mutableMapOf<String, MutableSet<String?>>()
+        existing.forEach { event ->
+            val message = event.chatMessage ?: return@forEach
+            incomingFingerprint(message)?.let { fingerprint ->
+                incomingFingerprintIds.getOrPut(fingerprint) { mutableSetOf() }
+                    .add(extractCustomMessageId(message))
+            }
+        }
         return incoming.filter { event ->
-            if (CustomImdn.isHiddenControlMessage(event.chatMessage)) {
+            val message = event.chatMessage
+            if (message != null && !LinphoneUtils.isDisplayableChatMessage(message)) {
                 false
             } else {
                 val key = messageEventKey(event)
-                val keep = key == null || seen.add(key)
+                val stableIdIsNew = key == null || seen.add(key)
+                val fingerprint = message?.let(::incomingFingerprint)
+                val customId = message?.let(::extractCustomMessageId)
+                val existingIds = if (fingerprint != null) incomingFingerprintIds[fingerprint] else null
+                val pairedByFingerprint = existingIds != null &&
+                    (customId == null || existingIds.contains(null) || existingIds.contains(customId))
+                if (fingerprint != null) {
+                    incomingFingerprintIds.getOrPut(fingerprint) { mutableSetOf() }.add(customId)
+                }
+                val keep = stableIdIsNew && !pairedByFingerprint
                 if (!keep) Log.i("$TAG Skipping duplicate message event [$key]")
                 keep
             }
         }.toTypedArray()
+    }
+
+    @WorkerThread
+    private fun incomingFingerprint(message: ChatMessage): String? {
+        if (message.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(message)) return null
+        val body = message.utf8Text.orEmpty()
+        val fileNames = message.contents.joinToString("|") { it.name.orEmpty() }
+        if (body.isBlank() && fileNames.isBlank()) return null
+        val bucket5s = CustomImdn.timestampMillis(message) / 5_000L
+        return "${canonicalAddressKey(message.fromAddress)}|$bucket5s|$body|$fileNames"
     }
 
     @WorkerThread
@@ -974,7 +1288,12 @@ class ConversationViewModel
     ): ArrayList<EventLogModel> {
         val eventsList = arrayListOf<EventLogModel>()
         val groupedEventLogs = arrayListOf<EventLog>()
+        // The native Basic-SIP history order can change when offline queue items are
+        // inserted during login. Always build the bubbles from sender date/time instead.
         val visibleHistory = filterMessageEvents(history)
+            .sortedWith(
+                compareBy<EventLog> { eventTimestamp(it) }
+            )
 
         if (visibleHistory.size == 1) {
             // If there is a single event, improve processing speed by skipping grouping tasks
@@ -1012,15 +1331,24 @@ class ConversationViewModel
     }
 
     @WorkerThread
+    private fun eventTimestamp(event: EventLog): Long {
+        val message = event.chatMessage
+        return if (message != null) CustomImdn.timestampMillis(message) else Long.MIN_VALUE
+    }
+
+    @WorkerThread
     private fun shouldWeGroupTwoEvents(event: EventLog, previousGroupEvent: EventLog): Boolean {
         return if (previousGroupEvent.type == EventLog.Type.ConferenceChatMessage && event.type == EventLog.Type.ConferenceChatMessage) {
             val previousChatMessage = previousGroupEvent.chatMessage!!
             val chatMessage = event.chatMessage!!
 
             // If they have the same direction, the same from address and were sent in a short timelapse, group them
-            chatMessage.isOutgoing == previousChatMessage.isOutgoing &&
+            (chatMessage.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(chatMessage)) ==
+                (previousChatMessage.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(previousChatMessage)) &&
                 chatMessage.fromAddress.weakEqual(previousChatMessage.fromAddress) &&
-                kotlin.math.abs(chatMessage.time - previousChatMessage.time) < MAX_TIME_TO_GROUP_MESSAGES
+                kotlin.math.abs(
+                    CustomImdn.timestamp(chatMessage) - CustomImdn.timestamp(previousChatMessage)
+                ) < MAX_TIME_TO_GROUP_MESSAGES
         } else {
             false
         }
@@ -1064,14 +1392,9 @@ class ConversationViewModel
     @WorkerThread
     private fun updateRepliesUpTo(chatMessage: ChatMessage) {
         for (model in eventsList.reversed()) {
-            if (model.model is MessageModel) {
-                if (model.model.replyToMessageId == chatMessage.messageId) {
-                    model.model.computeReplyInfo()
-                }
-
-                if (model.model.timestamp < chatMessage.time) {
-                    break
-                }
+            val messageModel = model.model as? MessageModel ?: continue
+            if (messageModel.referencesOriginalMessage(chatMessage)) {
+                messageModel.computeReplyInfo()
             }
         }
     }
@@ -1103,27 +1426,132 @@ class ConversationViewModel
 
     @WorkerThread
     private fun loadMessagesUpTo(targetEvent: EventLog) {
-        val mask = HistoryFilter.ChatMessage.toInt() or HistoryFilter.InfoNoDevice.toInt()
-        val historyToAdd = chatRoom.getHistoryRangeBetween(
-            targetEvent,
-            eventsList[0].eventLog,
-            mask
+        loadMessagesUpToTarget(
+            getSiblingChatRooms(), chatRoom, targetEvent,
+            targetEvent.chatMessage?.let {
+            CustomImdn.id(it) ?: it.messageId
+        }
         )
-        Log.i(
-            "$TAG Loaded [${historyToAdd.size}] items from history to go to event log [$targetEvent]"
-        )
+    }
 
-        Log.i("$TAG Loading [$ITEMS_TO_LOAD_BEFORE_SEARCH_RESULT] items before the target")
-        val previousMessages = chatRoom.getHistoryRangeNear(
-            ITEMS_TO_LOAD_BEFORE_SEARCH_RESULT,
-            0,
-            targetEvent,
-            mask
-        )
+    @WorkerThread
+    private fun loadMessagesUpToTarget(
+        rooms: List<ChatRoom>,
+        targetRoom: ChatRoom,
+        targetEvent: EventLog,
+        referenceId: String?
+    ) {
+        val firstStoredEvent = eventsList.firstOrNull()?.eventLog
+        if (rooms.size <= 1 && targetRoom == chatRoom && firstStoredEvent != null) {
+            val mask = HistoryFilter.ChatMessage.toInt() or HistoryFilter.InfoNoDevice.toInt()
+            val historyToAdd = chatRoom.getHistoryRangeBetween(
+                targetEvent,
+                firstStoredEvent,
+                mask
+            )
+            val previousMessages = chatRoom.getHistoryRangeNear(
+                ITEMS_TO_LOAD_BEFORE_SEARCH_RESULT,
+                0,
+                targetEvent,
+                mask
+            )
+            val toAdd = previousMessages.plus(historyToAdd)
+            val combined = filterMessageEvents(toAdd, eventsList.mapNotNull { it.eventLog })
+            val newList = getEventsListFromHistory(combined)
+            val list = arrayListOf<EventLogModel>()
+            val firstEvent = eventsList.firstOrNull()
+            val lastNew = newList.lastOrNull()
+            val firstEventLog = firstEvent?.eventLog
+            val lastNewEventLog = lastNew?.eventLog
+            if (
+                lastNew != null && lastNew.model is MessageModel &&
+                firstEvent != null && firstEvent.model is MessageModel &&
+                firstEventLog != null && lastNewEventLog != null &&
+                shouldWeGroupTwoEvents(firstEventLog, lastNewEventLog)
+            ) {
+                lastNew.model.groupedWithNextMessage.postValue(true)
+                firstEvent.model.groupedWithPreviousMessage.postValue(true)
+            }
+            list.addAll(newList)
+            list.addAll(eventsList)
+            val targetIndex = if (referenceId != null) {
+                list.indexOfFirst { (it.model as? MessageModel)?.matchesReplyReference(referenceId) == true }
+            } else {
+                (newList.size - 1).coerceAtLeast(0)
+            }
+            if (targetIndex >= 0) {
+                eventsList = list
+                itemToScrollTo.postValue(targetIndex)
+                isEmpty.postValue(eventsList.isEmpty())
+                updateEvents.postValue(Event(true))
+                checkAndTranslateIncomingMessages()
+                return
+            }
+            // getHistoryRangeBetween missed the endpoints or reference ID; fall through to
+            // chronological targetRoomHistory window below so we don't jump to index 0.
+            newList.forEach(EventLogModel::destroy)
+        }
 
-        itemToScrollTo.postValue(previousMessages.size - 2) // To go to the item before the target event
-        val toAdd = previousMessages.plus(historyToAdd)
-        prependEvents(toAdd)
+        val targetRoomHistory = getDisplayHistoryEventsForRoom(targetRoom, 0)
+            .sortedBy(::eventTimestamp)
+        val targetPos = targetRoomHistory.indexOfFirst {
+            it == targetEvent ||
+                (
+                    referenceId != null &&
+                        it.chatMessage?.let { msg -> msg.messageId == referenceId || CustomImdn.id(msg) == referenceId } == true
+                    )
+        }
+        val targetTs = eventTimestamp(targetEvent)
+        val windowStartTs = if (targetPos >= 0) {
+            val contextIdx = (targetPos - ITEMS_TO_LOAD_BEFORE_SEARCH_RESULT).coerceAtLeast(0)
+            eventTimestamp(targetRoomHistory[contextIdx])
+        } else {
+            targetTs
+        }
+
+        val existingRaw = eventsList.mapNotNull { it.eventLog }
+        val roomEvents = rooms.flatMap { room ->
+            getDisplayHistoryEventsForRoom(room, 0).filter { eventTimestamp(it) >= windowStartTs }
+        }
+        val allCandidateEvents = (roomEvents + existingRaw).toTypedArray()
+        val list = getEventsListFromHistory(allCandidateEvents)
+        optimisticMessages.values.forEach { message ->
+            val msgKey = messageKey(message)
+            val msgCustomId = extractCustomMessageId(message)
+            val msgNativeId = message.messageId.takeIf(String::isNotBlank)
+            val msgFingerprint = incomingFingerprint(message)
+            if (LinphoneUtils.isDisplayableChatMessage(message) && list.none {
+                val existingMsg = it.eventLog?.chatMessage
+                val mm = it.model as? MessageModel
+                (mm != null && (mm.id == message.messageId || (msgCustomId != null && mm.customDiyaId == msgCustomId))) ||
+                    (
+                        existingMsg != null && (
+                        (msgKey != null && messageKey(existingMsg) == msgKey) ||
+                            (msgNativeId != null && existingMsg.messageId == msgNativeId) ||
+                            (msgFingerprint != null && incomingFingerprint(existingMsg) == msgFingerprint)
+                        )
+                    )
+            }
+            ) {
+                list.add(createOptimisticSentMessageModel(message))
+            }
+        }
+        list.sortWith(compareBy<EventLogModel> { (it.model as? MessageModel)?.timestampMillis ?: Long.MIN_VALUE })
+
+        val targetIndex = referenceId?.let { ref ->
+            list.indexOfFirst { (it.model as? MessageModel)?.matchesReplyReference(ref) == true }
+        } ?: 0
+        if (targetIndex < 0) {
+            Log.e("$TAG Target message [$referenceId] still not in rebuilt list")
+            searchInProgress.postValue(false)
+            return
+        }
+        eventsList.forEach(EventLogModel::destroy)
+        eventsList = list
+        itemToScrollTo.postValue(targetIndex)
+        isEmpty.postValue(eventsList.isEmpty())
+        updateEvents.postValue(Event(true))
+        checkAndTranslateIncomingMessages()
     }
 
     @WorkerThread
@@ -1206,8 +1634,14 @@ class ConversationViewModel
         }
     }
 
+    @Volatile
+    private var cachedTranslationConversationId: String? = null
+
+    @Volatile
+    private var cachedPeerUsername: String? = null
+
     fun getTranslationConversationId(): String {
-        return if (isChatRoomInitialized()) LinphoneUtils.getConversationId(chatRoom) else conversationId
+        return cachedTranslationConversationId ?: conversationId
     }
 
     fun resolveEffectiveLanguage(): ChatTranslationLanguage {
@@ -1225,8 +1659,23 @@ class ConversationViewModel
     }
 
     fun checkAndTranslateIncomingMessages() {
+        val peer = cachedPeerUsername
+        if (peer == null && isChatRoomInitialized()) {
+            coreContext.postOnCoreThread {
+                if (isChatRoomInitialized()) {
+                    cachedTranslationConversationId = LinphoneUtils.getConversationId(chatRoom)
+                    cachedPeerUsername = chatRoom.peerAddress.username.orEmpty()
+                } else {
+                    cachedPeerUsername = ""
+                }
+                viewModelScope.launch(Dispatchers.Main.immediate) {
+                    checkAndTranslateIncomingMessages()
+                }
+            }
+            return
+        }
         val effectiveLang = resolveEffectiveLanguage()
-        val toNumber = if (isChatRoomInitialized()) chatRoom.peerAddress.username ?: "" else ""
+        val toNumber = peer.orEmpty()
 
         viewModelScope.launch(Dispatchers.IO) {
             val currentEvents = ArrayList(eventsList)
@@ -1234,7 +1683,7 @@ class ConversationViewModel
                 val messageModel = eventLogModel.model as? MessageModel ?: continue
                 if (messageModel.isOutgoing) continue
 
-                val originalText = messageModel.getRawTextContent()
+                val originalText = messageModel.getCachedRawTextContent() ?: continue
                 if (originalText.isBlank()) continue
 
                 if (effectiveLang == com.naminfo.translation.ChatTranslationLanguage.NONE) {

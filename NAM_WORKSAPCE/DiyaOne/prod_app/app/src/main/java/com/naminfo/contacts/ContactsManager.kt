@@ -59,6 +59,8 @@ class ContactsManager
         private const val DELAY_BEFORE_RELOADING_CONTACTS_AFTER_PRESENCE_RECEIVED = 1000L // 1 second
         private const val DELAY_BEFORE_RELOADING_CONTACTS_AFTER_MAGIC_SEARCH_RESULT = 1000L // 1 second
         private const val FRIEND_LIST_TEMPORARY_STORED_REMOTE_DIRECTORY = "TempRemoteDirectoryContacts"
+        private const val MOBION_FRIEND_LIST_NAME = "Mobion contacts"
+        private const val MOBION_DIRECTORY_SYNC_THROTTLE_MS = 15_000L
     }
 
     private var nativeContactsLoaded = false
@@ -71,6 +73,33 @@ class ContactsManager
     private val magicSearchMap = hashMapOf<String, MagicSearch>()
 
     private val unknownRemoteContactDirectoriesContactsMap = arrayListOf<String>()
+
+    @Volatile
+    private var nativeSavedNamesByNormalizedNumber: Map<String, String> = emptyMap()
+
+    @Volatile
+    private var nativeSavedNamesLoaded = false
+
+    @Volatile
+    private var remoteProfilePicturesByNormalizedNumber: Map<String, String> = emptyMap()
+
+    @Volatile
+    private var lastMobionDirectorySyncAtMs = 0L
+
+    private val mobionSyncLock = Any()
+    private var mobionSyncInFlight = false
+    private val mobionSyncCallbacks = mutableListOf<() -> Unit>()
+
+    @Volatile
+    private var lastObservedMobionRefreshVersion: Long? = null
+
+    private val mobionRefreshObserver = androidx.lifecycle.Observer<Long> { version ->
+        val shouldForce = lastObservedMobionRefreshVersion != null
+        if (lastObservedMobionRefreshVersion != version) {
+            lastObservedMobionRefreshVersion = version
+            syncMobionDirectoryAsync(forceRefresh = shouldForce)
+        }
+    }
 
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var reloadPresenceContactsJob: Job? = null
@@ -306,12 +335,19 @@ class ContactsManager
     }
 
     @MainThread
-    fun loadContacts(activity: MainActivity) {
-        Log.i("$TAG Starting contacts loader")
+    fun loadContacts(activity: MainActivity, forceReload: Boolean = false) {
+        Log.i("$TAG ${if (forceReload) "Restarting" else "Ensuring"} contacts loader")
         val manager = LoaderManager.getInstance(activity)
         val args = Bundle()
         args.putBoolean("defaultDirectory", loadContactsOnlyFromDefaultDirectory)
-        manager.restartLoader(0, args, ContactLoader())
+        if (forceReload) {
+            manager.restartLoader(0, args, ContactLoader())
+        } else {
+            // CursorLoader observes the Contacts provider after its first load. Restarting it
+            // from every Activity.onResume re-reads the whole phone book and can race a
+            // previous native-contact synchronization.
+            manager.initLoader(0, args, ContactLoader())
+        }
     }
 
     @WorkerThread
@@ -502,6 +538,37 @@ class ContactsManager
         nativeContactsLoaded = true
         Log.i("$TAG Native contacts have been loaded, cleaning avatars maps")
 
+        invalidateCachesAndNotify()
+
+        Log.i("$TAG Native contacts have been loaded")
+        // No longer create chat room shortcuts depending on most recents ones, create it when a message is sent or received instead
+        // ShortcutUtils.createShortcutsToChatRooms(coreContext.context)
+    }
+
+    /** Clears cached avatar models so refreshed native/Mobion names propagate across all screens. */
+    @WorkerThread
+    fun invalidateCachesAndNotify() {
+        refreshNativeSavedNames(force = true)
+
+        val existingModels = (knownContactsAvatarsMap.values + unknownContactsAvatarsMap.values).distinct()
+        for (model in existingModels) {
+            val addr = model.address
+            val normalizedAddr = addr?.let {
+                it.clone().apply {
+                    clean()
+                    if (port != -1) port = -1
+                }
+            }
+            val latestFriend = if (normalizedAddr != null) {
+                findContactByAddress(normalizedAddr)
+            } else {
+                model.id.takeIf { it.isNotEmpty() }?.let { findContactById(it) }
+            }
+            val latestName = resolveAvatarName(latestFriend, normalizedAddr, model.contactName.orEmpty())
+            val latestPhoto = resolveAvatarPhoto(latestFriend, normalizedAddr)
+            model.applyResolvedProfile(latestName, latestPhoto)
+        }
+
         knownContactsAvatarsMap.values.forEach(ContactAvatarModel::destroy)
         knownContactsAvatarsMap.clear()
         unknownContactsAvatarsMap.values.forEach(ContactAvatarModel::destroy)
@@ -511,10 +578,297 @@ class ContactsManager
         unknownRemoteContactDirectoriesContactsMap.clear()
 
         notifyContactsListChanged()
+    }
 
-        Log.i("$TAG Native contacts have been loaded")
-        // No longer create chat room shortcuts depending on most recents ones, create it when a message is sent or received instead
-        // ShortcutUtils.createShortcutsToChatRooms(coreContext.context)
+    fun syncMobionDirectoryAsync(
+        forceRefresh: Boolean = false,
+        onComplete: (() -> Unit)? = null
+    ) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        var shouldStart = false
+        var shouldInvokeImmediately = false
+        synchronized(mobionSyncLock) {
+            if (mobionSyncInFlight && !forceRefresh) {
+                if (onComplete != null) mobionSyncCallbacks.add(onComplete)
+            } else if (!forceRefresh &&
+                lastMobionDirectorySyncAtMs > 0L &&
+                now - lastMobionDirectorySyncAtMs < MOBION_DIRECTORY_SYNC_THROTTLE_MS
+            ) {
+                shouldInvokeImmediately = onComplete != null
+            } else {
+                if (onComplete != null) mobionSyncCallbacks.add(onComplete)
+                if (!mobionSyncInFlight) {
+                    mobionSyncInFlight = true
+                    shouldStart = true
+                }
+            }
+        }
+
+        if (shouldInvokeImmediately) {
+            coreContext.postOnCoreThread {
+                onComplete?.invoke()
+            }
+            return
+        }
+        if (!shouldStart) return
+
+        coroutineScope.launch(Dispatchers.IO) {
+            try {
+                val contacts = MobionContactsService.fetchContacts(forceRefresh)
+                val savedNames = if (PhoneContactNumbers.hasPermission(coreContext.context)) {
+                    PhoneContactNumbers.readSavedNames(coreContext.context)
+                } else {
+                    emptyMap()
+                }
+                coreContext.postOnCoreThread {
+                    try {
+                        if (coreContext.isReady()) {
+                            applyMobionDirectoryOnCoreThread(
+                                core = coreContext.core,
+                                contacts = contacts,
+                                savedNames = savedNames,
+                                forceRefresh = forceRefresh
+                            )
+                        }
+                    } catch (e: Exception) {
+                        Log.e("$TAG Failed to apply Mobion contacts on Core thread: $e")
+                    } finally {
+                        completeMobionDirectorySync(updated = true)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("$TAG Failed to fetch Mobion contacts: $e")
+                coreContext.postOnCoreThread {
+                    completeMobionDirectorySync(updated = false)
+                }
+            }
+        }
+    }
+
+    private fun completeMobionDirectorySync(updated: Boolean) {
+        val callbacks: List<() -> Unit>
+        synchronized(mobionSyncLock) {
+            mobionSyncInFlight = false
+            if (updated) {
+                lastMobionDirectorySyncAtMs = android.os.SystemClock.elapsedRealtime()
+            }
+            callbacks = mobionSyncCallbacks.toList()
+            mobionSyncCallbacks.clear()
+        }
+        callbacks.forEach { callback ->
+            try {
+                callback.invoke()
+            } catch (e: Exception) {
+                Log.e("$TAG Mobion sync callback failed: $e")
+            }
+        }
+    }
+
+    @WorkerThread
+    private fun applyMobionDirectoryOnCoreThread(
+        core: Core,
+        contacts: List<MobionContactsService.Contact>,
+        savedNames: Map<String, String>,
+        forceRefresh: Boolean
+    ) {
+        val sipDomain = core.defaultAccount?.params?.identityAddress?.domain
+            ?: corePreferences.defaultDomain
+        val list = core.getFriendListByName(MOBION_FRIEND_LIST_NAME)
+            ?: core.createFriendList().also {
+                it.displayName = MOBION_FRIEND_LIST_NAME
+                it.type = FriendList.Type.Default
+                it.isDatabaseStorageEnabled = true
+                core.addFriendList(it)
+            }
+
+        val existing = list.friends.associateBy { it.refKey.orEmpty() }
+        val keep = mutableListOf<Friend>()
+        var anyPhotoChanged = false
+        val normalizedSelf = PhoneContactNumbers.normalize(
+            core.defaultAccount?.params?.identityAddress?.username.orEmpty()
+        )
+        var selfRemotePhoto: String? = null
+        val remotePictures = hashMapOf<String, String>()
+        val previousPictures = remoteProfilePicturesByNormalizedNumber
+        val distinctContacts = contacts.distinctBy { PhoneContactNumbers.normalize(it.mobileNumber) }
+
+        for (contact in distinctContacts) {
+            val number = contact.mobileNumber.trim()
+            if (number.isEmpty()) continue
+            val normalized = PhoneContactNumbers.normalize(number)
+            val cleanPhoto = contact.profilePictureUrl?.trim()?.takeIf { it.isNotBlank() }
+            if (cleanPhoto != null) {
+                remotePictures[normalized] = cleanPhoto
+            }
+            if ((previousPictures[normalized].orEmpty()) != cleanPhoto.orEmpty()) {
+                anyPhotoChanged = true
+            }
+            if (normalizedSelf.isNotEmpty() && normalized == normalizedSelf) {
+                selfRemotePhoto = cleanPhoto.orEmpty()
+            }
+            if (savedNames.isNotEmpty() && normalized !in savedNames) {
+                continue
+            }
+            val address = core.interpretUrl("sip:$number@$sipDomain", false)
+                ?: Factory.instance().createAddress("sip:$number@$sipDomain")
+                ?: continue
+            val refKey = "mobion:$number"
+            val friend = existing[refKey] ?: core.createFriend()
+            val oldPhoto = friend.photo?.trim().orEmpty()
+            val newPhoto = cleanPhoto.orEmpty()
+            if (oldPhoto != newPhoto) {
+                anyPhotoChanged = true
+            }
+
+            val savedName = savedNames[normalized]?.takeIf {
+                !PhoneContactNumbers.isNumericPlaceholder(it, number)
+            }
+            val apiName = contact.name.takeIf {
+                !PhoneContactNumbers.isNumericPlaceholder(it, number)
+            }
+            val resolvedName = savedName ?: apiName ?: number
+
+            friend.edit()
+            friend.name = resolvedName
+            friend.refKey = refKey
+            friend.photo = cleanPhoto
+            for (oldAddress in friend.addresses) {
+                friend.removeAddress(oldAddress)
+            }
+            for (oldNumber in friend.phoneNumbers) {
+                friend.removePhoneNumber(oldNumber)
+            }
+            friend.addAddress(address)
+            friend.addPhoneNumberWithLabel(
+                Factory.instance().createFriendPhoneNumber(number, "Mobile")
+            )
+            friend.isSubscribesEnabled = true
+            friend.done()
+            keep.add(friend)
+        }
+
+        if (remotePictures.isNotEmpty() || contacts.isNotEmpty()) {
+            remoteProfilePicturesByNormalizedNumber = remotePictures
+        }
+
+        if (keep.isNotEmpty()) {
+            list.synchronizeFriendsWith(keep.toTypedArray())
+            list.isSubscriptionsEnabled = true
+            list.updateSubscriptions()
+        }
+
+        // Clear stale friend.photo URLs on any remaining friends whose remote DP was deleted.
+        if (contacts.isNotEmpty()) {
+            for (friendList in core.friendsLists) {
+                for (friend in friendList.friends) {
+                    val normalized = findNormalizedNumber(friend, friend.address)
+                    val remoteUrl = normalized.takeIf { it.isNotEmpty() }?.let { remotePictures[it] }
+                    val currentPhoto = friend.photo?.trim().orEmpty()
+                    if (currentPhoto != remoteUrl.orEmpty()) {
+                        friend.edit()
+                        friend.photo = remoteUrl
+                        friend.done()
+                        anyPhotoChanged = true
+                    }
+                }
+            }
+        }
+
+        val defaultAccount = core.defaultAccount
+        if (defaultAccount != null &&
+            core.accountList.any { it == defaultAccount } &&
+            selfRemotePhoto != null
+        ) {
+            val currentLocalPhoto = defaultAccount.params.pictureUri.orEmpty()
+            val shouldSyncSelfPhoto = currentLocalPhoto != selfRemotePhoto
+            if (shouldSyncSelfPhoto) {
+                val clone = defaultAccount.params.clone()
+                clone.pictureUri = selfRemotePhoto
+                defaultAccount.params = clone
+                val identity = defaultAccount.params.identityAddress?.asStringUriOnly()
+                if (!identity.isNullOrEmpty()) {
+                    core.config.setString("saved_profile_$identity", "picture_uri", selfRemotePhoto)
+                }
+                anyPhotoChanged = true
+            }
+        }
+
+        if (anyPhotoChanged || forceRefresh) {
+            MobionContactsService.bumpAvatarCacheEpoch()
+        }
+        core.config.sync()
+        invalidateCachesAndNotify()
+    }
+
+    private fun refreshNativeSavedNames(force: Boolean = false) {
+        if (!force && nativeSavedNamesLoaded) return
+        if (!PhoneContactNumbers.hasPermission(coreContext.context)) return
+
+        runCatching { PhoneContactNumbers.readSavedNames(coreContext.context) }
+            .onSuccess {
+                nativeSavedNamesByNormalizedNumber = it
+                nativeSavedNamesLoaded = true
+            }
+    }
+
+    private fun extractCleanUsername(address: Address): String =
+        address.username.orEmpty()
+            .replace(Regex("^(T_|tac_|tvc_)", RegexOption.IGNORE_CASE), "")
+            .trim()
+
+    @WorkerThread
+    fun findSavedNativeName(address: Address): String? {
+        val cleanUsername = extractCleanUsername(address)
+        val normalized = PhoneContactNumbers.normalize(cleanUsername)
+        if (normalized.isEmpty()) return null
+
+        refreshNativeSavedNames(force = false)
+        val candidate = nativeSavedNamesByNormalizedNumber[normalized]?.trim().orEmpty()
+        return candidate.takeIf {
+            it.isNotEmpty() && !PhoneContactNumbers.isNumericPlaceholder(it, cleanUsername)
+        }
+    }
+
+    private fun enrichFriendWithSavedNativeName(friend: Friend?, address: Address): Friend? {
+        if (friend == null) return null
+        val savedName = findSavedNativeName(address) ?: return friend
+        val cleanUsername = extractCleanUsername(address)
+        if (!PhoneContactNumbers.isNumericPlaceholder(savedName, cleanUsername) && friend.name != savedName) {
+            friend.edit()
+            friend.name = savedName
+            friend.done()
+        }
+        return friend
+    }
+
+    private fun findBestFriendByNormalizedPhone(cleanUsername: String): Friend? {
+        val targetNormalized = PhoneContactNumbers.normalize(cleanUsername)
+        if (targetNormalized.isEmpty()) return null
+
+        var fallback: Friend? = null
+        for (friendList in coreContext.core.friendsLists) {
+            val isNativeList = friendList.displayName != "Mobion contacts"
+            for (candidate in friendList.friends) {
+                val numberMatch = candidate.phoneNumbers.any {
+                    PhoneContactNumbers.normalize(it) == targetNormalized
+                } || candidate.addresses.any {
+                    PhoneContactNumbers.normalize(it.username.orEmpty()) == targetNormalized
+                }
+                if (!numberMatch) continue
+
+                val hasMeaningfulName = !PhoneContactNumbers.isNumericPlaceholder(
+                    candidate.name,
+                    cleanUsername
+                )
+                if (isNativeList && hasMeaningfulName) return candidate
+                if (fallback == null ||
+                    (hasMeaningfulName && PhoneContactNumbers.isNumericPlaceholder(fallback.name, cleanUsername))
+                ) {
+                    fallback = candidate
+                }
+            }
+        }
+        return fallback
     }
 
     @WorkerThread
@@ -539,26 +893,42 @@ class ContactsManager
     }
 
     @WorkerThread
+    private fun findFriendMatchingAddress(address: Address): Friend? {
+        coreContext.core.findFriend(address)?.let { return it }
+        if (address.port > 0) {
+            val portless = address.clone()
+            portless.port = 0
+            coreContext.core.findFriend(portless)?.let { return it }
+        }
+        return null
+    }
+
+    @WorkerThread
     fun findContactByAddress(address: Address): Friend? {
         Log.i("$TAG Looking for friend matching SIP address [${address.asStringUriOnly()}]")
-        val found = coreContext.core.findFriend(address)
+        val rawUsername = address.username.orEmpty()
+        val cleanUsername = extractCleanUsername(address)
+
+        val found = findFriendMatchingAddress(address)
         if (found != null) {
             Log.i("$TAG Found friend [${found.name}] matching SIP address [${address.asStringUriOnly()}]")
-            return found
+            if (!PhoneContactNumbers.isNumericPlaceholder(found.name, cleanUsername)) {
+                return enrichFriendWithSavedNativeName(found, address)
+            }
+            val betterMatch = findBestFriendByNormalizedPhone(cleanUsername)
+            if (betterMatch != null && !PhoneContactNumbers.isNumericPlaceholder(betterMatch.name, cleanUsername)) {
+                return enrichFriendWithSavedNativeName(betterMatch, address)
+            }
+            return enrichFriendWithSavedNativeName(found, address)
         }
-
-        val rawUsername = address.username.orEmpty()
-        val cleanUsername = rawUsername
-            .replace(Regex("^(T_|tac_|tvc_)", RegexOption.IGNORE_CASE), "")
-            .trim()
 
         if (cleanUsername != rawUsername) {
             val clone = address.clone()
             clone.username = cleanUsername
-            val foundClean = coreContext.core.findFriend(clone)
+            val foundClean = findFriendMatchingAddress(clone)
             if (foundClean != null) {
                 Log.i("$TAG Found friend [${foundClean.name}] matching clean SIP address [${clone.asStringUriOnly()}]")
-                return foundClean
+                return enrichFriendWithSavedNativeName(foundClean, address)
             }
         }
 
@@ -586,23 +956,94 @@ class ContactsManager
             )
         }
 
-        return if (username.isNotEmpty() && (username.startsWith("+") || username.isDigitsOnly())) {
+        if (username.isNotEmpty() && (username.startsWith("+") || username.isDigitsOnly())) {
             Log.i("$TAG Looking for friend using phone number [$username]")
+            val normalized = PhoneContactNumbers.normalize(username)
             val foundUsingPhoneNumber = coreContext.core.findFriendByPhoneNumber(username)
+                ?: normalized.takeIf { it.isNotEmpty() && it != username }
+                    ?.let { coreContext.core.findFriendByPhoneNumber(it) }
+                ?: findBestFriendByNormalizedPhone(username)
             if (foundUsingPhoneNumber != null) {
                 Log.i("$TAG Found friend [${foundUsingPhoneNumber.name}] matching phone number [$username]")
+                return enrichFriendWithSavedNativeName(foundUsingPhoneNumber, address)
             }
-            foundUsingPhoneNumber
-        } else {
-            null
         }
+        return null
     }
 
     @WorkerThread
     fun findDisplayName(address: Address): String {
-        return getContactAvatarModelForAddress(address).friend.name ?: LinphoneUtils.getDisplayName(
-            address
-        )
+        findSavedNativeName(address)?.let { return it }
+        val avatar = getContactAvatarModelForAddress(address)
+        val cleanUser = address.username.orEmpty().trim()
+        val resolved = avatar.friend.name?.takeIf { !PhoneContactNumbers.isNumericPlaceholder(it, cleanUser) }
+            ?: avatar.name.value?.takeIf { !PhoneContactNumbers.isNumericPlaceholder(it, cleanUser) }
+        if (!resolved.isNullOrBlank()) return resolved
+        return LinphoneUtils.getDisplayName(address)
+    }
+
+    private fun findNormalizedNumber(friend: Friend?, address: Address?): String {
+        if (address != null) {
+            val fromAddress = PhoneContactNumbers.normalize(extractCleanUsername(address))
+            if (fromAddress.isNotEmpty()) return fromAddress
+        }
+        friend?.addresses?.forEach { candidate ->
+            val normalized = PhoneContactNumbers.normalize(extractCleanUsername(candidate))
+            if (normalized.isNotEmpty()) return normalized
+        }
+        friend?.phoneNumbers?.forEach { rawNumber ->
+            val normalized = PhoneContactNumbers.normalize(rawNumber)
+            if (normalized.isNotEmpty()) return normalized
+        }
+        return ""
+    }
+
+    private fun resolveAvatarName(
+        friend: Friend?,
+        address: Address?,
+        fallbackName: String = ""
+    ): String {
+        if (address != null) {
+            findSavedNativeName(address)?.let { return it }
+        } else {
+            val savedByFriend = findNormalizedNumber(friend, null).takeIf { it.isNotEmpty() }?.let { normalized ->
+                nativeSavedNamesByNormalizedNumber[normalized]
+                    ?.takeIf { !PhoneContactNumbers.isNumericPlaceholder(it, normalized) }
+            }
+            if (savedByFriend != null) return savedByFriend
+        }
+        val cleanUsername = address?.let { extractCleanUsername(it) }.orEmpty()
+        val friendName = friend?.name?.trim().orEmpty()
+        if (friendName.isNotEmpty() && !PhoneContactNumbers.isNumericPlaceholder(friendName, cleanUsername)) {
+            return friendName
+        }
+        if (address != null) {
+            return LinphoneUtils.getDisplayName(address)
+        }
+        return friendName.ifEmpty { fallbackName }
+    }
+
+    private fun resolveAvatarPhoto(friend: Friend?, address: Address?): String {
+        val normalized = findNormalizedNumber(friend, address)
+        if (address != null && coreContext.isAddressMyself(address)) {
+            val remoteSelf = normalized.takeIf { it.isNotEmpty() }?.let { remoteProfilePicturesByNormalizedNumber[it] }
+                ?.trim()?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+            if (remoteSelf != null) return remoteSelf
+            val selfAccountPhoto = LinphoneUtils.getAccountForAddress(address)?.params?.pictureUri
+                ?.trim()?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+            if (!selfAccountPhoto.isNullOrEmpty()) return selfAccountPhoto
+        }
+        if (normalized.isNotEmpty()) {
+            val remote = remoteProfilePicturesByNormalizedNumber[normalized]
+                ?.trim()?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+            if (remote != null) return remote
+        }
+        val explicitFriendPhoto = friend?.photo?.trim()
+            ?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+        if (explicitFriendPhoto != null) return explicitFriendPhoto
+
+        // Never fall back to native Android phone-book photos.
+        return ""
     }
 
     @WorkerThread
@@ -615,6 +1056,7 @@ class ContactsManager
 
         val clone = address.clone()
         clone.clean()
+        if (clone.port > 0) clone.port = 0
         val key = clone.asStringUriOnly()
 
         val foundInMap = getAvatarModelFromCache(key)
@@ -630,9 +1072,20 @@ class ContactsManager
             Log.d("$TAG [$key] SIP URI matches one of the local account")
             val fakeFriend = coreContext.core.createFriend()
             fakeFriend.address = clone
-            fakeFriend.name = LinphoneUtils.getDisplayName(localAccount.params.identityAddress)
+            val resolvedSelfName = resolveAvatarName(fakeFriend, clone).ifEmpty {
+                LinphoneUtils.getDisplayName(localAccount.params.identityAddress)
+            }
+            fakeFriend.name = resolvedSelfName
             fakeFriend.photo = localAccount.params.pictureUri
-            val model = ContactAvatarModel(fakeFriend)
+                ?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                ?: remoteProfilePicturesByNormalizedNumber[
+                    PhoneContactNumbers.normalize(extractCleanUsername(clone))
+                ]
+            val model = ContactAvatarModel(fakeFriend, clone)
+            model.applyResolvedProfile(
+                fakeFriend.name.orEmpty(),
+                fakeFriend.photo.orEmpty()
+            )
             model.trust.postValue(SecurityLevel.EndToEndEncryptedAndVerified)
             unknownContactsAvatarsMap[key] = model
             model
@@ -641,15 +1094,26 @@ class ContactsManager
             val friend = findContactByAddress(clone)
             if (friend != null) {
                 Log.d("$TAG Matching friend [${friend.name}] found for SIP URI [$key]")
-                val model = ContactAvatarModel(friend, address)
+                val model = ContactAvatarModel(friend, clone)
+                model.applyResolvedProfile(
+                    resolveAvatarName(friend, clone),
+                    resolveAvatarPhoto(friend, clone)
+                )
                 knownContactsAvatarsMap[key] = model
                 model
             } else {
                 Log.d("$TAG No matching friend found for SIP URI [$key]...")
                 val fakeFriend = coreContext.core.createFriend()
-                fakeFriend.name = LinphoneUtils.getDisplayName(address)
+                fakeFriend.name = findSavedNativeName(clone) ?: LinphoneUtils.getDisplayName(clone)
+                fakeFriend.photo = remoteProfilePicturesByNormalizedNumber[
+                    PhoneContactNumbers.normalize(extractCleanUsername(clone))
+                ]
                 fakeFriend.address = clone
-                val model = ContactAvatarModel(fakeFriend)
+                val model = ContactAvatarModel(fakeFriend, clone)
+                model.applyResolvedProfile(
+                    fakeFriend.name.orEmpty(),
+                    resolveAvatarPhoto(null, clone)
+                )
                 unknownContactsAvatarsMap[key] = model
                 model
             }
@@ -667,6 +1131,10 @@ class ContactsManager
         }
 
         val avatar = ContactAvatarModel(friend)
+        avatar.applyResolvedProfile(
+            resolveAvatarName(friend, avatar.address),
+            resolveAvatarPhoto(friend, avatar.address)
+        )
         return avatar
     }
 
@@ -709,6 +1177,9 @@ class ContactsManager
         loadContactsOnlyFromDefaultDirectory = corePreferences.fetchContactsFromDefaultDirectory
 
         core.addListener(coreListener)
+        coreContext.postOnMainThread {
+            MobionContactsService.contactsRefreshRequested.observeForever(mobionRefreshObserver)
+        }
         for (list in core.friendsLists) {
             Log.i("$TAG Found existing friend list [${list.displayName}]")
             list.addListener(friendListListener)
@@ -739,6 +1210,9 @@ class ContactsManager
     @WorkerThread
     fun onCoreStopped(core: Core) {
         Log.w("$TAG Core has been stopped")
+        coreContext.postOnMainThread {
+            MobionContactsService.contactsRefreshRequested.removeObserver(mobionRefreshObserver)
+        }
         coroutineScope.cancel()
 
         knownContactsAvatarsMap.clear()
@@ -827,16 +1301,9 @@ class ContactsManager
 
 @WorkerThread
 fun Friend.getAvatarBitmap(round: Boolean = false): Bitmap? {
-    try {
-        return ImageUtils.getBitmap(
-            coreContext.context,
-            photo ?: getNativeContactPictureUri()?.toString(),
-            round
-        )
-    } catch (_: NumberFormatException) {
-        // Expected for contacts created by Linphone
-    }
-    return null
+    val cleanPhoto = photo?.trim()?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+        ?: return null
+    return ImageUtils.getBitmap(coreContext.context, cleanPhoto, round)
 }
 
 @WorkerThread

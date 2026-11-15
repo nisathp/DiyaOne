@@ -74,6 +74,21 @@
             app:layout_constraintEnd_toEndOf="@id/image"
             app:tint="@color/bc_white" />
 
+        <ImageView
+            android:id="@+id/cancel_transfer"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:onClick="@{() -> model.cancelTransfer()}"
+            android:padding="6dp"
+            android:background="@drawable/shape_squircle_file_background_5dp"
+            android:contentDescription="@string/dialog_cancel"
+            android:src="@drawable/cancel_transfer"
+            android:visibility="@{model.canCancelTransfer ? View.VISIBLE : View.GONE}"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toEndOf="parent" />
+
     </androidx.constraintlayout.widget.ConstraintLayout>
 
 </layout>

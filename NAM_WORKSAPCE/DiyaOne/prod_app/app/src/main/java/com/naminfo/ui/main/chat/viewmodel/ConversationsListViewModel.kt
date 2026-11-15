@@ -93,13 +93,16 @@ class ConversationsListViewModel
         @WorkerThread
         override fun onMessageSent(core: Core, chatRoom: ChatRoom, message: ChatMessage) {
             val id = LinphoneUtils.getConversationId(chatRoom)
+            val peerKey = getOneToOnePeerKey(chatRoom)
             val found = conversations.value.orEmpty().find {
-                it.conversationModel?.id == id
+                it.conversationModel?.id == id ||
+                    (peerKey != null && it.conversationModel?.chatRoom?.let(::getOneToOnePeerKey) == peerKey)
             }
             if (found == null) {
                 Log.i("$TAG Message sent for a conversation not yet in the list (probably was empty), adding it")
-                addChatRoom(chatRoom)
+                addChatRoom(chatRoom, force = true)
             } else {
+                found.conversationModel?.refreshFromSiblingRooms()
                 Log.i("$TAG Message sent for an existing conversation, re-order them")
                 reorderChatRooms()
             }
@@ -118,16 +121,29 @@ class ConversationsListViewModel
 
             if (visibleMessages.isEmpty()) return
             val id = LinphoneUtils.getConversationId(chatRoom)
+            val peerKey = getOneToOnePeerKey(chatRoom)
             val found = conversations.value.orEmpty().find {
-                it.conversationModel?.id == id
+                it.conversationModel?.id == id ||
+                    (peerKey != null && it.conversationModel?.chatRoom?.let(::getOneToOnePeerKey) == peerKey)
             }
             if (found == null) {
                 Log.i("$TAG Message(s) received for a conversation not yet in the list (probably was empty), adding it")
-                addChatRoom(chatRoom)
+                addChatRoom(chatRoom, force = true)
             } else {
+                found.conversationModel?.refreshFromSiblingRooms()
                 Log.i("$TAG Message(s) received for an existing conversation, re-order them")
                 reorderChatRooms()
             }
+        }
+
+        @WorkerThread
+        override fun onChatRoomRead(core: Core, chatRoom: ChatRoom) {
+            val id = LinphoneUtils.getConversationId(chatRoom)
+            val peerKey = getOneToOnePeerKey(chatRoom)
+            conversations.value.orEmpty().find {
+                it.conversationModel?.id == id ||
+                    (peerKey != null && it.conversationModel?.chatRoom?.let(::getOneToOnePeerKey) == peerKey)
+            }?.conversationModel?.updateUnreadCount()
         }
     }
 
@@ -151,6 +167,7 @@ class ConversationsListViewModel
         fetchInProgress.value = true
 
         coreContext.postOnCoreThread { core ->
+            coreContext.contactsManager.syncMobionDirectoryAsync()
             coreContext.contactsManager.addListener(contactsListener)
             core.addListener(coreListener)
 
@@ -196,8 +213,13 @@ class ConversationsListViewModel
         // underlying chat room (for example after an offline delivery is replayed).
         // Keep the newest room in the UI, otherwise the user sees duplicate rows for
         // the same person and the same last message.
+        val hideEmptyChatRooms = coreContext.core.config.getBool("misc", "hide_empty_chat_rooms", true)
         val displayedOneToOnePeers = mutableSetOf<String>()
         for (chatRoom in chatRooms.orEmpty().sortedByDescending { it.lastUpdateTime }) {
+            if (hideEmptyChatRooms && !LinphoneUtils.isChatRoomAGroup(chatRoom) && !LinphoneUtils.hasVisibleOrRecentMessages(chatRoom)) {
+                Log.w("$TAG Skipping control-only or never-used conversation for peer [${chatRoom.peerAddress.asStringUriOnly()}]")
+                continue
+            }
             val peerKey = getOneToOnePeerKey(chatRoom)
             if (peerKey != null && !displayedOneToOnePeers.add(peerKey)) {
                 Log.w("$TAG Skipping duplicate one-to-one conversation for peer [$peerKey]")
@@ -212,7 +234,7 @@ class ConversationsListViewModel
     }
 
     @WorkerThread
-    private fun addChatRoom(chatRoom: ChatRoom) {
+    private fun addChatRoom(chatRoom: ChatRoom, force: Boolean = false) {
         val identifier = chatRoom.identifier
         val chatRoomAccount = chatRoom.account
         val defaultAccount = LinphoneUtils.getDefaultAccount()
@@ -233,8 +255,8 @@ class ConversationsListViewModel
 
         val hideEmptyChatRooms = coreContext.core.config.getBool("misc", "hide_empty_chat_rooms", true)
         // Hide empty chat rooms only applies to 1-1 conversations
-        if (hideEmptyChatRooms && !LinphoneUtils.isChatRoomAGroup(chatRoom) && chatRoom.lastMessageInHistory == null) {
-            Log.w("$TAG Chat room with identifier [$identifier] is empty, not adding it to match Core setting")
+        if (!force && hideEmptyChatRooms && !LinphoneUtils.isChatRoomAGroup(chatRoom) && !LinphoneUtils.hasVisibleOrRecentMessages(chatRoom)) {
+            Log.w("$TAG Chat room with identifier [$identifier] has no visible messages, not adding it to match Core setting")
             return
         }
 
@@ -248,7 +270,9 @@ class ConversationsListViewModel
             }
         }
         if (found != null) {
-            Log.w("$TAG Created chat room with identifier [$identifier] is already represented in the list, skipping")
+            Log.w("$TAG Created chat room with identifier [$identifier] is already represented in the list, refreshing existing row")
+            found.conversationModel?.refreshFromSiblingRooms()
+            reorderChatRooms()
             return
         }
 
@@ -314,14 +338,22 @@ class ConversationsListViewModel
      * those room variants. Group rooms must remain separate and therefore return null.
      */
     @WorkerThread
-    private fun getOneToOnePeerKey(chatRoom: ChatRoom): String? {
-        if (!chatRoom.hasCapability(ChatRoom.Capabilities.OneToOne.toInt())) return null
+    private fun getOneToOnePeerKey(chatRoom: ChatRoom): String? =
+        LinphoneUtils.getOneToOnePeerKey(chatRoom)
 
-        val localUsername = chatRoom.localAddress.username
-            ?: chatRoom.account?.params?.identityAddress?.username
-            ?: return null
-        val peerUsername = chatRoom.peerAddress.username ?: return null
-        return "${localUsername.lowercase()}::${peerUsername.lowercase()}"
+    @UiThread
+    fun refreshConversationForChatRoom(room: ChatRoom?) {
+        room ?: return
+        coreContext.postOnCoreThread {
+            val id = LinphoneUtils.getConversationId(room)
+            val peerKey = getOneToOnePeerKey(room)
+            conversations.value.orEmpty().find { wrapper ->
+                val model = wrapper.conversationModel ?: return@find false
+                model.chatRoom == room ||
+                    model.id == id ||
+                    (peerKey != null && getOneToOnePeerKey(model.chatRoom) == peerKey)
+            }?.conversationModel?.refreshFromSiblingRooms()
+        }
     }
 
     @WorkerThread

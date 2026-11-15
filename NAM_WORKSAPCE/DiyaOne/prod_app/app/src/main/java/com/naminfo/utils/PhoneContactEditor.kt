@@ -28,7 +28,7 @@ class PhoneContactEditor(private val fragment: Fragment) {
         ) {
             // Some contact editors return RESULT_CANCELED even after saving.
             // Reload actual provider data instead of assuming a result means saved.
-            coreContext.contactsManager.loadContacts(activity)
+            coreContext.contactsManager.loadContacts(activity, forceReload = true)
         }
     }
 

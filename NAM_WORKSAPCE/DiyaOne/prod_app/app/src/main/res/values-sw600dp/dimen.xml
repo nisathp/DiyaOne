@@ -9,4 +9,5 @@
     <integer name="media_columns">8</integer>
 
     <dimen name="chat_bubble_big_image_max_size">350dp</dimen>
+    <dimen name="chat_bubble_compact_media_size">220dp</dimen>
 </resources>

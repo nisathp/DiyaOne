@@ -8,6 +8,7 @@ import androidx.core.view.doOnPreDraw
 import androidx.databinding.DataBindingUtil
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.findViewTreeLifecycleOwner
+import androidx.recyclerview.widget.DefaultItemAnimator
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
@@ -42,6 +43,53 @@ class ConversationEventAdapter :
 
     val showDeliveryForChatMessageModelEvent: MutableLiveData<Event<MessageModel>> by lazy {
         MutableLiveData()
+    }
+
+    override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
+        super.onAttachedToRecyclerView(recyclerView)
+        recyclerView.itemAnimator = object : DefaultItemAnimator() {
+            init {
+                supportsChangeAnimations = false
+            }
+
+            override fun canReuseUpdatedViewHolder(
+                viewHolder: RecyclerView.ViewHolder,
+                payloads: MutableList<Any>
+            ): Boolean {
+                // Swap only swiped holders so ItemTouchHelper detaches the shifted view
+                // immediately instead of leaving its recover translation and reply icon stuck.
+                return viewHolder.itemView.translationX == 0f
+            }
+
+            override fun animateChange(
+                oldHolder: RecyclerView.ViewHolder,
+                newHolder: RecyclerView.ViewHolder,
+                fromLeft: Int,
+                fromTop: Int,
+                toLeft: Int,
+                toTop: Int
+            ): Boolean {
+                oldHolder.itemView.translationX = 0f
+                oldHolder.itemView.translationY = 0f
+                oldHolder.itemView.alpha = 1f
+                if (oldHolder !== newHolder) {
+                    newHolder.itemView.translationX = 0f
+                    newHolder.itemView.translationY = 0f
+                    newHolder.itemView.alpha = 1f
+                    dispatchChangeFinished(oldHolder, true)
+                    dispatchChangeFinished(newHolder, false)
+                    return false
+                }
+                return super.animateChange(oldHolder, newHolder, fromLeft, fromTop, toLeft, toTop)
+            }
+        }
+    }
+
+    override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
+        super.onViewRecycled(holder)
+        holder.itemView.translationX = 0f
+        holder.itemView.translationY = 0f
+        holder.itemView.alpha = 1f
     }
 
     val showReactionForChatMessageModelEvent: MutableLiveData<Event<MessageModel>> by lazy {
@@ -224,7 +272,7 @@ class ConversationEventAdapter :
         }
     }
 
-    private class EventLogDiffCallback : DiffUtil.ItemCallback<EventLogModel>() {
+    internal class EventLogDiffCallback : DiffUtil.ItemCallback<EventLogModel>() {
         override fun areItemsTheSame(oldItem: EventLogModel, newItem: EventLogModel): Boolean {
             return if (!oldItem.isEvent && !newItem.isEvent) {
                 val oldData = (oldItem.model as MessageModel)
@@ -241,11 +289,14 @@ class ConversationEventAdapter :
             return if (!oldItem.isEvent && !newItem.isEvent) {
                 val oldModel = (oldItem.model as MessageModel)
                 val newModel = (newItem.model as MessageModel)
-                newModel.isRead &&
+                // Recomputing history destroys old MessageModel instances; rebind whenever the instance changes
+                // so clicks, highlights, and transfer progress never target a torn-down model.
+                oldModel === newModel &&
+                    newModel.isRead &&
                     oldModel.groupedWithNextMessage.value == newModel.groupedWithNextMessage.value &&
                     oldModel.groupedWithPreviousMessage.value == newModel.groupedWithPreviousMessage.value
             } else {
-                true
+                oldItem.model === newItem.model
             }
         }
     }

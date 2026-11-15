@@ -22,6 +22,7 @@ import com.google.android.material.color.DynamicColors
 import com.naminfo.compatibility.Compatibility
 import com.naminfo.core.CoreContext
 import com.naminfo.core.CorePreferences
+import com.naminfo.core.MobionTlsCompatibility
 import org.linphone.core.Factory
 import org.linphone.core.LogCollectionState
 import org.linphone.core.LogLevel
@@ -59,6 +60,11 @@ class DiyaOneApplication : Application(), SingletonImageLoader.Factory {
 
         corePreferences = CorePreferences(context)
         corePreferences.copyAssetsFromPackage()
+
+        // Android 10 doesn't contain Sectigo's R46 root used by mobionglobal.com.
+        // Add only Mobion's shipped intermediate as an additional trust anchor;
+        // hostname validation and all other platform TLS checks remain enabled.
+        MobionTlsCompatibility.install(context)
 
         val config = Factory.instance().createConfigWithFactory(
             corePreferences.configPath,

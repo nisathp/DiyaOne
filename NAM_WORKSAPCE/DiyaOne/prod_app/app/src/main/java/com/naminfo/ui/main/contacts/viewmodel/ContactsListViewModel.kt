@@ -17,7 +17,6 @@ import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.contacts.ContactsManager.ContactsListener
 import com.naminfo.contacts.MobionContactsService
-import com.naminfo.contacts.PhoneContactNumbers
 import org.linphone.core.Friend
 import org.linphone.core.FriendList
 import org.linphone.core.FriendListListenerStub
@@ -41,7 +40,17 @@ class ContactsListViewModel
 
         @JvmStatic
         fun resetMobionSessionCache() {
-            MobionContactsService.clearContactsCache()
+            MobionContactsService.clearContactsCache(clearPersisted = true)
+            coreContext.postOnCoreThread { core ->
+                core.getFriendListByName(MOBION_FRIEND_LIST)?.let { friendList ->
+                    // This is app-created API directory data, not the phone address book.
+                    // Remove it at sign-out so another account cannot see stale contacts.
+                    core.removeFriendList(friendList)
+                    core.config.sync()
+                    coreContext.contactsManager.notifyContactsListChanged()
+                    Log.i("$TAG Cleared persisted Mobion friend list for sign-out")
+                }
+            }
         }
     }
 
@@ -313,103 +322,8 @@ class ContactsListViewModel
     }
 
     private fun refreshMobionContacts(forceRefresh: Boolean = false) {
-        viewModelScope.launch {
-            try {
-                val (contacts, nativePhoneNumbers) = withContext(Dispatchers.IO) {
-                    val phoneNumbers = if (PhoneContactNumbers.hasPermission(coreContext.context)) {
-                        PhoneContactNumbers.read(coreContext.context)
-                    } else {
-                        emptySet()
-                    }
-                    MobionContactsService.fetchContacts(forceRefresh) to phoneNumbers
-                }
-                val matchedContacts = contacts.filter { it.mobileNumber in nativePhoneNumbers }
-                Log.i("$TAG Fetched [${contacts.size}] contacts from Mobion, phonebook matches=[${matchedContacts.size}]")
-
-                if (matchedContacts.isEmpty()) {
-                    Log.w(
-                        "$TAG Mobion returned an empty dataset; keeping the existing cached contacts"
-                    )
-                    return@launch
-                }
-
-                coreContext.postOnCoreThread { core ->
-                    val friendList = core.getFriendListByName(MOBION_FRIEND_LIST)
-                        ?: core.createFriendList().also { list ->
-                            list.displayName = MOBION_FRIEND_LIST
-                            list.isDatabaseStorageEnabled = true
-                            list.type = FriendList.Type.Default
-                            core.addFriendList(list)
-                        }
-                    friendList.isSubscriptionsEnabled = true
-
-                    val sipDomain = core.defaultAccount?.params?.identityAddress?.domain
-                        ?: corePreferences.defaultDomain
-
-                    Log.i(
-                        "$TAG PRESENCE ACCOUNT: " +
-                                "identity=[${core.defaultAccount?.params?.identityAddress?.asStringUriOnly()}], " +
-                                "domain=[$sipDomain]"
-                    )
-
-                    val friends = matchedContacts.mapNotNull { contact ->
-                        val address = core.interpretUrl(
-                            "sip:${contact.mobileNumber}@$sipDomain",
-                            false
-                        ) ?: return@mapNotNull null
-
-                        core.createFriend().apply {
-                            name = contact.name
-                            refKey = "mobion:${contact.mobileNumber}"
-                            isSubscribesEnabled = true
-                            // A null URL is meaningful after a remote delete; clear any old
-                            // local Friend photo instead of keeping a stale image.
-                            photo = contact.profilePictureUrl
-                            addAddress(address)
-                            addPhoneNumberWithLabel(
-                                Factory.instance().createFriendPhoneNumber(
-                                    contact.mobileNumber,
-                                    "Mobile"
-                                )
-                            )
-                        }
-                    }.toTypedArray()
-
-                    friendList.synchronizeFriendsWith(friends)
-                    Log.i(
-                        "$TAG PRESENCE: Mobion FriendList " +
-                                "friends=${friendList.friends.size}, " +
-                                "subscriptionsEnabled=${friendList.isSubscriptionsEnabled}"
-                    )
-
-                    for (friend in friendList.friends) {
-
-                        friend.isSubscribesEnabled = true
-
-                        Log.i(
-                            "$TAG PRESENCE: friend=[${friend.name}] " +
-                                    "refKey=[${friend.refKey}] " +
-                                    "address=[${friend.address?.asStringUriOnly()}] " +
-                                    "subscribe=[${friend.isSubscribesEnabled}] " +
-                                    "presence=[${friend.consolidatedPresence}]"
-                        )
-                    }
-
-                    Log.i("$TAG PRESENCE: calling Mobion updateSubscriptions()")
-
-                    friendList.updateSubscriptions()
-                    core.config.sync()
-                    coreContext.contactsManager.notifyContactsListChanged()
-
-                    // The first search is started before the remote contacts request completes.
-                    // ContactsManager notifications can be coalesced during startup, so make sure
-                    // this ViewModel also invalidates its own search and publishes the new list.
-                    refreshSearchResults()
-                }
-
-            } catch (exception: Exception) {
-                Log.e("$TAG Failed to fetch Mobion contacts: $exception")
-            }
+        coreContext.contactsManager.syncMobionDirectoryAsync(forceRefresh) {
+            refreshSearchResults()
         }
     }
 
@@ -442,12 +356,23 @@ class ContactsListViewModel
 
     private fun refreshConferenceContacts() {
         viewModelScope.launch {
-            val registeredNumber = coreContext.core.defaultAccount
-                ?.params
-                ?.identityAddress
-                ?.username
-                ?.filter(Char::isDigit)
-                .orEmpty()
+            val deferredNumber = kotlinx.coroutines.CompletableDeferred<String>()
+            coreContext.postOnCoreThread { core ->
+                val digits = if (coreContext.isReady()) {
+                    core.defaultAccount
+                        ?.params
+                        ?.identityAddress
+                        ?.username
+                        ?.filter(Char::isDigit)
+                        .orEmpty()
+                } else {
+                    ""
+                }
+                deferredNumber.complete(digits)
+            }
+            val registeredNumber = kotlinx.coroutines.withTimeoutOrNull(3_000L) {
+                deferredNumber.await()
+            }.orEmpty()
             if (registeredNumber.isEmpty()) {
                 Log.w("$TAG No registered number available, skipping Conference contacts")
                 return@launch

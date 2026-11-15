@@ -132,12 +132,12 @@ class CallLogModel
         } else if (wasConference) {
             callLog.conferenceInfo?.subject.orEmpty()
         } else {
-            coreContext.contactsManager.findContactByAddress(address)
-                ?.name
-                .orEmpty()
+            coreContext.contactsManager.findDisplayName(address)
                 .trim()
                 .takeUnless {
-                    it == displayedAddress || it == sipUri
+                    it == displayedAddress ||
+                        it == sipUri ||
+                        com.naminfo.contacts.PhoneContactNumbers.isNumericPlaceholder(it, displayedAddress)
                 }
                 .orEmpty()
         }

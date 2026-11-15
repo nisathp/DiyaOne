@@ -2,6 +2,8 @@ package com.naminfo.notifications
 
 import com.google.firebase.messaging.RemoteMessage
 import com.naminfo.DiyaOneApplication.Companion.coreContext
+import com.naminfo.core.CustomImdn
+import com.naminfo.core.OfflineInboxRepository
 import org.linphone.core.Call
 import org.linphone.core.tools.Log
 import org.linphone.core.tools.firebase.FirebaseMessaging
@@ -47,6 +49,31 @@ class DiyaOneFirebaseMessagingService : FirebaseMessaging() {
                 } else {
                     Log.w("$TAG Core is not ready yet; pending call wake will be handled when Core starts")
                 }
+            }
+        }
+
+        if (type == "OFFLINE_QUEUE_AVAILABLE") {
+            Log.i("$TAG Received offline-queue wake-up; pulling durable inbox")
+            com.naminfo.DiyaOneApplication.coreContext.postOnCoreThread {
+                OfflineInboxRepository.pullForCurrentAccount()
+            }
+        }
+
+        if (type == "OFFLINE_QUEUE_DELIVERED") {
+            val messageId = data["id"]
+            val recipient = data["recipient"]
+            Log.i("$TAG Received offline queue delivery acknowledgement for id [$messageId]")
+            coreContext.postOnCoreThread {
+                CustomImdn.markDeliveredFromOfflineQueue(messageId, recipient)
+            }
+        }
+
+        if (type == "OFFLINE_QUEUE_REPLAY") {
+            val messageId = data["id"]
+            val recipient = data["recipient"]
+            Log.i("$TAG Received offline queue SIP replay request for id [$messageId]")
+            coreContext.postOnCoreThread {
+                OfflineInboxRepository.replayQueuedOutgoing(messageId, recipient)
             }
         }
 

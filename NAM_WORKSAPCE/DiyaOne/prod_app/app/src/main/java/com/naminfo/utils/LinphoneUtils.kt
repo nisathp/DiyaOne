@@ -13,7 +13,9 @@ import androidx.core.text.toSpannable
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
+import com.naminfo.contacts.PhoneContactNumbers
 import com.naminfo.contacts.getListOfSipAddresses
+import com.naminfo.core.CustomImdn
 import org.linphone.core.Account
 import org.linphone.core.Address
 import org.linphone.core.AudioDevice
@@ -34,6 +36,7 @@ import org.linphone.core.MediaDirection
 import org.linphone.core.Reason
 import org.linphone.core.tools.Log
 import com.naminfo.ui.main.contacts.model.ContactAvatarModel
+import com.naminfo.ui.main.chat.decodeForwardEnvelope
 import com.naminfo.ui.main.chat.decodeReplyPreviewEnvelope
 import com.naminfo.ui.main.chat.resolveComposingNames
 import com.naminfo.ui.main.model.isEndToEndEncryptionMandatory
@@ -118,7 +121,7 @@ class LinphoneUtils {
             return core.chatRooms.firstOrNull { room ->
                 room.account == account &&
                     room.hasCapability(ChatRoom.Capabilities.Basic.toInt()) &&
-                    room.hasCapability(ChatRoom.Capabilities.OneToOne.toInt()) &&
+                    !isChatRoomAGroup(room) &&
                     localAddress?.let { basicChatAddressesMatch(it, room.localAddress) } == true &&
                     room.peerAddress.username == username &&
                     room.peerAddress.domain.orEmpty().trim().trimEnd('.').lowercase() in accountDomains
@@ -182,19 +185,25 @@ class LinphoneUtils {
         fun getDisplayName(address: Address?): String {
             if (address == null) return "[null]"
 
+            val cleanUsername = address.username.orEmpty().trim()
             val displayName = address.displayName
-            if (displayName.isNullOrEmpty()) {
-                val account = coreContext.core.accountList.find { account ->
-                    account.params.identityAddress?.asStringUriOnly() == address.asStringUriOnly()
-                }
-                val localDisplayName = account?.params?.identityAddress?.displayName
-                // Do not return an empty local display name
-                if (!localDisplayName.isNullOrEmpty()) {
-                    return localDisplayName
-                }
+            if (!displayName.isNullOrEmpty() && !com.naminfo.contacts.PhoneContactNumbers.isNumericPlaceholder(displayName, cleanUsername)) {
+                return displayName
             }
 
-            // Do not return an empty display name
+            val account = coreContext.core.accountList.find { account ->
+                account.params.identityAddress?.asStringUriOnly() == address.asStringUriOnly()
+            }
+            val localDisplayName = account?.params?.identityAddress?.displayName
+            if (!localDisplayName.isNullOrEmpty() && !com.naminfo.contacts.PhoneContactNumbers.isNumericPlaceholder(localDisplayName, cleanUsername)) {
+                return localDisplayName
+            }
+
+            val savedNativeName = coreContext.contactsManager.findSavedNativeName(address)
+            if (!savedNativeName.isNullOrEmpty()) {
+                return savedNativeName
+            }
+
             return if (displayName.isNullOrEmpty()) {
                 address.username ?: address.asString()
             } else {
@@ -549,13 +558,13 @@ class LinphoneUtils {
         @DrawableRes
         fun getChatIconResId(chatState: ChatMessage.State): Int {
             return when (chatState) {
-                ChatMessage.State.Displayed, ChatMessage.State.FileTransferDone -> {
+                ChatMessage.State.Displayed -> {
                     R.drawable.checks
                 }
                 ChatMessage.State.DeliveredToUser -> {
                     R.drawable.check
                 }
-                ChatMessage.State.Delivered -> {
+                ChatMessage.State.Delivered, ChatMessage.State.FileTransferDone -> {
                     R.drawable.envelope_simple
                 }
                 ChatMessage.State.NotDelivered, ChatMessage.State.FileTransferError -> {
@@ -636,9 +645,24 @@ class LinphoneUtils {
         @WorkerThread
         fun getConversationId(chatRoom: ChatRoom): String {
             if (chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())) {
-                return "${chatRoom.peerAddress.asStringUriOnly()}##${chatRoom.localAddress.asStringUriOnly()}"
+                // FreeSWITCH and the SDK can expose the same Basic SIP peer both with
+                // and without the default :5060 port.  A persisted conversation ID must
+                // not depend on that transport detail, otherwise opening a chat can look
+                // for a different native room and create duplicates.
+                return "${basicChatConversationAddress(chatRoom.peerAddress)}##" +
+                    basicChatConversationAddress(chatRoom.localAddress)
             }
             return chatRoom.identifier ?: ""
+        }
+
+        /** Only SIP's default port is equivalent to a port-less Basic chat URI. */
+        @WorkerThread
+        private fun basicChatConversationAddress(address: Address): String {
+            return if (address.port == 5060) {
+                getAddressAsCleanStringUriOnly(address)
+            } else {
+                address.asStringUriOnly()
+            }
         }
 
         /**
@@ -685,12 +709,23 @@ class LinphoneUtils {
                             ephemeralLifetime = 0
                         }
                         val canonicalPeer = canonicalizeBasicChatAddress(peer, account)
-                        core.searchChatRoom(
-                            params,
+                        val peerCandidates = listOf(canonicalPeer, peer).distinctBy {
+                            it.asStringUriOnly()
+                        }
+                        val localCandidates = listOfNotNull(
                             local,
-                            null,
-                            arrayOf(canonicalPeer)
-                        )?.let { return it }
+                            account.params.identityAddress
+                        ).distinctBy { it.asStringUriOnly() }
+                        for (localCandidate in localCandidates) {
+                            for (peerCandidate in peerCandidates) {
+                                core.searchChatRoom(
+                                    params,
+                                    localCandidate,
+                                    null,
+                                    arrayOf(peerCandidate)
+                                )?.let { return it }
+                            }
+                        }
                     }
                 }
 
@@ -732,6 +767,142 @@ class LinphoneUtils {
             val oneToOne = chatRoom.hasCapability(ChatRoom.Capabilities.OneToOne.toInt())
             val conference = chatRoom.hasCapability(ChatRoom.Capabilities.Conference.toInt())
             return !oneToOne && conference
+        }
+
+        private fun normalizeOneToOneUserPart(raw: String): String {
+            val trimmed = raw.trim().lowercase()
+            if (trimmed.isEmpty() || trimmed.any(Char::isLetter)) return trimmed
+            val digits = PhoneContactNumbers.normalize(trimmed)
+            return if (digits.length >= 6) digits else trimmed
+        }
+
+        @WorkerThread
+        fun getOneToOnePeerKey(chatRoom: ChatRoom): String? {
+            if (isChatRoomAGroup(chatRoom)) return null
+
+            val localAddress = chatRoom.localAddress
+            val peerAddress = chatRoom.participants.firstOrNull()?.address ?: chatRoom.peerAddress
+            val localRaw = localAddress.username?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+                ?: chatRoom.account?.params?.identityAddress?.username?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+                ?: getAddressAsCleanStringUriOnly(localAddress).lowercase()
+            val peerRaw = peerAddress.username?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+                ?: getAddressAsCleanStringUriOnly(peerAddress).lowercase()
+            val localPart = normalizeOneToOneUserPart(localRaw)
+            val peerPart = normalizeOneToOneUserPart(peerRaw)
+            if (localPart.isBlank() || peerPart.isBlank()) return null
+
+            return "$localPart::$peerPart"
+        }
+
+        @WorkerThread
+        fun findSiblingOneToOneChatRooms(core: Core, chatRoom: ChatRoom): List<ChatRoom> {
+            if (!chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())) {
+                return listOf(chatRoom)
+            }
+            val targetPeerKey = getOneToOnePeerKey(chatRoom) ?: return listOf(chatRoom)
+            val targetAccount = chatRoom.account
+            val siblings = core.chatRooms.filter { candidate ->
+                candidate == chatRoom || (
+                    candidate.hasCapability(ChatRoom.Capabilities.Basic.toInt()) &&
+                        (targetAccount == null || candidate.account == null || candidate.account == targetAccount) &&
+                        getOneToOnePeerKey(candidate) == targetPeerKey
+                    )
+            }
+            return if (chatRoom in siblings) siblings else listOf(chatRoom) + siblings
+        }
+
+        @WorkerThread
+        fun areSameOneToOnePeer(first: ChatRoom, second: ChatRoom): Boolean {
+            if (first == second) return true
+            if (
+                !first.hasCapability(ChatRoom.Capabilities.Basic.toInt()) ||
+                !second.hasCapability(ChatRoom.Capabilities.Basic.toInt())
+            ) {
+                return false
+            }
+            if (first.account != null && second.account != null && first.account != second.account) {
+                return false
+            }
+            val firstKey = getOneToOnePeerKey(first) ?: return false
+            return firstKey == getOneToOnePeerKey(second)
+        }
+
+        @WorkerThread
+        fun isDisplayableChatMessage(message: ChatMessage?): Boolean {
+            if (message == null || CustomImdn.isHiddenControlMessage(message)) return false
+            if (message.isRetracted) return true
+            val directVisibleText = stripMessageEnvelopes(message.utf8Text.orEmpty())
+            if (directVisibleText.isNotBlank() && !isFileTransferMetadata(directVisibleText)) {
+                return true
+            }
+            if (com.naminfo.core.OfflineInboxRepository.queuedMedia(message).isNotEmpty()) return true
+            if (message.contents.any {
+                    it.isIcalendar || it.isVoiceRecording || it.isFile || it.isFileTransfer
+                }
+            ) {
+                return true
+            }
+            val rawText = message.contents.firstOrNull { it.isText }?.utf8Text.orEmpty()
+            val visibleText = stripMessageEnvelopes(rawText)
+            if (visibleText.isNotBlank() && !isFileTransferMetadata(visibleText)) {
+                return true
+            }
+            val replyHeader = com.naminfo.ui.main.chat.decodeReplyPreviewHeader(
+                message.getCustomHeader(com.naminfo.ui.main.chat.DIYA_REPLY_MESSAGE_ID_HEADER)
+                    ?: message.replyMessageId,
+                message.getCustomHeader(com.naminfo.ui.main.chat.DIYA_REPLY_PREVIEW_HEADER)
+            )
+            return replyHeader?.second.orEmpty().isNotBlank()
+        }
+
+        @WorkerThread
+        fun hasVisibleOrRecentMessages(chatRoom: ChatRoom): Boolean {
+            val lastMsg = chatRoom.lastMessageInHistory
+            if (isDisplayableChatMessage(lastMsg)) return true
+            if (chatRoom.unreadHistory.any { isDisplayableChatMessage(it) }) return true
+            val history = chatRoom.getHistoryMessageEvents(0)
+            if (history.asSequence()
+                .mapNotNull { it.chatMessage }
+                .any { isDisplayableChatMessage(it) }
+            ) {
+                return true
+            }
+
+            // A Basic-SIP build can accept a SIP MESSAGE but fail to expose its local history
+            // row after a reload (storage id -1). Such a room still has a last-update time and
+            // is a genuine recent peer chat; a receipt-only room has only hidden control rows.
+            val hasAnyHistory = history.isNotEmpty()
+            return !hasAnyHistory && chatRoom.lastUpdateTime > 0L
+        }
+
+        /**
+         * Returns the chronologically latest non-control chat message across [rooms], ordered by
+         * sender/original timestamp rather than SQLite insertion order so out-of-order SIP replay
+         * or offline queue injection cannot regress conversation previews.
+         */
+        @WorkerThread
+        fun findLatestVisibleMessage(rooms: Iterable<ChatRoom>): ChatMessage? {
+            var best: ChatMessage? = null
+            var bestTimestampMs = Long.MIN_VALUE
+
+            fun consider(candidate: ChatMessage?) {
+                if (candidate == null || !isDisplayableChatMessage(candidate)) return
+                val ts = CustomImdn.timestampMillis(candidate)
+                if (best == null || ts >= bestTimestampMs) {
+                    best = candidate
+                    bestTimestampMs = ts
+                }
+            }
+            for (room in rooms) {
+                for (event in room.getHistoryMessageEvents(0).orEmpty()) {
+                    consider(event.chatMessage)
+                }
+                for (unread in room.unreadHistory.orEmpty()) {
+                    consider(unread)
+                }
+                consider(room.lastMessageInHistory)
+            }
+            return best
         }
 
         @WorkerThread
@@ -794,6 +965,46 @@ class LinphoneUtils {
             return builder.toSpannable()
         }
 
+        private val hftFileNamePattern = Regex("<file-name>\\s*([^<]+?)\\s*</file-name>", RegexOption.IGNORE_CASE)
+        private val jsonFileNamePattern = Regex("\"file(?:name|_name)?\"\\s*:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
+
+        fun isFileTransferMetadata(value: String): Boolean {
+            if (value.isBlank()) return false
+            val lower = value.lowercase()
+            return lower.contains("rcs:fthttp") ||
+                lower.contains("<file") ||
+                lower.contains("<file-name>") ||
+                lower.contains("server response:") ||
+                (lower.contains("{") && (lower.contains("\"url\"") || lower.contains("\"filename\"") || lower.contains("\"file_name\""))) ||
+                (lower.contains("<?xml") && lower.contains("file"))
+        }
+
+        fun extractFileNameFromPayload(value: String): String? {
+            if (value.isBlank()) return null
+            hftFileNamePattern.find(value)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+            jsonFileNamePattern.find(value)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+            return null
+        }
+
+        /**
+         * Strips DiyaOne's internal reply and forward transport envelopes (including nested
+         * combinations) while leaving ordinary user text untouched.
+         */
+        fun stripMessageEnvelopes(messageText: String): String {
+            var current = messageText
+            var strippedAny = false
+            repeat(4) {
+                val trimmed = current.trim()
+                val next = decodeForwardEnvelope(trimmed)
+                    ?: decodeReplyPreviewEnvelope(trimmed)?.second
+                    ?: return if (strippedAny) trimmed else current
+                if (next == current) return trimmed
+                current = next
+                strippedAny = true
+            }
+            return if (strippedAny) current.trim() else current
+        }
+
         @WorkerThread
         fun getPlainTextDescribingMessage(message: ChatMessage): String {
             val pair = getTextDescribingMessage(message)
@@ -814,13 +1025,23 @@ class LinphoneUtils {
 
             // If message contains text, then use that
             var text = message.contents.find { content -> content.isText }?.utf8Text.orEmpty()
-            // DiyaOne's reply fallback envelope is transport metadata. The same description
-            // helper feeds the reply composer and quoted-message bubble, so decode it here
-            // before either UI can display its Base64 payload.
-            text = decodeReplyPreviewEnvelope(text)?.second ?: text
+            // DiyaOne's reply and forward fallback envelopes are transport metadata. The same
+            // description helper feeds the reply composer, conversation list, and quote bubble,
+            // so strip them here before any UI can display internal prefixes or Base64 payloads.
+            text = stripMessageEnvelopes(text)
+            if (isFileTransferMetadata(text)) {
+                text = ""
+            }
             var contentDescription = ""
 
             if (text.isEmpty()) {
+                // HFT messages carry two representations of the same attachment: the
+                // XML/JSON transport payload (text) and the actual file Content.  Once
+                // the latter is available, do not derive a second name from the former
+                // or conversation previews become "image.jpg, image.jpg".
+                val hasNamedNonTextContent = message.contents.any {
+                    !it.isText && it.name.orEmpty().isNotEmpty()
+                }
                 val firstContent = message.contents.firstOrNull()
                 if (firstContent?.isIcalendar == true) {
                     val conferenceInfo = Factory.instance().createConferenceInfoFromIcalendarContent(
@@ -859,11 +1080,27 @@ class LinphoneUtils {
                     contentDescription = "$label ($formattedDuration)"
                 } else {
                     for (content in message.contents) {
+                        if (content.isText && hasNamedNonTextContent) {
+                            continue
+                        }
                         if (text.isNotEmpty()) {
                             text += ", "
                         }
-                        if (!content.name.isNullOrEmpty()) {
-                            text += content.name
+                        var name = content.name.orEmpty()
+                        if (name.isEmpty()) {
+                            val rawPayload = message.contents.find { it.isText }?.utf8Text.orEmpty()
+                            name = extractFileNameFromPayload(rawPayload).orEmpty()
+                        }
+                        if (name.isNotEmpty()) {
+                            text += name
+                        }
+                    }
+                    if (text.isEmpty()) {
+                        val queuedNames = com.naminfo.core.OfflineInboxRepository
+                            .queuedMedia(message)
+                            .mapNotNull { it.name.takeIf { name -> name.isNotBlank() } }
+                        if (queuedNames.isNotEmpty()) {
+                            text = queuedNames.joinToString(", ")
                         }
                     }
                 }

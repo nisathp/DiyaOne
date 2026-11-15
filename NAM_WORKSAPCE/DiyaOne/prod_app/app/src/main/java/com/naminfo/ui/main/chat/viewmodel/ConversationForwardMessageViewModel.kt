@@ -21,24 +21,28 @@ package com.naminfo.ui.main.chat.viewmodel
 
 import androidx.annotation.UiThread
 import androidx.annotation.WorkerThread
+import androidx.lifecycle.MediatorLiveData
 import androidx.lifecycle.MutableLiveData
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
-import com.naminfo.contacts.getListOfSipAddressesAndPhoneNumbers
+import com.naminfo.ui.main.chat.ChatForwardDispatcher
+import com.naminfo.ui.main.chat.SingleFlightGate
+import com.naminfo.ui.main.chat.model.MessageModel
 import com.naminfo.ui.main.contacts.model.ContactAvatarModel
+import com.naminfo.ui.main.model.ConversationContactOrSuggestionModel
+import com.naminfo.ui.main.model.SelectedAddressModel
+import com.naminfo.ui.main.viewmodel.AddressSelectionViewModel
+import com.naminfo.utils.AppUtils
+import com.naminfo.utils.Event
+import com.naminfo.utils.LinphoneUtils
+import java.util.concurrent.ConcurrentHashMap
 import org.linphone.core.Address
 import org.linphone.core.ChatRoom
 import org.linphone.core.ChatRoomListenerStub
 import org.linphone.core.Conference
 import org.linphone.core.Friend
 import org.linphone.core.tools.Log
-import com.naminfo.ui.main.model.ConversationContactOrSuggestionModel
-import com.naminfo.ui.main.chat.SingleFlightGate
-import com.naminfo.ui.main.viewmodel.AddressSelectionViewModel
-import com.naminfo.utils.AppUtils
-import com.naminfo.utils.Event
-import com.naminfo.utils.LinphoneUtils
 
 class ConversationForwardMessageViewModel
     @UiThread
@@ -80,6 +84,35 @@ class ConversationForwardMessageViewModel
         MutableLiveData()
     }
 
+    val singleForwardRoomCompletedEvent: MutableLiveData<Event<ChatRoom>> by lazy {
+        MutableLiveData()
+    }
+
+    val multiForwardCompletedEvent: MutableLiveData<Event<Int>> by lazy {
+        MutableLiveData()
+    }
+
+    val hasSelection = MediatorLiveData<Boolean>().apply {
+        value = false
+        addSource(selection) { selected ->
+            value = !selected.isNullOrEmpty()
+        }
+    }
+
+    private val selectedConversationIds = ConcurrentHashMap<String, String>()
+
+    @Volatile
+    private var capturedPayload: ChatForwardDispatcher.ForwardPayload? = null
+
+    @Volatile
+    private var captureInProgress = false
+
+    @Volatile
+    private var pendingForwardAfterCapture = false
+
+    @Volatile
+    private var capturedSourceMessage: MessageModel? = null
+
     // Core operations are serialized; keep a pending creation from being requested twice.
     private val conversationCreationGate = SingleFlightGate()
 
@@ -110,7 +143,43 @@ class ConversationForwardMessageViewModel
 
     init {
         skipConversation = false
+        switchToMultipleSelectionMode()
     }
+
+    @UiThread
+    fun captureMessageToForward(toForward: MessageModel) {
+        if (capturedSourceMessage === toForward && (capturedPayload != null || captureInProgress)) {
+            return
+        }
+        capturedSourceMessage = toForward
+        captureInProgress = true
+        ChatForwardDispatcher.capturePayload(toForward) { payload ->
+            capturedPayload?.cleanupStaging()
+            capturedPayload = payload
+            captureInProgress = false
+            if (pendingForwardAfterCapture) {
+                pendingForwardAfterCapture = false
+                coreContext.postOnMainThread {
+                    confirmForward()
+                }
+            }
+        }
+    }
+
+    @UiThread
+    fun cancelForward() {
+        pendingForwardAfterCapture = false
+        capturedPayload?.cleanupStaging()
+        capturedPayload = null
+    }
+
+    override fun onCleared() {
+        cancelForward()
+        super.onCleared()
+    }
+
+    private fun selectionKey(address: Address): String =
+        address.asStringUriOnly().trim().lowercase()
 
     @WorkerThread
     override fun onSingleAddressSelected(address: Address, friend: Friend?) {
@@ -128,41 +197,86 @@ class ConversationForwardMessageViewModel
 
     @UiThread
     fun handleClickOnModel(model: ConversationContactOrSuggestionModel) {
-        coreContext.postOnCoreThread { core ->
-            if (model.conversationId.isNotEmpty()) {
-                Log.i("$TAG User clicked on an existing conversation")
-                chatRoomCreatedEvent.postValue(Event(model.conversationId))
-                if (searchFilter.value.orEmpty().isNotEmpty()) {
-                    // Clear filter after it was used
-                    coreContext.postOnMainThread {
-                        clearFilter()
+        if (model.conversationId.isNotEmpty()) {
+            val existingSelection = selection.value.orEmpty().find {
+                it.address.weakEqual(model.address) ||
+                    (model.friend != null && it.avatarModel?.friend == model.friend)
+            }
+            coreContext.postOnCoreThread {
+                if (existingSelection != null || model.selected.value == true) {
+                    val toRemove = existingSelection ?: selection.value.orEmpty().find {
+                        it.address.weakEqual(model.address)
+                    }
+                    selectedConversationIds.remove(selectionKey(model.address))
+                    if (toRemove != null) {
+                        removeAddressModelFromSelection(toRemove)
+                    }
+                } else {
+                    selectedConversationIds[selectionKey(model.address)] = model.conversationId
+                    val avatarModel = coreContext.contactsManager.getContactAvatarModelForAddress(model.address)
+                    val selected = SelectedAddressModel(model.address, avatarModel) {
+                        selectedConversationIds.remove(selectionKey(it.address))
+                        removeAddressModelFromSelection(it)
+                    }
+                    addAddressModelToSelection(selected)
+                    if (searchFilter.value.orEmpty().isNotEmpty()) {
+                        coreContext.postOnMainThread { clearFilter() }
                     }
                 }
-                return@postOnCoreThread
             }
-
-            val friend = model.friend
-            if (friend == null) {
-                Log.i("$TAG Friend is null, using address [${model.address.asStringUriOnly()}]")
-                onSingleAddressSelected(model.address, null)
-                return@postOnCoreThread
-            }
-
-            val singleAvailableAddress = LinphoneUtils.getSingleAvailableAddressForFriend(friend)
-            if (singleAvailableAddress != null) {
-                Log.i(
-                    "$TAG Only 1 SIP address or phone number found for contact [${friend.name}], using it"
-                )
-                onSingleAddressSelected(singleAvailableAddress, friend)
-            } else {
-                val list = friend.getListOfSipAddressesAndPhoneNumbers(numberOrAddressClickListener)
-                Log.i(
-                    "$TAG [${list.size}] numbers or addresses found for contact [${friend.name}], showing selection dialog"
-                )
-
-                showNumberOrAddressPickerDialogEvent.postValue(Event(list))
-            }
+            return
         }
+
+        handleClickOnContactModel(model)
+    }
+
+    @UiThread
+    fun confirmForward() {
+        val currentSelection = selection.value.orEmpty()
+        if (currentSelection.isEmpty()) return
+        if (operationInProgress.value == true && !pendingForwardAfterCapture) return
+
+        val payload = capturedPayload
+        if (payload == null) {
+            if (captureInProgress) {
+                operationInProgress.value = true
+                pendingForwardAfterCapture = true
+                return
+            }
+            val source = capturedSourceMessage
+            if (source == null) {
+                showRedToast(R.string.conversation_message_forward_cancelled_toast, R.drawable.warning_circle)
+                return
+            }
+            operationInProgress.value = true
+            pendingForwardAfterCapture = true
+            captureMessageToForward(source)
+            return
+        }
+
+        operationInProgress.value = true
+        val destinations = currentSelection.map { selected ->
+            ChatForwardDispatcher.ForwardDestination(
+                address = selected.address,
+                conversationId = selectedConversationIds[selectionKey(selected.address)]
+            )
+        }
+        Log.i("$TAG Forwarding message to [${destinations.size}] destination(s)")
+        ChatForwardDispatcher.forwardToDestinations(
+            destinations = destinations,
+            payload = payload,
+            onErrorToast = { toastRes -> showRedToast(toastRes, R.drawable.warning_circle) },
+            onFinished = { rooms ->
+                capturedPayload = null
+                operationInProgress.postValue(false)
+                when {
+                    rooms.size == 1 && destinations.size == 1 ->
+                        singleForwardRoomCompletedEvent.postValue(Event(rooms.first()))
+                    rooms.isNotEmpty() ->
+                        multiForwardCompletedEvent.postValue(Event(rooms.size))
+                }
+            }
+        )
     }
 
     @WorkerThread
@@ -226,9 +340,9 @@ class ConversationForwardMessageViewModel
             return
         }
 
-        val participants = arrayOf(remote)
         val localAddress = account.params.identityAddress
         val canonicalRemote = LinphoneUtils.canonicalizeBasicChatAddress(remote, account)
+        val participants = arrayOf(canonicalRemote)
         val existingChatRoom = LinphoneUtils.findExistingOneToOneChatRoom(
             core, params, localAddress, canonicalRemote
         )

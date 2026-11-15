@@ -108,13 +108,54 @@
                         app:layout_constraintTop_toTopOf="@id/search_bar"
                         app:tint="?attr/color_main2_600" />
 
+                    <androidx.appcompat.widget.AppCompatTextView
+                        style="@style/default_text_style_300"
+                        android:id="@+id/multiple_selection_count"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="20dp"
+                        android:layout_marginTop="8dp"
+                        android:layout_marginEnd="20dp"
+                        android:text="@{viewModel.selectionCount, default=`0 selected`}"
+                        android:textSize="12sp"
+                        android:textColor="?attr/color_main2_600"
+                        android:visibility="@{viewModel.hasSelection ? View.VISIBLE : View.GONE, default=gone}"
+                        app:layout_constraintStart_toStartOf="parent"
+                        app:layout_constraintEnd_toEndOf="parent"
+                        app:layout_constraintTop_toBottomOf="@id/search_bar" />
+
+                    <HorizontalScrollView
+                        android:id="@+id/multiple_selection"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="16dp"
+                        android:layout_marginTop="4dp"
+                        android:layout_marginEnd="16dp"
+                        android:scrollbars="none"
+                        android:visibility="@{viewModel.hasSelection ? View.VISIBLE : View.GONE, default=gone}"
+                        app:layout_constraintStart_toStartOf="parent"
+                        app:layout_constraintEnd_toEndOf="parent"
+                        app:layout_constraintTop_toBottomOf="@id/multiple_selection_count">
+
+                        <LinearLayout
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:orientation="horizontal"
+                            entries="@{viewModel.selection}"
+                            layout="@{@layout/address_selected_list_cell}"
+                            emptyPlaceholder="@{@layout/multiple_participants_selection_placeholder}" />
+
+                    </HorizontalScrollView>
+
                     <androidx.recyclerview.widget.RecyclerView
                         android:id="@+id/contacts_list"
                         android:layout_width="0dp"
                         android:layout_height="0dp"
                         android:layout_marginTop="8dp"
+                        android:clipToPadding="false"
+                        android:paddingBottom="88dp"
                         android:visibility="@{viewModel.isEmpty ? View.GONE : View.VISIBLE}"
-                        app:layout_constraintTop_toBottomOf="@id/search_bar"
+                        app:layout_constraintTop_toBottomOf="@id/multiple_selection"
                         app:layout_constraintStart_toStartOf="parent"
                         app:layout_constraintEnd_toEndOf="parent"
                         app:layout_constraintBottom_toBottomOf="parent" />
@@ -133,6 +174,21 @@
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintTop_toBottomOf="@id/contacts_content"
+                app:layout_constraintBottom_toBottomOf="parent" />
+
+            <com.google.android.material.floatingactionbutton.FloatingActionButton
+                android:id="@+id/send_forward"
+                android:onClick="@{() -> viewModel.confirmForward()}"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_margin="16dp"
+                android:visibility="@{viewModel.hasSelection ? View.VISIBLE : View.GONE, default=gone}"
+                android:src="@drawable/paper_plane_right"
+                android:contentDescription="@string/content_description_forward_send"
+                app:tint="?attr/color_on_main"
+                app:backgroundTint="?attr/color_main1_500"
+                app:shapeAppearanceOverlay="@style/rounded"
+                app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintBottom_toBottomOf="parent" />
 
         </androidx.constraintlayout.widget.ConstraintLayout>

@@ -46,6 +46,7 @@ class CoreFileTransferService : FileTransferService() {
 
     var builder = NotificationCompat.Builder(this, SERVICE_NOTIFICATION_CHANNEL_ID)
 
+    @Volatile
     var listenerAdded = false
 
     private val coreListener = object : CoreListenerStub() {
@@ -61,20 +62,25 @@ class CoreFileTransferService : FileTransferService() {
 
     override fun onCreate() {
         super.onCreate()
-        if (!listenerAdded && coreContext.isCoreAvailable()) {
-            coreContext.core.addListener(coreListener)
-            listenerAdded = true
-        }
+        registerCoreListenerIfNeeded()
         Log.i("$TAG Created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i("$TAG onStartCommand")
-        if (!listenerAdded && coreContext.isCoreAvailable()) {
-            coreContext.core.addListener(coreListener)
-            listenerAdded = true
-        }
+        registerCoreListenerIfNeeded()
         return super.onStartCommand(intent, flags, startId)
+    }
+
+    private fun registerCoreListenerIfNeeded() {
+        if (!listenerAdded && coreContext.isCoreAvailable()) {
+            coreContext.postOnCoreThread { core ->
+                if (!listenerAdded) {
+                    core.addListener(coreListener)
+                    listenerAdded = true
+                }
+            }
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -84,8 +90,14 @@ class CoreFileTransferService : FileTransferService() {
 
     override fun onDestroy() {
         Log.i("$TAG onDestroy")
-        coreContext.core.removeListener(coreListener)
-        listenerAdded = false
+        if (coreContext.isCoreAvailable()) {
+            coreContext.postOnCoreThread { core ->
+                if (listenerAdded) {
+                    core.removeListener(coreListener)
+                    listenerAdded = false
+                }
+            }
+        }
         super.onDestroy()
     }
 

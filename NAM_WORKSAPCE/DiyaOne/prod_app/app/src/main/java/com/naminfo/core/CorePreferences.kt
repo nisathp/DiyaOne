@@ -89,6 +89,13 @@ class CorePreferences
         }
 
     @get:AnyThread @set:WorkerThread
+    var firebasePresenceEnabled: Boolean
+        get() = config.getBool("app", "firebase_presence_enabled", false)
+        set(value) {
+            config.setBool("app", "firebase_presence_enabled", value)
+        }
+
+    @get:AnyThread @set:WorkerThread
     var keepServiceAlive: Boolean
         get() = true
         set(value) {
@@ -457,7 +464,7 @@ class CorePreferences
         get() = config.getString(
             "ui",
             "assistant_third_party_sip_account_domain",
-            "203.95.216.67"
+            "203.95.216.68"
         )!!
 
     @get:AnyThread

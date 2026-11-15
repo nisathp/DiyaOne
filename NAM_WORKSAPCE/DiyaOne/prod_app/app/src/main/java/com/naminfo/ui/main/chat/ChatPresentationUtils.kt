@@ -17,7 +17,18 @@ internal fun resolveConversationDisplayName(
     addressDisplayName: String?,
     username: String?,
     domain: String?
-): String = sequenceOf(conversationSubject, contactName, addressDisplayName, username, domain)
-    .mapNotNull { it?.trim()?.takeIf(String::isNotEmpty) }
-    .firstOrNull()
-    .orEmpty()
+): String {
+    val cleanUsername = username.orEmpty().trim()
+    val subject = conversationSubject?.trim()?.takeIf { it.isNotEmpty() }
+    val contact = contactName?.trim()?.takeIf {
+        it.isNotEmpty() && !com.naminfo.contacts.PhoneContactNumbers.isNumericPlaceholder(it, cleanUsername)
+    }
+    val addrName = addressDisplayName?.trim()?.takeIf {
+        it.isNotEmpty() && !com.naminfo.contacts.PhoneContactNumbers.isNumericPlaceholder(it, cleanUsername)
+    }
+
+    return sequenceOf(subject, contact, addrName, cleanUsername, domain)
+        .mapNotNull { it?.trim()?.takeIf(String::isNotEmpty) }
+        .firstOrNull()
+        .orEmpty()
+}

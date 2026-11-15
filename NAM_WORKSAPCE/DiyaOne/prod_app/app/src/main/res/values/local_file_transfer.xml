@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="local_file_transfer_server_url" translatable="false">http://203.95.216.68:8019/hft.php</string>
+    <string name="local_file_transfer_local_server_url" translatable="false">http://192.168.1.100:8090/hft.py</string>
+    <string name="local_file_transfer_server_url" translatable="false">http://mobionglobal.com:8019/hft.py</string>
+    <string name="shared_hft_upload_username" translatable="false">diya</string>
+    <string name="shared_hft_upload_password" translatable="false">ivrs@123</string>
+    <string name="shared_hft_upload_realm" translatable="false">203.95.216.68</string>
+    <string name="shared_hft_upload_domain" translatable="false">mobionglobal.com</string>
     <string name="global_file_transfer_server_url" translatable="false">https://www.linphone.org:444/lft.php</string>
 </resources>

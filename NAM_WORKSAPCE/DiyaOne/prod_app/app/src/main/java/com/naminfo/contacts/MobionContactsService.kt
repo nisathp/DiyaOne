@@ -11,6 +11,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.core.ApiLogRepository
+import com.naminfo.core.MobionTokenRefresher
 import org.linphone.core.tools.Log
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
@@ -21,13 +22,12 @@ object MobionContactsService {
     @Volatile
     private var contactsCache: List<Contact>? = null
 
-    // A directory cache can be created before a new sign-in has stored its
-    // access token. Keep the token used for the profile map separately so the
-    // first Contacts screen after sign-in always enriches the cached directory.
-    @Volatile
-    private var profileMapAccessToken: String? = null
-
     private val contactsRefreshVersion = AtomicLong(0L)
+    private val avatarCacheEpoch = AtomicLong(0L)
+
+    fun currentAvatarCacheEpoch(): Long = avatarCacheEpoch.get()
+
+    fun bumpAvatarCacheEpoch(): Long = avatarCacheEpoch.incrementAndGet()
 
     // The backend can briefly return the old URL immediately after DELETE. Keep the local
     // removal authoritative until `/users` confirms that this number has no picture anymore.
@@ -39,8 +39,7 @@ object MobionContactsService {
      */
     val contactsRefreshRequested = MutableLiveData<Long>()
 
-    private const val CONTACTS_URL =
-        "https://mobionglobal.com/fs_webservice/WebService.asmx/Get_MobionNumber"
+    private const val DEFAULT_API_BASE = "https://mobionglobal.com/diyaone/api"
 
     private const val CONFERENCES_URL =
         "https://mobionglobal.com/fs_webservice/WebService.asmx/GroupSetting_View"
@@ -49,11 +48,6 @@ object MobionContactsService {
         val name: String,
         val mobileNumber: String,
         val profilePictureUrl: String? = null
-    )
-
-    private data class ProfilePictureMapResult(
-        val profileUrls: Map<String, String>,
-        val loaded: Boolean
     )
 
     data class Conference(
@@ -65,71 +59,49 @@ object MobionContactsService {
 
     @Synchronized
     fun fetchContacts(forceRefresh: Boolean = false): List<Contact> {
-        val accessToken = corePreferences.authToken.orEmpty()
-        val hasProfileMapForCurrentSession =
-            accessToken.isNotBlank() && profileMapAccessToken == accessToken
+        contactsCache?.takeIf { !forceRefresh }?.let { return it }
 
-        // Use a cached, already enriched directory during this signed-in
-        // session. A plain XML-only cache must not bypass the first `/users`
-        // request after sign-in.
-        contactsCache?.takeIf { !forceRefresh && hasProfileMapForCurrentSession }
-            ?.let { return it }
+        val contacts = try {
+            fetchUsersContacts()
+        } catch (error: Exception) {
+            Log.w("$TAG Failed to fetch /users contacts: ${error.javaClass.simpleName}")
+            // A pull-to-refresh must never replace a usable directory with an empty list
+            // when the request times out or authentication cannot be refreshed.
+            return contactsCache ?: readPersistedContacts()
+        }
+        if (contacts.isEmpty()) return contactsCache ?: readPersistedContacts()
 
-        // The XML endpoint is the complete phone directory. The authenticated
-        // /users endpoint enriches that directory with profile URLs only; it
-        // never replaces contacts which are absent from the API response.
-        val xmlContacts = if (!forceRefresh && contactsCache != null) {
-            contactsCache.orEmpty()
-        } else {
-            try {
-                fetchMobionXmlContacts()
-            } catch (error: Exception) {
-                Log.w("$TAG Failed to fetch XML contacts: ${error.javaClass.simpleName}")
-                // A pull-to-refresh must never replace a usable directory with an
-                // empty list when this network request times out.
-                return contactsCache ?: readPersistedContacts()
-            }
-        }
-        if (xmlContacts.isEmpty()) return contactsCache ?: readPersistedContacts()
-
-        val profileMapResult = fetchProfileUrlsByNumber()
-        if (profileMapResult.loaded && accessToken.isNotBlank()) {
-            profileMapAccessToken = accessToken
-        }
-        val cachedProfileUrlsByNumber = (contactsCache ?: readPersistedContacts()).associate {
-            it.mobileNumber to it.profilePictureUrl
-        }
-        val contacts = xmlContacts.map { contact ->
-            val isLocallyRemoved = contact.mobileNumber in locallyRemovedProfileNumbers
-            val serverPictureUrl = profileMapResult.profileUrls[contact.mobileNumber]
-            if (isLocallyRemoved && profileMapResult.loaded && serverPictureUrl == null) {
-                locallyRemovedProfileNumbers.remove(contact.mobileNumber)
-            }
-            contact.copy(
-                // A successful `/users` response is authoritative, including an explicit
-                // null picture URL after the user deletes their profile photo. While DELETE
-                // propagation is still catching up, never briefly restore the old image.
-                profilePictureUrl = if (isLocallyRemoved) {
-                    null
-                } else if (profileMapResult.loaded) {
-                    serverPictureUrl
-                } else {
-                    cachedProfileUrlsByNumber[contact.mobileNumber]
+        val resolvedContacts = contacts.map { contact ->
+            // Keep an immediately deleted picture hidden while the backend deletion finishes
+            // propagating. A later /users response with null confirms it and clears the guard.
+            if (contact.mobileNumber in locallyRemovedProfileNumbers) {
+                if (contact.profilePictureUrl == null) {
+                    locallyRemovedProfileNumbers.remove(contact.mobileNumber)
                 }
-            )
+                contact.copy(profilePictureUrl = null)
+            } else {
+                contact
+            }
         }
-        contactsCache = contacts
-        persistContacts(contacts)
-        return contacts
+
+        contactsCache = resolvedContacts
+        persistContacts(resolvedContacts)
+        return resolvedContacts
     }
 
-    fun clearContactsCache() {
+    /** Clears only memory by default; sign-out also removes the persisted directory. */
+    fun clearContactsCache(clearPersisted: Boolean = false) {
         contactsCache = null
-        profileMapAccessToken = null
+        locallyRemovedProfileNumbers.clear()
+        if (clearPersisted) {
+            corePreferences.mobionContactsCache = null
+            Log.i("$TAG Cleared persisted Mobion contacts for sign-out")
+        }
     }
 
     fun refreshContactsAfterProfilePictureChange() {
         clearContactsCache()
+        avatarCacheEpoch.incrementAndGet()
         contactsRefreshRequested.postValue(contactsRefreshVersion.incrementAndGet())
     }
 
@@ -195,19 +167,20 @@ object MobionContactsService {
         }.getOrDefault(emptyList())
     }
 
-    private fun fetchProfileUrlsByNumber(): ProfilePictureMapResult {
+    /**
+     * Retrieves the complete Diya directory from the JSON endpoint. A device's contact UI
+     * subsequently filters this list against its local SIM/phone contacts by mobile number.
+     */
+    private fun fetchUsersContacts(allowTokenRefreshRetry: Boolean = true): List<Contact> {
         val apiBase = corePreferences.apiDomain?.takeIf { it.isNotBlank() }
-            ?: "https://mobionglobal.com/Diyaone/api"
-        // `/users` is used only as a mobile-number -> profile-picture map.
-        // Keep this endpoint identical to the backend contract; the XML
-        // Get_MobionNumber endpoint remains the 34-contact directory source.
-        val urlStr = "$apiBase/users"
+            ?: DEFAULT_API_BASE
+        val urlStr = "${apiBase.trimEnd('/')}/users"
         val connection = URL(urlStr).openConnection() as HttpURLConnection
         connection.requestMethod = "GET"
         connection.connectTimeout = 15_000
         connection.readTimeout = 20_000
         connection.setRequestProperty("Accept", "application/json")
-        val token = corePreferences.authToken
+        val token = MobionTokenRefresher.validAccessToken(apiBase)
         if (!token.isNullOrEmpty()) {
             connection.setRequestProperty("Authorization", "Bearer $token")
         }
@@ -222,63 +195,45 @@ object MobionContactsService {
                     Log.i("$TAG /users response received")
 
                     val jsonArray = JSONArray(responseJson)
-                    val profileUrls = mutableMapOf<String, String>()
+                    val contacts = linkedMapOf<String, Contact>()
                     for (i in 0 until jsonArray.length()) {
                         val obj = jsonArray.getJSONObject(i)
                         val mobileNo = PhoneContactNumbers.normalize(
                             obj.optString("mobileNo").ifEmpty { obj.optString("subscriberId") }
                         )
-                        val rawPic = obj.optString("profilePictureUrl")
-                        val profilePictureUrl = normalizeProfilePictureUrl(rawPic, apiBase)
-                        if (mobileNo.length == 10 && profilePictureUrl != null) {
-                            profileUrls[mobileNo] = profilePictureUrl
+                        if (mobileNo.length != 10) continue
+
+                        val incoming = Contact(
+                            name = obj.optString("name").trim().ifBlank { mobileNo },
+                            mobileNumber = mobileNo,
+                            profilePictureUrl = normalizeProfilePictureUrl(
+                                obj.optString("profilePictureUrl"),
+                                apiBase
+                            )
+                        )
+                        val existing = contacts[mobileNo]
+                        contacts[mobileNo] = when {
+                            existing == null -> incoming
+                            existing.profilePictureUrl == null && incoming.profilePictureUrl != null -> incoming
+                            else -> existing
                         }
                     }
-                    Log.i("$TAG Parsed [${profileUrls.size}] profile URLs from JSON contacts")
-                    return ProfilePictureMapResult(profileUrls, loaded = true)
+                    Log.i("$TAG Parsed [${contacts.size}] contacts from /users JSON")
+                    return contacts.values.toList()
                 }
             }
-            ApiLogRepository.complete(logId, responseCode, connection.errorStream?.bufferedReader()?.use { it.readText() })
-            ProfilePictureMapResult(emptyMap(), loaded = false)
+            val errorResponse = connection.errorStream?.bufferedReader()?.use { it.readText() }
+            ApiLogRepository.complete(logId, responseCode, errorResponse)
+            if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED && allowTokenRefreshRetry) {
+                connection.disconnect()
+                if (MobionTokenRefresher.refreshAfterUnauthorized(apiBase) != null) {
+                    return fetchUsersContacts(allowTokenRefreshRetry = false)
+                }
+            }
+            error("Mobion users request failed with HTTP $responseCode")
         } catch (e: Exception) {
             ApiLogRepository.fail(logId, e)
-            Log.w("$TAG Failed to fetch profile URL map: ${e.javaClass.simpleName}")
-            ProfilePictureMapResult(emptyMap(), loaded = false)
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    private fun fetchMobionXmlContacts(): List<Contact> {
-        val connection = URL(CONTACTS_URL).openConnection() as HttpURLConnection
-        connection.requestMethod = "GET"
-        connection.connectTimeout = 15_000
-        connection.readTimeout = 20_000
-        connection.setRequestProperty("Accept", "text/xml")
-        val logId = ApiLogRepository.begin("GET", CONTACTS_URL)
-
-        return try {
-            val responseCode = connection.responseCode
-            if (responseCode !in 200..299) {
-                val error = connection.errorStream?.bufferedReader()?.use { it.readText() }
-                ApiLogRepository.complete(logId, responseCode, error)
-                error("Mobion contacts request failed with HTTP $responseCode")
-            }
-
-            connection.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
-                val responseXml = reader.readText()
-                ApiLogRepository.complete(logId, responseCode, responseXml)
-                Log.i("$TAG Get_MobionNumber response:\n$responseXml")
-
-                val parser = XmlPullParserFactory.newInstance().newPullParser()
-                parser.setInput(StringReader(responseXml))
-                parseContacts(parser).also { contacts ->
-                    Log.i("$TAG Parsed [${contacts.size}] valid XML contacts")
-                }
-            }
-        } catch (error: Exception) {
-            ApiLogRepository.fail(logId, error)
-            throw error
+            throw e
         } finally {
             connection.disconnect()
         }
@@ -302,10 +257,10 @@ object MobionContactsService {
         return resolvedUrl
     }
 
-    fun fetchProfilePictureUrl(subscriberId: String): String? {
+    fun fetchProfilePictureUrl(subscriberId: String, allowTokenRefreshRetry: Boolean = true): String? {
         val apiBase = corePreferences.apiDomain?.takeIf { it.isNotBlank() }
             ?: "https://mobionglobal.com/Diyaone/api"
-        val accessToken = corePreferences.authToken
+        val accessToken = MobionTokenRefresher.validAccessToken(apiBase)
         val encodedSubscriberId = URLEncoder.encode(subscriberId, Charsets.UTF_8.name())
         val connection = URL("${apiBase.trimEnd('/')}/users/$encodedSubscriberId")
             .openConnection() as HttpURLConnection
@@ -322,6 +277,12 @@ object MobionContactsService {
             val responseCode = connection.responseCode
             if (responseCode !in 200..299) {
                 ApiLogRepository.complete(logId, responseCode, connection.errorStream?.bufferedReader()?.use { it.readText() })
+                if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED && allowTokenRefreshRetry) {
+                    connection.disconnect()
+                    if (MobionTokenRefresher.refreshAfterUnauthorized(apiBase) != null) {
+                        return fetchProfilePictureUrl(subscriberId, allowTokenRefreshRetry = false)
+                    }
+                }
                 return null
             }
             val responseText = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
@@ -371,35 +332,6 @@ object MobionContactsService {
         } finally {
             connection.disconnect()
         }
-    }
-
-    private fun parseContacts(parser: XmlPullParser): List<Contact> {
-        val contacts = linkedMapOf<String, Contact>()
-        var name = ""
-        var mobileNumber = ""
-        var event = parser.eventType
-
-        while (event != XmlPullParser.END_DOCUMENT) {
-            when {
-                event == XmlPullParser.START_TAG && parser.name == "Table" -> {
-                    name = ""
-                    mobileNumber = ""
-                }
-                event == XmlPullParser.START_TAG && parser.name == "Name" -> {
-                    name = parser.nextText().trim()
-                }
-                event == XmlPullParser.START_TAG && parser.name == "Mobile_No" -> {
-                    mobileNumber = PhoneContactNumbers.normalize(parser.nextText())
-                }
-                event == XmlPullParser.END_TAG && parser.name == "Table" -> {
-                    if (mobileNumber.length == 10) {
-                        contacts[mobileNumber] = Contact(name, mobileNumber, null)
-                    }
-                }
-            }
-            event = parser.next()
-        }
-        return contacts.values.toList()
     }
 
     private fun parseConferences(parser: XmlPullParser): List<Conference> {

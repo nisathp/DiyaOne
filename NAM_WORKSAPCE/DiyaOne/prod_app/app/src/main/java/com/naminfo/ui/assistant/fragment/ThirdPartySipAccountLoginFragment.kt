@@ -82,6 +82,15 @@ class ThirdPartySipAccountLoginFragment : GenericFragment() {
         binding.viewModel = viewModel
         observeToastEvents(viewModel)
 
+        viewModel.apiFailureDiagnosticEvent.observe(viewLifecycleOwner) {
+            it.consume { diagnostic ->
+                (requireActivity() as GenericActivity).showScrollableErrorToast(
+                    diagnostic.title,
+                    diagnostic.details
+                )
+            }
+        }
+
         viewModel.accountLoggedInEvent.observe(viewLifecycleOwner) {
             it.consume {
                 Log.i("$TAG Account successfully logged-in, requesting permissions")

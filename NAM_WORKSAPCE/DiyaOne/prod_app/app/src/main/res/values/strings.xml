@@ -192,10 +192,10 @@
     <string name="assistant_account_register_unavailable_no_push_warning">Push notifications do not seem to be available on your device, but they are mandatory for creating an account in the mobile app.\n\nWe invite you to create an account on our web platform instead:</string>
     <string name="assistant_account_register_push_notification_not_received_error">Push notification with auth token not received in 5 seconds, please try again later</string>
     <string name="assistant_account_register_unexpected_error">Unexpected error occurred, please try again later</string>
-    <string name="assistant_account_login_forbidden_error">Invalid username</string>
-    <string name="assistant_account_login_error">Failed to login: error code is %s</string>
+    <string name="assistant_account_login_forbidden_error">Incorrect phone number or credentials. Please check and try again.</string>
+    <string name="assistant_account_login_error">Login failed. Please check your network and credentials.</string>
     <string name="assistant_account_retry">Retry</string>
-    <string name="assistant_account_login_sip_server_unreachable_error">SIP server did not respond. Check that the SIP server and UDP port 5060 are reachable.</string>
+    <string name="assistant_account_login_sip_server_unreachable_error">Unable to connect to server. Please check your internet connection and try again.</string>
     <string name="call_blocked_invalid_fallback_identity">Call blocked: invalid Linphone fallback identity detected. Sign in and wait for SIP registration.</string>
     <string name="assistant_permissions_title">Grant permissions</string>
     <string name="assistant_permissions_grant_all_of_them">OK</string>
@@ -334,6 +334,7 @@
     <string name="settings_contacts_edit_native_contacts_in_linphone_title">Use &appName; contact editor for native contacts</string>
     <string name="settings_contacts_hide_empty_contacts_title">Hide contacts without SIP address nor phone number</string>
     <string name="settings_contacts_presence_subscribe_title">Subscribe to presence info</string>
+    <string name="settings_contacts_firebase_presence_title">Use Firebase presence for extra accuracy</string>
     <string name="settings_contacts_add_ldap_server_title">Add LDAP server</string>
     <string name="settings_contacts_edit_ldap_server_title">Edit LDAP server</string>
     <string name="settings_contacts_add_carddav_server_title">Add CardDAV address book</string>
@@ -741,7 +742,10 @@
 
     <string name="conversation_forward_message_title">Forward message to…</string>
     <string name="conversation_message_forwarded_toast">Message was forwarded</string>
+    <string name="conversation_message_forwarded_multi_toast">Forwarded to %d chats</string>
     <string name="conversation_message_forward_cancelled_toast">Message forward was cancelled</string>
+    <string name="conversation_file_unavailable_toast">File is not available on this device yet</string>
+    <string name="content_description_forward_send">Send forwarded message</string>
 
     <string name="message_delivery_info_read_title">Read %s</string>
     <string name="message_delivery_info_received_title">Received %s</string>

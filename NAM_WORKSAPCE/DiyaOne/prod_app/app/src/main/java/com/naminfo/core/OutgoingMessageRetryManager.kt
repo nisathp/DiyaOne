@@ -23,6 +23,9 @@ import java.util.concurrent.ConcurrentHashMap
 object OutgoingMessageRetryManager {
     private const val TAG = "[Outgoing Message Retry]"
     private const val MAX_RETRIES = 8
+    // Give an online recipient enough time to return Diya's delivery receipt
+    // before adding a second, queue-delivery transport for the same message.
+    private const val QUEUE_FALLBACK_GRACE_MS = 8_000L
     private val retryDelaysMs = longArrayOf(5_000, 15_000, 30_000, 60_000, 120_000, 180_000, 300_000, 300_000)
 
     private data class PendingMessage(
@@ -30,6 +33,8 @@ object OutgoingMessageRetryManager {
         val message: ChatMessage,
         var attempts: Int = 0,
         var retryScheduled: Boolean = false,
+        var queueFallbackScheduled: Boolean = false,
+        var queueFallbackRequested: Boolean = false,
         val listener: ChatMessageListenerStub
     )
 
@@ -53,10 +58,28 @@ object OutgoingMessageRetryManager {
                 when (state) {
                     ChatMessage.State.Delivered,
                     ChatMessage.State.DeliveredToUser,
-                    ChatMessage.State.Displayed -> complete(entry)
+                    ChatMessage.State.Displayed -> {
+                        // `Delivered` only acknowledges that FreeSWITCH accepted the SIP
+                        // MESSAGE. The durable item stays until CustomImdn receives B's
+                        // delivery receipt (or B acknowledges the queue itself).
+                        scheduleQueueFallbackAfterGrace(entry, changedMessage)
+                    }
+
+                    ChatMessage.State.FileTransferDone -> {
+                        // The signed URL is now ready. Delivery still waits for the
+                        // SIP-receipt grace period below so online users don't see a
+                        // duplicate queue copy of the same attachment.
+                        Log.i("$TAG HFT upload completed; awaiting receiver receipt or fallback")
+                    }
 
                     ChatMessage.State.NotDelivered,
-                    ChatMessage.State.FileTransferError -> scheduleRetry(entry)
+                    ChatMessage.State.FileTransferError -> {
+                        if (!entry.queueFallbackRequested) {
+                            entry.queueFallbackRequested = true
+                            OfflineInboxRepository.enqueueOutgoingFallback(changedMessage)
+                        }
+                        scheduleRetry(entry)
+                    }
 
                     else -> Unit
                 }
@@ -65,6 +88,9 @@ object OutgoingMessageRetryManager {
         entry = PendingMessage(key, message, listener = listener)
         pending[key] = entry
         message.addListener(listener)
+        // Store every message in Vercel before relying on the best-effort SIP transport. Text
+        // queues immediately; media waits inside the repository for its HFT upload to finish.
+        OfflineInboxRepository.enqueueOutgoingAsSourceOfTruth(message)
     }
 
     /** Call after SIP registration returns so queued failures retry immediately on reconnect. */
@@ -86,6 +112,28 @@ object OutgoingMessageRetryManager {
             delay(delayMs)
             coreContext.postOnCoreThread {
                 retry(entry, immediate = false)
+            }
+        }
+    }
+
+    @WorkerThread
+    private fun scheduleQueueFallbackAfterGrace(entry: PendingMessage, message: ChatMessage) {
+        if (entry.queueFallbackRequested || entry.queueFallbackScheduled) return
+        if (CustomImdn.isReceiverDeliveryConfirmed(message)) {
+            complete(entry)
+            return
+        }
+        entry.queueFallbackScheduled = true
+        scope.launch {
+            delay(QUEUE_FALLBACK_GRACE_MS)
+            coreContext.postOnCoreThread {
+                if (pending[entry.key] !== entry) return@postOnCoreThread
+                entry.queueFallbackScheduled = false
+                if (!CustomImdn.isReceiverDeliveryConfirmed(entry.message)) {
+                    entry.queueFallbackRequested = true
+                    OfflineInboxRepository.enqueueOutgoingFallback(entry.message)
+                }
+                complete(entry)
             }
         }
     }

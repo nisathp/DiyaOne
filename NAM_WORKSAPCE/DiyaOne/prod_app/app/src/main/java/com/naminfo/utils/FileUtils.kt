@@ -91,7 +91,7 @@ class FileUtils {
                 }
             }
 
-            return extension.lowercase(Locale.getDefault())
+            return extension.orEmpty().lowercase(Locale.getDefault())
         }
 
         @AnyThread
@@ -142,14 +142,15 @@ class FileUtils {
             fileName: String,
             isImage: Boolean = false,
             isRecording: Boolean = false,
-            overrideExisting: Boolean = false
+            overrideExisting: Boolean = false,
+            excludedPaths: Set<String> = emptySet()
         ): File {
             val path = getFileStorageDir(isPicture = isImage, isRecording = isRecording)
             var file = File(path, fileName)
 
             if (!overrideExisting) {
                 var prefix = 1
-                while (file.exists()) {
+                while (file.exists() || excludedPaths.contains(file.absolutePath)) {
                     file = File(path, prefix.toString() + "_" + fileName)
                     Log.w("$TAG File with that name already exists, renamed to [${file.name}]")
                     prefix += 1
@@ -501,30 +502,30 @@ class FileUtils {
         private fun getNameFromUri(uri: Uri, context: Context): String {
             var name = ""
             if (uri.scheme == "content") {
-                val returnCursor =
-                    context.contentResolver.query(uri, null, null, null, null)
-                if (returnCursor != null) {
-                    returnCursor.moveToFirst()
-                    val nameIndex = returnCursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (nameIndex != -1) {
-                        try {
-                            val displayName = returnCursor.getString(nameIndex)
-                            if (displayName != null) {
-                                name = displayName
-                            } else {
+                context.contentResolver.query(uri, null, null, null, null)?.use { returnCursor ->
+                    if (returnCursor.moveToFirst()) {
+                        val nameIndex = returnCursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (nameIndex != -1) {
+                            try {
+                                val displayName = returnCursor.getString(nameIndex)
+                                if (displayName != null) {
+                                    name = displayName
+                                } else {
+                                    Log.e(
+                                        "$TAG Failed to get the display name for URI $uri, returned value is null"
+                                    )
+                                }
+                            } catch (e: CursorIndexOutOfBoundsException) {
                                 Log.e(
-                                    "$TAG Failed to get the display name for URI $uri, returned value is null"
+                                    "$TAG Failed to get the display name for URI $uri, exception is $e"
                                 )
                             }
-                        } catch (e: CursorIndexOutOfBoundsException) {
-                            Log.e(
-                                "$TAG Failed to get the display name for URI $uri, exception is $e"
-                            )
+                        } else {
+                            Log.e("$TAG Couldn't get DISPLAY_NAME column index for URI: $uri")
                         }
                     } else {
-                        Log.e("$TAG Couldn't get DISPLAY_NAME column index for URI: $uri")
+                        Log.w("$TAG Empty cursor when querying DISPLAY_NAME for URI: $uri")
                     }
-                    returnCursor.close()
                 }
             } else if (uri.scheme == "file") {
                 name = uri.lastPathSegment ?: ""

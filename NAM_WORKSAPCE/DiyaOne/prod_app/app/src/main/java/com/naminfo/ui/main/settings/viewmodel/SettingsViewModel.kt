@@ -20,7 +20,9 @@ import org.linphone.core.Factory
 import org.linphone.core.FriendList
 import org.linphone.core.MediaEncryption
 import org.linphone.core.Tunnel
+import com.naminfo.core.CoreContext
 import com.naminfo.core.VFS
+import com.naminfo.core.FirebasePresenceRepository
 import org.linphone.core.tools.Log
 import com.naminfo.ui.GenericViewModel
 import com.naminfo.ui.main.settings.model.CardDavLdapModel
@@ -115,6 +117,7 @@ class SettingsViewModel
     val cardDavFriendsLists = MutableLiveData<List<CardDavLdapModel>>()
 
     val presenceSubscribe = MutableLiveData<Boolean>()
+    val firebasePresenceEnabled = MutableLiveData<Boolean>()
 
     val addLdapServerEvent: MutableLiveData<Event<Boolean>> by lazy {
         MutableLiveData()
@@ -219,6 +222,7 @@ class SettingsViewModel
     val mediaEncryptionLabels = arrayListOf<String>()
     private val mediaEncryptionValues = arrayListOf<MediaEncryption>()
     val mediaEncryptionMandatory = MutableLiveData<Boolean>()
+    val isSrtpEnabled = MutableLiveData<Boolean>()
     val rfc2833Dtmf = MutableLiveData<Boolean>()
     val sipInfoDtmf = MutableLiveData<Boolean>()
     val useProximitySensor = MutableLiveData<Boolean>()
@@ -356,6 +360,7 @@ class SettingsViewModel
             editNativeContactsInLinphone.postValue(corePreferences.editNativeContactsInLinphone)
             hideEmptyContacts.postValue(corePreferences.hideContactsWithoutPhoneNumberOrSipAddress)
             presenceSubscribe.postValue(core.isFriendListSubscriptionEnabled)
+            firebasePresenceEnabled.postValue(corePreferences.firebasePresenceEnabled)
 
             showPastMeetings.postValue(corePreferences.showPastMeetings)
             defaultLayout.postValue(core.defaultConferenceLayout.toInt())
@@ -707,6 +712,16 @@ class SettingsViewModel
     }
 
     @UiThread
+    fun toggleFirebasePresence() {
+        val newValue = firebasePresenceEnabled.value == false
+        coreContext.postOnCoreThread {
+            corePreferences.firebasePresenceEnabled = newValue
+            FirebasePresenceRepository.clearCache()
+            firebasePresenceEnabled.postValue(newValue)
+        }
+    }
+
+    @UiThread
     fun toggleMeetingsExpand() {
         expandMeetings.value = expandMeetings.value == false
     }
@@ -887,34 +902,26 @@ class SettingsViewModel
         mediaEncryptionLabels.clear()
         mediaEncryptionValues.clear()
 
-        var index = 0
         val defaultMediaEncryption = core.mediaEncryption
         Log.i("$TAG Current media encryption is [$defaultMediaEncryption]")
-        for (encryption in MediaEncryption.entries) {
+        isSrtpEnabled.postValue(defaultMediaEncryption == MediaEncryption.SRTP)
+        // Keep NONE first: Spinner attaches its adapter before restoring the saved
+        // selection, so its initial callback must never momentarily enable SRTP.
+        for (encryption in listOf(MediaEncryption.None, MediaEncryption.SRTP)) {
             if (core.isMediaEncryptionSupported(encryption)) {
-                if (encryption == MediaEncryption.ZRTP) {
-                    if (core.postQuantumAvailable) {
-                        Log.i("$TAG Post Quantum ZRTP is available")
-                        mediaEncryptionLabels.add(
-                            AppUtils.getString(
-                                R.string.call_stats_media_encryption_zrtp_post_quantum
-                            )
-                        )
-                    } else {
-                        Log.i(
-                            "$TAG Post Quantum ZRTP isn't available, will use classic ZRTP instead"
-                        )
-                        mediaEncryptionLabels.add(encryption.toString())
-                    }
-                } else {
-                    mediaEncryptionLabels.add(encryption.toString())
-                }
+                mediaEncryptionLabels.add(if (encryption == MediaEncryption.None) "NONE" else "SRTP")
                 mediaEncryptionValues.add(encryption)
                 if (encryption == defaultMediaEncryption) {
-                    mediaEncryptionIndex.postValue(index)
+                    mediaEncryptionIndex.postValue(mediaEncryptionValues.lastIndex)
                 }
-                index += 1
             }
+        }
+
+        // A previously saved unsupported option (for example ZRTP) must not leave
+        // the picker uninitialised after limiting this setting to NONE and SRTP.
+        // The first supported choice is NONE, making it the safe default.
+        if (mediaEncryptionIndex.value == null && mediaEncryptionValues.isNotEmpty()) {
+            mediaEncryptionIndex.postValue(0)
         }
 
         mediaEncryptionMandatory.postValue(core.isMediaEncryptionMandatory)
@@ -923,16 +930,48 @@ class SettingsViewModel
     @UiThread
     fun setMediaEncryption(index: Int) {
         coreContext.postOnCoreThread { core ->
-            val mediaEncryption = mediaEncryptionValues[index]
+            val mediaEncryption = mediaEncryptionValues.getOrNull(index) ?: return@postOnCoreThread
             core.mediaEncryption = mediaEncryption
-            // A deliberate Settings choice (including None) must survive the app restart
-            // instead of being replaced by the first-run SRTP default.
+            // A deliberate Settings choice (including SRTP) must survive the app restart
+            // instead of being replaced by the first-run default.
+            core.config.setBool("app", CoreContext.MEDIA_ENCRYPTION_DEFAULT_NONE_KEY, true)
             core.config.setBool("app", "srtp_default_initialized", true)
 
             if (mediaEncryption == MediaEncryption.None) {
                 core.isMediaEncryptionMandatory = false
                 mediaEncryptionMandatory.postValue(false)
+                isSrtpEnabled.postValue(false)
+            } else if (mediaEncryption == MediaEncryption.SRTP) {
+                core.isMediaEncryptionMandatory = true
+                mediaEncryptionMandatory.postValue(true)
+                isSrtpEnabled.postValue(true)
             }
+        }
+    }
+
+    @UiThread
+    fun toggleSrtpEnabled() {
+        val newValue = isSrtpEnabled.value == false
+
+        coreContext.postOnCoreThread { core ->
+            if (newValue) {
+                core.mediaEncryption = MediaEncryption.SRTP
+                core.isMediaEncryptionMandatory = true
+                mediaEncryptionMandatory.postValue(true)
+                isSrtpEnabled.postValue(true)
+                val srtpIdx = mediaEncryptionValues.indexOf(MediaEncryption.SRTP)
+                if (srtpIdx >= 0) mediaEncryptionIndex.postValue(srtpIdx)
+            } else {
+                core.mediaEncryption = MediaEncryption.None
+                core.isMediaEncryptionMandatory = false
+                mediaEncryptionMandatory.postValue(false)
+                isSrtpEnabled.postValue(false)
+                val noneIdx = mediaEncryptionValues.indexOf(MediaEncryption.None)
+                if (noneIdx >= 0) mediaEncryptionIndex.postValue(noneIdx)
+            }
+            core.config.setBool("app", CoreContext.MEDIA_ENCRYPTION_DEFAULT_NONE_KEY, true)
+            core.config.setBool("app", "srtp_default_initialized", true)
+            Log.i("$TAG Toggled SRTP encryption: enabled=$newValue")
         }
     }
 

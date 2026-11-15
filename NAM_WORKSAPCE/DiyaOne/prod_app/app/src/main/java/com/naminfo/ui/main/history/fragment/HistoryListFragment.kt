@@ -354,6 +354,7 @@ class HistoryListFragment : AbstractMainFragment() {
         super.onResume()
 
         Log.i("$TAG Fragment is resumed, resetting missed calls count")
+        coreContext.contactsManager.syncMobionDirectoryAsync()
         sharedViewModel.resetMissedCallsCountEvent.value = Event(true)
         sharedViewModel.refreshDrawerMenuAccountsListEvent.value = Event(false)
 

@@ -104,7 +104,7 @@ open class AbstractMainViewModel
             state: ChatRoom.State?
         ) {
             if (state == ChatRoom.State.Deleted) {
-                computeUnreadMessagesCount()
+                scheduleUnreadMessagesCount()
             }
         }
 
@@ -119,17 +119,17 @@ open class AbstractMainViewModel
             }.toTypedArray()
 
             if (visibleMessages.isEmpty()) return
-            computeUnreadMessagesCount()
+            scheduleUnreadMessagesCount()
         }
 
         @WorkerThread
         override fun onChatRoomRead(core: Core, chatRoom: ChatRoom) {
-            computeUnreadMessagesCount()
+            scheduleUnreadMessagesCount()
         }
 
         @WorkerThread
         override fun onMessageRetracted(core: Core, chatRoom: ChatRoom, message: ChatMessage) {
-            computeUnreadMessagesCount()
+            scheduleUnreadMessagesCount()
         }
 
         @WorkerThread
@@ -160,13 +160,14 @@ open class AbstractMainViewModel
 
             if (defaultAccount == null) {
                 Log.w("$TAG Default account is now null!")
+                account.postValue(null)
+                defaultAccountChangedEvent.postValue(Event(true))
                 return
             } else {
                 Log.i(
                     "$TAG Default account has changed [${defaultAccount.params.identityAddress?.asStringUriOnly()}]"
                 )
 
-                account.value?.destroy()
                 account.postValue(AccountModel(defaultAccount))
             }
 
@@ -175,8 +176,8 @@ open class AbstractMainViewModel
     }
 
     init {
-        // Pre-compute this value to prevent the menu being briefly visible
-        hideMeetings.value = !coreContext.defaultAccountHasVideoConferenceFactoryUri
+        // Keep the Meetings navigation tab hidden from the bottom/side navigation bar
+        hideMeetings.value = true
 
         coreContext.postOnCoreThread { core ->
             moreThanOneAccount.postValue(core.accountList.size > 1)
@@ -275,6 +276,13 @@ open class AbstractMainViewModel
     }
 
     @WorkerThread
+    private fun scheduleUnreadMessagesCount() {
+        // Core callbacks are invoked with the native Core lock held. Querying
+        // ChatRoom history in that callback can deadlock against UI navigation.
+        coreContext.postOnCoreThread { computeUnreadMessagesCount() }
+    }
+
+    @WorkerThread
     fun updateMissedCallsCount() {
         val account = LinphoneUtils.getDefaultAccount()
         // Fetch all call logs if only one account to workaround no history issue
@@ -294,9 +302,9 @@ open class AbstractMainViewModel
     @WorkerThread
     fun computeUnreadMessagesCount() {
         val account = LinphoneUtils.getDefaultAccount()
-        val count = coreContext.core.chatRooms
+        val accountRooms = coreContext.core.chatRooms
             .filter { account == null || LinphoneUtils.getAccountForAddress(it.localAddress) == account }
-            .sumOf(CustomImdn::visibleUnreadMessagesCount)
+        val count = CustomImdn.visibleUnreadMessagesCount(accountRooms)
         val moreThanOne = count > 1
         Log.i(
             "$TAG There ${if (moreThanOne) "are" else "is"} [$count] unread ${if (moreThanOne) "messages" else "message"}"
@@ -329,12 +337,7 @@ open class AbstractMainViewModel
     @WorkerThread
     fun updateAvailableMenus() {
         hideConversations.postValue(corePreferences.disableChat)
-
-        val conferencingAvailable = LinphoneUtils.isRemoteConferencingAvailable(
-            coreContext.core
-        )
-        val hideGroupCall = corePreferences.disableMeetings || !conferencingAvailable
-        hideMeetings.postValue(hideGroupCall)
+        hideMeetings.postValue(true)
     }
 
     @WorkerThread

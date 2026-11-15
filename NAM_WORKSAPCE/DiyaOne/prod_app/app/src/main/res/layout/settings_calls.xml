@@ -273,24 +273,82 @@
 
         <androidx.appcompat.widget.AppCompatTextView
             style="@style/settings_title_style"
-            android:id="@+id/advanced_call_settings"
-            android:visibility="gone"
-            android:onClick="@{advancedCallSettingsClickListener}"
+            android:onClick="@{() -> viewModel.toggleSrtpEnabled()}"
+            android:id="@+id/srtp_encryption_title"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:padding="5dp"
             android:layout_marginStart="16dp"
             android:layout_marginEnd="10dp"
-            android:layout_marginTop="20dp"
-            android:layout_marginBottom="@dimen/screen_bottom_margin"
-            android:text="@string/settings_advanced_calls"
-            android:drawableEnd="@drawable/caret_right"
-            android:drawableTint="?attr/color_main2_600"
-            android:background="@drawable/squircle_transparent_button_background"
-            app:layout_constraintHorizontal_bias="1"
+            android:visibility="gone"
+            android:text="@string/settings_advanced_media_encryption_title"
+            android:labelFor="@id/srtp_encryption_switch"
+            app:layout_constraintTop_toTopOf="@id/srtp_encryption_switch"
+            app:layout_constraintBottom_toBottomOf="@id/srtp_encryption_switch"
             app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toStartOf="@id/srtp_encryption_switch"/>
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            style="@style/material_switch_style"
+            android:id="@+id/srtp_encryption_switch"
+            android:onClick="@{() -> viewModel.toggleSrtpEnabled()}"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:visibility="gone"
+            android:layout_marginBottom="20dp"
+            android:layout_marginEnd="16dp"
+            android:checked="@{viewModel.isSrtpEnabled}"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/call_redirection_service_switch"/>
+            app:layout_constraintTop_toBottomOf="@id/change_ringtone"/>
+
+        <androidx.appcompat.widget.AppCompatTextView
+            style="@style/settings_title_padding_style"
+            android:id="@+id/media_encryption_label"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="20dp"
+            android:visibility="gone"
+            android:text="@string/settings_advanced_media_encryption_title"
+            android:labelFor="@id/media_encryption"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/srtp_encryption_switch"/>
+
+        <androidx.appcompat.widget.AppCompatSpinner
+            style="@style/default_text_style"
+            android:id="@+id/media_encryption"
+            android:layout_width="0dp"
+            android:layout_height="50dp"
+            android:layout_marginStart="16dp"
+            android:layout_marginEnd="16dp"
+            android:layout_marginBottom="@dimen/screen_bottom_margin"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:textSize="14sp"
+            android:textColor="@color/gray_main2_600"
+            android:gravity="center_vertical"
+            android:overlapAnchor="false"
+            android:dropDownVerticalOffset="2dp"
+            android:spinnerMode="dropdown"
+            android:visibility="gone"
+            android:popupBackground="@drawable/shape_squircle_white_background"
+            android:background="@drawable/edit_text_background"
+            app:layout_constraintTop_toBottomOf="@id/media_encryption_label"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toEndOf="parent" />
+
+        <ImageView
+            android:id="@+id/media_encryption_caret"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="32dp"
+            android:src="@drawable/caret_down"
+            android:contentDescription="@null"
+            android:visibility="gone"
+            app:tint="?attr/color_main2_600"
+            app:layout_constraintTop_toTopOf="@id/media_encryption"
+            app:layout_constraintBottom_toBottomOf="@id/media_encryption"
+            app:layout_constraintEnd_toEndOf="@id/media_encryption"/>
 
     </androidx.constraintlayout.widget.ConstraintLayout>
 

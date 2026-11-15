@@ -216,10 +216,7 @@ abstract class AddressSelectionViewModel
             list.add(model)
             list.addAll(actual)
 
-            val found = modelsList.value.orEmpty().find {
-                it.address.weakEqual(model.address) || it.friend == model.avatarModel?.friend
-            }
-            found?.selected?.postValue(true)
+            syncModelSelectionState(modelsList.value.orEmpty(), model, selected = true)
 
             selectionCount.postValue(
                 AppUtils.getStringWithPlural(
@@ -248,10 +245,7 @@ abstract class AddressSelectionViewModel
             model.avatarModel?.destroy()
             list.remove(model)
 
-            val found = modelsList.value.orEmpty().find {
-                it.address.weakEqual(model.address) || it.friend == model.avatarModel?.friend
-            }
-            found?.selected?.postValue(false)
+            syncModelSelectionState(modelsList.value.orEmpty(), model, selected = false)
 
             selectionCount.postValue(
                 AppUtils.getStringWithPlural(
@@ -428,6 +422,15 @@ abstract class AddressSelectionViewModel
         list.addAll(suggestionsList)
         list.addAll(requestList)
 
+        val currentSelection = selection.value.orEmpty()
+        if (currentSelection.isNotEmpty()) {
+            list.forEach { item ->
+                if (currentSelection.any { selected -> matchesSelectedItem(item, selected) }) {
+                    item.selected.postValue(true)
+                }
+            }
+        }
+
         searchInProgress.postValue(false)
         modelsList.postValue(list)
         isEmpty.postValue(list.isEmpty())
@@ -439,10 +442,22 @@ abstract class AddressSelectionViewModel
     @WorkerThread
     private fun getConversationsList(filter: String): ArrayList<ConversationContactOrSuggestionModel> {
         val conversationsList = arrayListOf<ConversationContactOrSuggestionModel>()
-        for (chatRoom in LinphoneUtils.getDefaultAccount()?.chatRooms.orEmpty()) {
+        val hideEmptyChatRooms = coreContext.core.config.getBool("misc", "hide_empty_chat_rooms", true)
+        val displayedOneToOnePeers = mutableSetOf<String>()
+        for (chatRoom in LinphoneUtils.getDefaultAccount()?.chatRooms.orEmpty().sortedByDescending { it.lastUpdateTime }) {
             // Do not list conversations in which we can't send a message
             val isBasic = chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())
             if (chatRoom.isReadOnly || (!isBasic && chatRoom.participants.isEmpty())) continue
+            if (hideEmptyChatRooms && !LinphoneUtils.isChatRoomAGroup(chatRoom) && !LinphoneUtils.hasVisibleOrRecentMessages(chatRoom)) {
+                continue
+            }
+
+            // Basic SIP can keep sibling rooms for the same one-to-one peer (e.g. with/without
+            // port or after offline queue replay). Show only the newest room per peer under Chats.
+            val peerKey = LinphoneUtils.getOneToOnePeerKey(chatRoom)
+            if (peerKey != null && !displayedOneToOnePeers.add(peerKey)) {
+                continue
+            }
 
             val isOneToOne = chatRoom.hasCapability(ChatRoom.Capabilities.OneToOne.toInt())
             val conversationId = LinphoneUtils.getConversationId(chatRoom)
@@ -533,6 +548,25 @@ abstract class AddressSelectionViewModel
         return conversationsList
     }
 
+    private fun matchesSelectedItem(
+        candidate: ConversationContactOrSuggestionModel,
+        selected: SelectedAddressModel
+    ): Boolean {
+        if (candidate.address.weakEqual(selected.address)) return true
+        val selectedFriend = selected.avatarModel?.friend
+        return selectedFriend != null && candidate.friend == selectedFriend
+    }
+
+    private fun syncModelSelectionState(
+        items: List<ConversationContactOrSuggestionModel>,
+        selectedModel: SelectedAddressModel,
+        selected: Boolean
+    ) {
+        items.filter { matchesSelectedItem(it, selectedModel) }.forEach { match ->
+            match.selected.postValue(selected)
+        }
+    }
+
     @UiThread
     fun handleClickOnContactModel(model: ConversationContactOrSuggestionModel) {
         if (model.selected.value == true) {
@@ -540,7 +574,7 @@ abstract class AddressSelectionViewModel
                 "$TAG User clicked on already selected item [${model.name}], removing it from selection"
             )
             val found = selection.value.orEmpty().find {
-                it.address.weakEqual(model.address) || it.avatarModel?.friend == model.friend
+                matchesSelectedItem(model, it)
             }
             if (found != null) {
                 coreContext.postOnCoreThread {

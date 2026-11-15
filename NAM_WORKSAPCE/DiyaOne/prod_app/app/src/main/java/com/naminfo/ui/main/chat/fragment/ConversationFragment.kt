@@ -23,7 +23,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.UiThread
 import androidx.appcompat.app.AlertDialog
 import androidx.core.app.ActivityCompat
+import android.animation.ArgbEvaluator
+import android.animation.ValueAnimator
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.util.TypedValue
 import androidx.core.content.FileProvider
+import java.io.File
 import androidx.core.view.doOnPreDraw
 import androidx.databinding.DataBindingUtil
 import androidx.lifecycle.ViewModelProvider
@@ -33,6 +39,7 @@ import androidx.navigation.fragment.navArgs
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.recyclerview.widget.RecyclerView.AdapterDataObserver
+import androidx.recyclerview.widget.SimpleItemAnimator
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetBehavior.BottomSheetCallback
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
@@ -77,7 +84,6 @@ import com.naminfo.utils.showKeyboard
 import androidx.core.net.toUri
 import com.naminfo.ui.main.chat.adapter.ConversationParticipantsAdapter
 import com.naminfo.utils.ShortcutUtils
-import kotlin.collections.*
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 
 @UiThread
@@ -107,6 +113,10 @@ open class ConversationFragment : SlidingPaneChildFragment() {
     private var bottomSheetDialog: BottomSheetDialogFragment? = null
 
     private var filePathToExport: String? = null
+
+    // The adapter can publish several diffs while opening a conversation. Only the first
+    // completed page should trigger the initial displayed-receipt recovery.
+    private var initialDisplayedReceiptRefreshDone = false
 
     private val pickMedia = registerForActivityResult(
         ActivityResultContracts.PickMultipleVisualMedia(
@@ -223,15 +233,14 @@ open class ConversationFragment : SlidingPaneChildFragment() {
                 adapter.notifyItemChanged(positionStart - 1) // For grouping purposes
             } else if (adapter.itemCount != itemCount) {
                 if (viewModel.searchInProgress.value == true) {
-                    val recyclerView = binding.eventsList
-                    var indexToScrollTo = viewModel.itemToScrollTo.value ?: 0
-                    if (indexToScrollTo < 0) indexToScrollTo = 0
-                    Log.i(
-                        "$TAG User has loaded more history to go to a specific message, scrolling to index [$indexToScrollTo]"
-                    )
-                    recyclerView.scrollToPosition(indexToScrollTo)
-                    viewModel.searchInProgress.postValue(false)
+                    scrollToTargetSearchPosition()
+                    return
                 }
+            }
+
+            if (viewModel.searchInProgress.value == true) {
+                scrollToTargetSearchPosition()
+                return
             }
 
             if (viewModel.isUserScrollingUp.value == true) {
@@ -244,6 +253,11 @@ open class ConversationFragment : SlidingPaneChildFragment() {
             if (positionStart == 0 && adapter.itemCount == itemCount) {
                 // First time we fill the list with messages
                 Log.i("$TAG [$itemCount] events have been loaded")
+                if (!initialDisplayedReceiptRefreshDone && itemCount > 0) {
+                    initialDisplayedReceiptRefreshDone = true
+                    Log.i("$TAG Latest messages are visible, refreshing displayed receipts")
+                    viewModel.refreshDisplayedReceipts()
+                }
                 val unreadCount = viewModel.unreadMessagesCount.value ?: 0
                 if (unreadCount > 0) {
                     Log.i("$TAG [$unreadCount] unread messages, scrolling to first one")
@@ -255,6 +269,65 @@ open class ConversationFragment : SlidingPaneChildFragment() {
                 )
                 scrollToFirstUnreadMessageOrBottom()
             }
+        }
+    }
+
+    private fun scrollToTargetSearchPosition() {
+        val targetIndex = (viewModel.itemToScrollTo.value ?: 0).coerceIn(0, (adapter.itemCount - 1).coerceAtLeast(0))
+        Log.i(
+            "$TAG User has loaded more history to go to a specific message, scrolling to index [$targetIndex]"
+        )
+        scrollToAndHighlightPosition(targetIndex)
+        viewModel.searchInProgress.value = false
+    }
+
+    private fun scrollToAndHighlightPosition(position: Int) {
+        if (adapter.itemCount <= 0) return
+        val safePosition = position.coerceIn(0, adapter.itemCount - 1)
+        val recyclerView = binding.eventsList
+        val layoutManager = recyclerView.layoutManager as? LinearLayoutManager
+        if (layoutManager != null) {
+            val offset = (recyclerView.height / 3).coerceAtLeast(120)
+            layoutManager.scrollToPositionWithOffset(safePosition, offset)
+        } else {
+            recyclerView.scrollToPosition(safePosition)
+        }
+        (adapter.currentList.getOrNull(safePosition)?.model as? MessageModel)?.flashHighlight()
+        recyclerView.post {
+            if (!isAdded) return@post
+            recyclerView.findViewHolderForAdapterPosition(safePosition)?.itemView?.let(::flashRowOverlay)
+        }
+    }
+
+    private fun flashRowOverlay(rowView: View) {
+        val typedValue = TypedValue()
+        val resolved = rowView.context.theme.resolveAttribute(R.attr.color_main1_500, typedValue, true)
+        val baseColor = if (resolved && typedValue.data != 0) typedValue.data else 0xFF009688.toInt()
+        val highlightColor = Color.argb(
+            76,
+            Color.red(baseColor),
+            Color.green(baseColor),
+            Color.blue(baseColor)
+        )
+        ValueAnimator.ofObject(ArgbEvaluator(), highlightColor, Color.TRANSPARENT).apply {
+            duration = 1800L
+            addUpdateListener { animator ->
+                if (!rowView.isAttachedToWindow) {
+                    cancel()
+                    return@addUpdateListener
+                }
+                rowView.foreground = ColorDrawable(animator.animatedValue as Int)
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    rowView.foreground = null
+                }
+
+                override fun onAnimationCancel(animation: android.animation.Animator) {
+                    rowView.foreground = null
+                }
+            })
+            start()
         }
     }
 
@@ -498,6 +571,7 @@ open class ConversationFragment : SlidingPaneChildFragment() {
         val layoutManager = LinearLayoutManager(requireContext())
         layoutManager.stackFromEnd = true
         binding.eventsList.layoutManager = layoutManager
+        (binding.eventsList.itemAnimator as? SimpleItemAnimator)?.supportsChangeAnimations = false
 
         binding.sendArea.participants.participantsList.setHasFixedSize(true)
         val participantsLayoutManager = LinearLayoutManager(requireContext())
@@ -641,7 +715,11 @@ open class ConversationFragment : SlidingPaneChildFragment() {
             it.consume {
                 val items = viewModel.eventsList
                 Log.i("$TAG Events (messages) list submitted, contains [${items.size}] items")
-                adapter.submitList(items)
+                adapter.submitList(items) {
+                    if (viewModel.searchInProgress.value == true) {
+                        scrollToTargetSearchPosition()
+                    }
+                }
 
                 // Wait for adapter to have items before setting it in the RecyclerView,
                 // otherwise scroll position isn't retained
@@ -693,24 +771,26 @@ open class ConversationFragment : SlidingPaneChildFragment() {
 
         adapter.scrollToRepliedMessageEvent.observe(viewLifecycleOwner) {
             it.consume { model ->
-                val repliedMessageId = model.replyToMessageId
-                if (repliedMessageId.isNullOrEmpty()) {
+                val candidateIds = model.candidateReplyReferences()
+                if (candidateIds.isEmpty()) {
                     Log.w("$TAG Message [${model.id}] doesn't have a reply to ID!")
                     return@consume
                 }
 
-                val originalMessage = adapter.currentList.find { eventLog ->
-                    !eventLog.isEvent && (eventLog.model as MessageModel).id == repliedMessageId
+                val position = adapter.currentList.indexOfFirst { eventLog ->
+                    !eventLog.isEvent &&
+                        candidateIds.any { ref ->
+                            (eventLog.model as MessageModel).matchesReplyReference(ref)
+                        }
                 }
-                if (originalMessage != null) {
-                    val position = adapter.currentList.indexOf(originalMessage)
-                    Log.i("$TAG Scrolling to position [$position]")
-                    binding.eventsList.scrollToPosition(position)
+                if (position >= 0) {
+                    Log.i("$TAG Scrolling to replied position [$position]")
+                    scrollToAndHighlightPosition(position)
                 } else {
                     Log.w(
-                        "$TAG Failed to find message with ID [$repliedMessageId] in already loaded history, loading missing items"
+                        "$TAG Failed to find message with ID [${model.replyToMessageId}] in already loaded history, loading missing items"
                     )
-                    viewModel.loadDataUpUntilToMessageId(model.replyToMessageId)
+                    viewModel.loadDataUpUntilToMessageId(model.replyToMessageId, candidateIds)
                 }
             }
         }
@@ -932,7 +1012,7 @@ open class ConversationFragment : SlidingPaneChildFragment() {
         }
 
         viewModel.itemToScrollTo.observe(viewLifecycleOwner) { position ->
-            if (position >= 0) {
+            if (position >= 0 && viewModel.searchInProgress.value != true) {
                 val recyclerView = binding.eventsList
                 val layoutManager = recyclerView.layoutManager as LinearLayoutManager
                 val firstDisplayedItemPosition = layoutManager.findFirstVisibleItemPosition()
@@ -1102,6 +1182,23 @@ open class ConversationFragment : SlidingPaneChildFragment() {
         binding.sendArea.messageToSend.addTextChangedListener(textObserver)
 
         scrollListener = object : RecyclerViewScrollListener(layoutManager, 5, false) {
+            private var userScrolled = false
+
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                if (dy != 0) userScrolled = true
+                super.onScrolled(recyclerView, dx, dy)
+            }
+
+            override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                super.onScrollStateChanged(recyclerView, newState)
+                if (newState == RecyclerView.SCROLL_STATE_IDLE && userScrolled) {
+                    userScrolled = false
+                    Log.i("$TAG User scroll completed, marking visible messages read and refreshing displayed receipts")
+                    markVisibleMessagesAsRead()
+                    viewModel.refreshDisplayedReceipts()
+                }
+            }
+
             @UiThread
             override fun onLoadMore(totalItemsCount: Int) {
                 if (viewModel.searchInProgress.value == false) {
@@ -1116,11 +1213,12 @@ open class ConversationFragment : SlidingPaneChildFragment() {
 
             @UiThread
             override fun onScrolledToEnd() {
-                if (viewModel.isUserScrollingUp.value == true) {
-                    viewModel.isUserScrollingUp.value = false
-                    Log.i("$TAG Last message is visible, considering conversation as read")
-                    viewModel.markAsRead()
-                }
+                viewModel.isUserScrollingUp.value = false
+                Log.i("$TAG Last message is visible, considering conversation as read")
+                viewModel.markAsRead()
+                sharedViewModel.updateUnreadMessageCountForCurrentConversationEvent.postValue(
+                    Event(true)
+                )
             }
         }
 
@@ -1133,6 +1231,7 @@ open class ConversationFragment : SlidingPaneChildFragment() {
     override fun onResume() {
         super.onResume()
 
+        coreContext.contactsManager.syncMobionDirectoryAsync()
         viewModel.updateCurrentlyDisplayedConversation()
 
         // Wait for items to be displayed
@@ -1142,6 +1241,12 @@ open class ConversationFragment : SlidingPaneChildFragment() {
 
         if (::scrollListener.isInitialized) {
             binding.eventsList.addOnScrollListener(scrollListener)
+        }
+
+        binding.eventsList.post {
+            if (isResumed && viewModel.isUserScrollingUp.value != true && adapter.itemCount > 0) {
+                markVisibleMessagesAsRead()
+            }
         }
 
         try {
@@ -1232,16 +1337,48 @@ open class ConversationFragment : SlidingPaneChildFragment() {
         viewModel.isUserScrollingUp.value = !bottomReached
         if (bottomReached) {
             viewModel.markAsRead()
+            sharedViewModel.updateUnreadMessageCountForCurrentConversationEvent.postValue(
+                Event(true)
+            )
         } else {
-            val firstUnread = adapter.currentList[firstUnreadMessagePosition]
-            if (firstUnread.model is MessageModel) {
-                Log.i("$TAG Marking only first message (to which user scrolled to) as read")
+            val firstUnread = adapter.currentList.getOrNull(firstUnreadMessagePosition)
+            if (firstUnread?.model is MessageModel) {
+                Log.i("$TAG Marking first unread and visible unread messages as read")
                 firstUnread.model.markAsRead()
                 viewModel.updateUnreadMessageCount()
                 sharedViewModel.updateUnreadMessageCountForCurrentConversationEvent.postValue(
                     Event(true)
                 )
             }
+            recyclerView.post { markVisibleMessagesAsRead() }
+        }
+    }
+
+    private fun markVisibleMessagesAsRead() {
+        if (adapter.itemCount == 0) return
+        val layoutManager = binding.eventsList.layoutManager as? LinearLayoutManager ?: return
+        val firstVisible = layoutManager.findFirstVisibleItemPosition()
+        val lastVisible = layoutManager.findLastVisibleItemPosition()
+        if (firstVisible == RecyclerView.NO_POSITION || lastVisible == RecyclerView.NO_POSITION) return
+
+        if (lastVisible >= adapter.itemCount - 1) {
+            viewModel.isUserScrollingUp.value = false
+            viewModel.markAsRead()
+            sharedViewModel.updateUnreadMessageCountForCurrentConversationEvent.postValue(
+                Event(true)
+            )
+            return
+        }
+
+        val currentList = adapter.currentList
+        val visibleUnread = (firstVisible..lastVisible)
+            .mapNotNull { index -> currentList.getOrNull(index)?.model as? MessageModel }
+            .filter { !it.isOutgoing && !it.isRead }
+        if (visibleUnread.isNotEmpty()) {
+            viewModel.markMessagesAsRead(visibleUnread)
+            sharedViewModel.updateUnreadMessageCountForCurrentConversationEvent.postValue(
+                Event(true)
+            )
         }
     }
 
@@ -1258,6 +1395,12 @@ open class ConversationFragment : SlidingPaneChildFragment() {
 
     private fun goToFileViewer(fileModel: FileModel) {
         val path = fileModel.path
+        val localFile = path.takeIf { it.isNotBlank() }?.let(::File)
+        if (localFile == null || !localFile.isFile || localFile.length() <= 0L) {
+            Log.w("$TAG Skipping file viewer because local file is unavailable [$path]")
+            viewModel.showRedToast(R.string.conversation_file_unavailable_toast, R.drawable.warning_circle)
+            return
+        }
         Log.i("$TAG Navigating to file viewer fragment with path [$path]")
         val extension = FileUtils.getExtensionFromFileName(path)
         val mime = FileUtils.getMimeTypeFromExtension(extension)

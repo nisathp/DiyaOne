@@ -97,7 +97,7 @@ class DrawerMenuViewModel
         @WorkerThread
         override fun onAccountRemoved(core: Core, account: Account) {
             Log.i(
-                "$TAG Account [${account.params.identityAddress?.asStringUriOnly()}] has been removed from the Core"
+                "$TAG An account has been removed from the Core"
             )
             computeAccountsList()
         }

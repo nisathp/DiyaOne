@@ -10,4 +10,5 @@
     <dimen name="top_bar_rounded_corner_radius">0dp</dimen>
 
     <dimen name="chat_bubble_big_image_max_size">175dp</dimen>
+    <dimen name="chat_bubble_compact_media_size">150dp</dimen>
 </resources>

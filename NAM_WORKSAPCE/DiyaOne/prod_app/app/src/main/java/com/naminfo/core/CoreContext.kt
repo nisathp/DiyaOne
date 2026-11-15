@@ -54,6 +54,7 @@ class CoreContext
     constructor(val context: Context) : HandlerThread("Core Thread") {
     companion object {
         private const val TAG = "[Core Context]"
+        const val MEDIA_ENCRYPTION_DEFAULT_NONE_KEY = "media_encryption_default_none_v1"
     }
 
     lateinit var core: Core
@@ -211,6 +212,27 @@ class CoreContext
 
     private val coreListener = object : CoreListenerStub() {
         @WorkerThread
+        private fun onDefaultAccountReady(account: Account) {
+            if (core.accountList.none { it == account }) return
+            OfflineInboxRepository.cacheConfiguredHftHost(core)
+            contactsManager.syncMobionDirectoryAsync()
+            FirebasePresenceRepository.syncRegistration(
+                account.params.identityAddress?.username.orEmpty(),
+                online = true
+            )
+            OutgoingMessageRetryManager.onSipRegistrationRestored()
+            CustomImdn.onSipRegistrationRestored()
+            OfflineInboxRepository.pullForRegisteredAccount(
+                account.params.identityAddress?.username
+            )
+            // Core may start before the user creates the first SIP account.
+            // In that case onCoreStarted() has nothing to configure, so
+            // enable push once the account has actually registered.
+            enablePushNotificationsForConfiguredFreeSwitchAccounts()
+            acknowledgePendingWakeCallIfRegistered()
+        }
+
+        @WorkerThread
         override fun onAccountRegistrationStateChanged(
             core: Core,
             account: Account,
@@ -218,14 +240,14 @@ class CoreContext
             message: String
         ) {
             Log.i("$TAG SIP registration callback state=[$state] message=[$message]")
-            if (state != RegistrationState.Ok) return
-            if (account == core.defaultAccount) {
-                OutgoingMessageRetryManager.onSipRegistrationRestored()
-                // Core may start before the user creates the first SIP account.
-                // In that case onCoreStarted() has nothing to configure, so
-                // enable push once the account has actually registered.
-                enablePushNotificationsForConfiguredFreeSwitchAccounts()
-                acknowledgePendingWakeCallIfRegistered()
+            if (account != core.defaultAccount) return
+            when (state) {
+                RegistrationState.Ok -> onDefaultAccountReady(account)
+                RegistrationState.Cleared, RegistrationState.Failed -> FirebasePresenceRepository.syncRegistration(
+                    account.params.identityAddress?.username.orEmpty(),
+                    online = false
+                )
+                else -> Unit
             }
         }
 
@@ -246,6 +268,12 @@ class CoreContext
             } else if (isAccountOnDefaultDomain && domainFilter != "") {
                 corePreferences.contactsFilter = defaultDomain
                 Log.i("$TAG New default account is on default domain, using that domain as filter instead of wildcard")
+            }
+
+            // During fresh login, RegistrationState.Ok often fires before the login ViewModel
+            // assigns core.defaultAccount, so trigger post-registration hooks once assigned too.
+            if (account != null && account.state == RegistrationState.Ok) {
+                onDefaultAccountReady(account)
             }
         }
 
@@ -309,7 +337,11 @@ class CoreContext
 
         @WorkerThread
         override fun onChatRoomRead(core: Core, chatRoom: ChatRoom) {
-            CustomImdn.roomRead(chatRoom)
+            try {
+                CustomImdn.roomRead(chatRoom)
+            } catch (e: Throwable) {
+                Log.e("$TAG Exception in onChatRoomRead: $e")
+            }
         }
 
         @WorkerThread
@@ -662,6 +694,9 @@ class CoreContext
             Log.i(
                 "$TAG New account configured: [${account.params.identityAddress?.asStringUriOnly()}]"
             )
+            // An HFT Digest request starts from this SIP account. Add the matching
+            // per-account auth record now as well, for accounts created after Core start.
+            configureSharedHftDigestAuth()
             if (!account.params.isPushNotificationAvailable) {
                 if (!corePreferences.keepServiceAlive) {
                     Log.w(
@@ -675,7 +710,7 @@ class CoreContext
 
         @WorkerThread
         override fun onAccountRemoved(core: Core, account: Account) {
-            Log.i("$TAG Account [${account.params.identityAddress?.asStringUriOnly()}] removed, clearing auth request dialog if needed")
+            Log.i("$TAG Account removed from Core, clearing auth request dialog if needed")
             if (account.findAuthInfo() == digestAuthInfoPendingPasswordUpdate) {
                 Log.i("$TAG Removed account matches auth info pending password update, removing dialog")
                 clearAuthenticationRequestDialogEvent.postValue(Event(true))
@@ -791,7 +826,7 @@ class CoreContext
         coreThread = Handler(looper)
 
         core = Factory.instance().createCoreWithConfig(corePreferences.config, context)
-        enableSrtpByDefault()
+        disableSrtpByDefault()
         // `disable_ringing` only controls the ringtone for incoming calls. The outgoing
         // ringback tone has to be configured separately for the caller to hear it after
         // the remote endpoint starts ringing (SIP 180 Ringing).
@@ -861,39 +896,101 @@ class CoreContext
             core.fileTransferServer = localFileTransferServer
             Log.i("$TAG File transfer server configured as [$localFileTransferServer]")
         }
+        configureSharedHftDigestAuth()
+        // Keep received HFT media as a file-transfer attachment. The conversation UI then
+        // shows a compact placeholder and starts the transfer only after the user taps it.
+        core.maxSizeForAutoDownloadIncomingFiles = -1
+        Log.i("$TAG Disabled automatic download for incoming HFT media")
         Log.i("$TAG Core has been configured with user-agent [${core.userAgent}], starting it")
         core.start()
     }
 
-    /** Set the media-encryption default before any account registers or call is created. */
+    /**
+     * The managed HFT currently uses one shared HTTP Digest account. Liblinphone selects an
+     * HTTP credential using the originating SIP account username, then uses AuthInfo.userId
+     * as the Digest username. Therefore every SIP account needs its own matching record with
+     * the shared HFT identity in userId; adding an AuthInfo whose username is only the shared
+     * HFT username makes Liblinphone fall back to the SIP password after a 401 challenge.
+     *
+     * This is intentionally a temporary bridge until every SIP user has a matching HFT digest
+     * identity server-side.
+     */
     @WorkerThread
-    private fun enableSrtpByDefault() {
-        if (core.config.getBool("app", "srtp_default_initialized", false)) {
+    private fun configureSharedHftDigestAuth() {
+        val sharedUsername = context.getString(com.naminfo.R.string.shared_hft_upload_username)
+        val password = context.getString(com.naminfo.R.string.shared_hft_upload_password)
+        val realm = context.getString(com.naminfo.R.string.shared_hft_upload_realm)
+        val domain = context.getString(com.naminfo.R.string.shared_hft_upload_domain)
+        val legacySharedAuth = core.findAuthInfo(realm, sharedUsername, domain)
+        if (
+            legacySharedAuth?.username == sharedUsername &&
+                legacySharedAuth.realm == realm &&
+                legacySharedAuth.domain == domain
+        ) {
+            core.removeAuthInfo(legacySharedAuth)
+        }
+
+        core.accountList
+            .mapNotNull { it.params.identityAddress?.username }
+            .distinct()
+            .forEach { sipUsername ->
+                val existing = core.findAuthInfo(realm, sipUsername, domain)
+                if (
+                    existing?.password == password &&
+                        existing.realm == realm &&
+                        existing.domain == domain
+                ) {
+                    return@forEach
+                }
+                if (existing?.realm == realm && existing.domain == domain) {
+                    core.removeAuthInfo(existing)
+                }
+                core.addAuthInfo(
+                    Factory.instance().createAuthInfo(
+                        sipUsername,
+                        sharedUsername,
+                        password,
+                        null,
+                        realm,
+                        domain
+                    )
+                )
+                Log.i("$TAG Added shared HFT Digest credentials for SIP account [$sipUsername@$domain]")
+            }
+    }
+
+    /** Ensure media encryption defaults to disabled (None) before any account registers or call is created. */
+    @WorkerThread
+    private fun disableSrtpByDefault() {
+        if (core.config.getBool("app", MEDIA_ENCRYPTION_DEFAULT_NONE_KEY, false)) {
             Log.i("$TAG Keeping user's selected media encryption [${core.mediaEncryption}]")
             return
         }
 
-        if (!core.isMediaEncryptionSupported(MediaEncryption.SRTP)) {
-            Log.e("$TAG SRTP is not supported by this SDK build")
-            return
-        }
-
-        core.mediaEncryption = MediaEncryption.SRTP
+        core.mediaEncryption = MediaEncryption.None
+        core.isMediaEncryptionMandatory = false
+        core.config.setBool("app", MEDIA_ENCRYPTION_DEFAULT_NONE_KEY, true)
         core.config.setBool("app", "srtp_default_initialized", true)
-        Log.i("$TAG Default media encryption set to SDES-SRTP")
+        Log.i("$TAG Default media encryption disabled (MediaEncryption.None)")
     }
 
-    /** Use the FreeSWITCH-compatible SDES-SRTP suite only while SRTP is selected in Settings. */
+    /** Apply the selected media-encryption setting to outgoing and incoming call parameters. */
     @WorkerThread
     private fun applySelectedSrtp(params: CallParams, direction: String) {
-        if (core.mediaEncryption != MediaEncryption.SRTP) {
-            Log.i("$TAG Keeping selected media encryption [${core.mediaEncryption}] for $direction call")
-            return
+        when (core.mediaEncryption) {
+            MediaEncryption.SRTP -> {
+                params.mediaEncryption = MediaEncryption.SRTP
+                params.srtpSuites = arrayOf(SrtpSuite.AESCM128HMACSHA180)
+                Log.i("$TAG Offering SDES-SRTP for $direction call")
+            }
+            MediaEncryption.None -> {
+                params.mediaEncryption = MediaEncryption.None
+                Log.i("$TAG SRTP disabled (MediaEncryption.None) for $direction call")
+            }
+            else -> {
+                Log.i("$TAG Keeping selected media encryption [${core.mediaEncryption}] for $direction call")
+            }
         }
-
-        params.mediaEncryption = MediaEncryption.SRTP
-        params.srtpSuites = arrayOf(SrtpSuite.AESCM128HMACSHA180)
-        Log.i("$TAG Offering SDES-SRTP for $direction call")
     }
 
     @WorkerThread
@@ -1128,6 +1225,8 @@ class CoreContext
     @UiThread
     fun onForeground() {
         postOnCoreThread {
+            OfflineInboxRepository.cacheConfiguredHftHost(core)
+            contactsManager.syncMobionDirectoryAsync()
             // We can't rely on defaultAccount?.params?.isPublishEnabled
             // as it will be modified by the SDK when changing the presence status
             if (corePreferences.publishPresence) {
@@ -1329,8 +1428,8 @@ class CoreContext
         } else {
             address
         }
-        // SDES-SRTP is the app default. Keep an explicit ZRTP request intact, but otherwise
-        // offer the same SRTP suite for every outgoing SIP call.
+        // Keep an explicit ZRTP request intact; otherwise apply the configured media encryption
+        // (disabled by default) for every outgoing SIP call.
         if (!forceZRTP) {
             applySelectedSrtp(params, "outgoing")
         }
@@ -1441,6 +1540,7 @@ class CoreContext
 
     fun saveTokenToFirestoreBackend(phoneNumber: String, fcmToken: String) {
         if (phoneNumber.isBlank() || fcmToken.isBlank()) return
+        OfflineInboxRepository.updateCachedFcmToken(fcmToken)
         Thread {
             try {
                 val url = URL("https://androidpushnotification.vercel.app/api/save-token")
@@ -1468,6 +1568,15 @@ class CoreContext
                     ?.bufferedReader()?.use { it.readText() }
                 ApiLogRepository.complete(logId, code, response)
                 Log.i("$TAG Token auto-save to Firestore backend for [$phoneNumber] status: $code")
+                if (code in 200..299) {
+                    postOnCoreThread {
+                        val defaultAccount = core.defaultAccount
+                        val defaultUsername = defaultAccount?.params?.identityAddress?.username
+                        if (defaultUsername == phoneNumber && defaultAccount.state == RegistrationState.Ok) {
+                            OfflineInboxRepository.pullForRegisteredAccount(phoneNumber)
+                        }
+                    }
+                }
             } catch (e: Exception) {
                 ApiLogRepository.begin("POST", "https://androidpushnotification.vercel.app/api/save-token")
                     .also { ApiLogRepository.fail(it, e) }
@@ -1477,9 +1586,17 @@ class CoreContext
     }
 
     fun fetchAndSyncFcmToken() {
-        val username = core.defaultAccount?.params?.identityAddress?.username.orEmpty()
-        if (username.isBlank()) return
-        val prid = core.defaultAccount?.params?.pushNotificationConfig?.prid.orEmpty()
+        postOnCoreThread {
+            if (!isReady()) return@postOnCoreThread
+            val params = core.defaultAccount?.params ?: return@postOnCoreThread
+            val username = params.identityAddress?.username.orEmpty()
+            if (username.isBlank()) return@postOnCoreThread
+            val prid = params.pushNotificationConfig?.prid.orEmpty()
+            fetchAndSyncFcmTokenForUser(username, prid)
+        }
+    }
+
+    private fun fetchAndSyncFcmTokenForUser(username: String, prid: String) {
         if (prid.isNotBlank()) {
             Log.i("$TAG Syncing FCM token from pushNotificationConfig.prid for $username: $prid")
             saveTokenToFirestoreBackend(username, prid)
@@ -1491,6 +1608,7 @@ class CoreContext
                     if (task.isSuccessful && !task.result.isNullOrBlank()) {
                         val token = task.result
                         Log.i("$TAG Fetched current live FCM token: $token for $username")
+                        OfflineInboxRepository.updateCachedFcmToken(token)
                         saveTokenToFirestoreBackend(username, token)
                     } else {
                         Log.e("$TAG Failed to fetch FCM token: ${task.exception}")
@@ -1539,8 +1657,7 @@ class CoreContext
             return
         }
 
-        // Mirror the caller's default on the B-party answer. This ensures the 200 OK offers
-        // SDES-SRTP too, rather than relying only on the incoming INVITE's parameters.
+        // Apply the configured media encryption policy (disabled by default) on incoming answers too.
         applySelectedSrtp(params, "incoming answer")
 
         // `Call-ID` itself is generated and owned by the SIP stack.  Do not

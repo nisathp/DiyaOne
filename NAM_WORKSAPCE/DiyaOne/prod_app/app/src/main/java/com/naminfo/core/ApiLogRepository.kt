@@ -61,6 +61,9 @@ object ApiLogRepository {
         }
     }
 
+    /** Redacts credentials before an API diagnostic is shown to the user or sent to Crashlytics. */
+    fun sanitizeForDisplay(value: String?): String? = sanitize(value)
+
     private fun update(id: Long, change: (Entry) -> Entry) = synchronized(lock) {
         val index = history.indexOfFirst { it.id == id }
         if (index < 0) return@synchronized

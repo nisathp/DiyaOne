@@ -64,7 +64,7 @@ class HistoryListViewModel
 
     private val tempCallLogsList = ArrayList<CallLogModelWrapper>()
 
-    private val magicSearch = coreContext.core.createMagicSearch()
+    private lateinit var magicSearch: MagicSearch
 
     private val magicSearchListener = object : MagicSearchListenerStub() {
         @WorkerThread
@@ -108,12 +108,22 @@ class HistoryListViewModel
         fetchInProgress.value = true
 
         coreContext.postOnCoreThread { core ->
+            coreContext.contactsManager.syncMobionDirectoryAsync()
             coreContext.contactsManager.addListener(contactsListener)
             core.addListener(coreListener)
-            magicSearch.addListener(magicSearchListener)
+            ensureMagicSearch(core)
 
             computeCallLogsList(currentFilter)
         }
+    }
+
+    @WorkerThread
+    private fun ensureMagicSearch(core: Core): MagicSearch {
+        if (!::magicSearch.isInitialized) {
+            magicSearch = core.createMagicSearch()
+            magicSearch.addListener(magicSearchListener)
+        }
+        return magicSearch
     }
 
     @UiThread
@@ -123,7 +133,9 @@ class HistoryListViewModel
         coreContext.postOnCoreThread { core ->
             coreContext.contactsManager.removeListener(contactsListener)
             core.removeListener(coreListener)
-            magicSearch.removeListener(magicSearchListener)
+            if (::magicSearch.isInitialized) {
+                magicSearch.removeListener(magicSearchListener)
+            }
         }
     }
 
@@ -241,7 +253,7 @@ class HistoryListViewModel
 
         val isFilterEmpty = filter.isEmpty()
         if (!isFilterEmpty) {
-            magicSearch.getContactsListAsync(
+            ensureMagicSearch(coreContext.core).getContactsListAsync(
                 filter,
                 corePreferences.contactsFilter,
                 MagicSearch.Source.All.toInt(),

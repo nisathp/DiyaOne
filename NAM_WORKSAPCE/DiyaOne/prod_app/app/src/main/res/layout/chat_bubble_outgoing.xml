@@ -47,6 +47,7 @@
         <androidx.appcompat.widget.AppCompatTextView
             style="@style/default_text_style_300"
             android:id="@+id/reply_name"
+            android:onClick="@{scrollToRepliedMessageClickListener}"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginEnd="8dp"
@@ -54,12 +55,13 @@
             android:textSize="12sp"
             android:textColor="?attr/color_main2_500"
             app:drawableTint="?attr/color_main2_500"
-            app:layout_constraintEnd_toEndOf="@id/reply"
+            app:layout_constraintEnd_toEndOf="@id/bubble"
             app:layout_constraintTop_toTopOf="parent"
             app:layout_constraintBottom_toTopOf="@id/reply" />
 
         <ImageView
             android:id="@+id/reply_icon"
+            android:onClick="@{scrollToRepliedMessageClickListener}"
             android:layout_width="@dimen/small_icon_size"
             android:layout_height="@dimen/small_icon_size"
             android:layout_marginEnd="5dp"
@@ -71,22 +73,23 @@
 
         <View
             android:id="@+id/reply_background"
+            android:onClick="@{scrollToRepliedMessageClickListener}"
             android:layout_width="0dp"
             android:layout_height="0dp"
             android:layout_marginBottom="-20dp"
             android:background="@drawable/shape_chat_bubble_reply"
             app:layout_constraintTop_toTopOf="@id/reply"
-            app:layout_constraintStart_toStartOf="@id/reply"
-            app:layout_constraintEnd_toEndOf="@id/reply"
+            app:layout_constraintStart_toStartOf="@id/bubble"
+            app:layout_constraintEnd_toEndOf="@id/bubble"
             app:layout_constraintBottom_toTopOf="@id/bubble"/>
 
         <androidx.appcompat.widget.AppCompatTextView
             style="@style/default_text_style"
             android:onClick="@{scrollToRepliedMessageClickListener}"
             android:id="@+id/reply"
-            android:layout_width="wrap_content"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_marginStart="32dp"
+            android:layout_marginStart="6dp"
             android:text="@{model.replyText, default=`Reply`}"
             android:textColor="?attr/color_main2_500"
             android:textSize="14sp"
@@ -94,9 +97,23 @@
             android:ellipsize="end"
             android:padding="10dp"
             app:layout_constraintHorizontal_bias="0"
-            app:layout_constraintWidth_max="@dimen/chat_bubble_max_reply_width"
+            app:layout_constraintStart_toEndOf="@id/reply_image"
             app:layout_constraintEnd_toEndOf="@id/bubble"
             app:layout_constraintTop_toBottomOf="@id/reply_name" />
+
+        <ImageView
+            android:id="@+id/reply_image"
+            android:onClick="@{scrollToRepliedMessageClickListener}"
+            android:layout_width="@dimen/chat_bubble_reply_media_preview_size"
+            android:layout_height="@dimen/chat_bubble_reply_media_preview_size"
+            android:layout_marginStart="8dp"
+            android:contentDescription="@string/content_description_chat_bubble_reply"
+            android:scaleType="centerCrop"
+            android:visibility="@{model.isReply &amp;&amp; model.isReplyImage ? View.VISIBLE : View.GONE, default=gone}"
+            app:coilReplyPreview="@{model.replyImagePath}"
+            app:layout_constraintStart_toStartOf="@id/bubble"
+            app:layout_constraintTop_toTopOf="@id/reply"
+            app:layout_constraintBottom_toBottomOf="@id/reply" />
 
         <androidx.appcompat.widget.AppCompatTextView
             style="@style/default_text_style_300"
@@ -270,6 +287,19 @@
                     android:layout_marginStart="5dp"
                     android:text="@{model.time, default=`13:40`}"
                     android:textSize="12sp" />
+
+                <androidx.appcompat.widget.AppCompatImageButton
+                    android:id="@+id/retry_failed_media_upload"
+                    android:onClick="@{() -> model.resend()}"
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:layout_marginStart="4dp"
+                    android:background="@android:color/transparent"
+                    android:contentDescription="@string/menu_resend_chat_message"
+                    android:padding="4dp"
+                    android:src="@drawable/upload_retry"
+                    app:tint="?attr/color_main2_500"
+                    android:visibility="@{model.hasOutgoingFileAttachment &amp;&amp; model.isFileUploadFailed ? View.VISIBLE : View.GONE, default=gone}" />
 
                 <ImageView
                     style="@style/default_text_style_300"

@@ -118,6 +118,15 @@ class SettingsFragment : GenericMainFragment() {
         }
     }
 
+    private val mediaEncryptionDropdownListener = object : AdapterView.OnItemSelectedListener {
+        override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+            viewModel.setMediaEncryption(position)
+        }
+
+        override fun onNothingSelected(parent: AdapterView<*>?) {
+        }
+    }
+
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
@@ -158,6 +167,10 @@ class SettingsFragment : GenericMainFragment() {
                 val action = SettingsFragmentDirections.actionSettingsFragmentToSettingsDeveloperFragment()
                 findNavController().navigate(action)
             }
+        }
+
+        viewModel.mediaEncryptionIndex.observe(viewLifecycleOwner) {
+            setupMediaEncryptionPicker()
         }
 
         viewModel.recreateActivityEvent.observe(viewLifecycleOwner) {
@@ -341,6 +354,19 @@ class SettingsFragment : GenericMainFragment() {
         }
 
         startPostponedEnterTransition()
+    }
+
+    private fun setupMediaEncryptionPicker() {
+        val index = viewModel.mediaEncryptionIndex.value ?: 0
+        val adapter = ArrayAdapter(
+            requireContext(),
+            R.layout.drop_down_item,
+            viewModel.mediaEncryptionLabels
+        )
+        adapter.setDropDownViewResource(R.layout.generic_dropdown_cell)
+        binding.callsSettings.mediaEncryption.adapter = adapter
+        binding.callsSettings.mediaEncryption.onItemSelectedListener = mediaEncryptionDropdownListener
+        binding.callsSettings.mediaEncryption.setSelection(index)
     }
 
     @Deprecated("Deprecated in Java")

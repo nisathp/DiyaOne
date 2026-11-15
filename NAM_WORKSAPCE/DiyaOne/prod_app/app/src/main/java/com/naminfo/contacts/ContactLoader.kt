@@ -10,10 +10,12 @@ import androidx.annotation.WorkerThread
 import androidx.loader.app.LoaderManager
 import androidx.loader.content.CursorLoader
 import androidx.loader.content.Loader
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import java.lang.Exception
 import com.naminfo.DiyaOneApplication.Companion.coreContext
@@ -163,6 +165,7 @@ class ContactLoader : LoaderManager.LoaderCallbacks<Cursor> {
 
             val friends = HashMap<String, Friend>()
             while (!cursor.isClosed && cursor.moveToNext()) {
+                scope.coroutineContext.ensureActive()
                 try {
                     val id: String = cursor.getString(contactIdColumn)
                     val mime: String? = cursor.getString(mimetypeColumn)
@@ -174,10 +177,9 @@ class ContactLoader : LoaderManager.LoaderCallbacks<Cursor> {
                         if (!displayName.isNullOrEmpty()) {
                             friend.name = displayName
 
-                            val uri = friend.getNativeContactPictureUri()
-                            if (uri != null) {
-                                friend.photo = uri.toString()
-                            }
+                            // Do not resolve photos while importing the full address book.
+                            // Resolving an absent display_photo opens the Contacts provider for
+                            // every entry; avatars are resolved lazily for visible contacts.
 
                             val starred = cursor.getInt(starredColumn) == 1
                             friend.starred = starred
@@ -202,7 +204,7 @@ class ContactLoader : LoaderManager.LoaderCallbacks<Cursor> {
 
                             val label =
                                 PhoneNumberUtils.addressBookLabelTypeToVcardParamString(
-                                    data2?.toInt()
+                                    data2?.toIntOrNull()
                                         ?: ContactsContract.CommonDataKinds.BaseTypes.TYPE_CUSTOM,
                                     data3
                                 )
@@ -262,10 +264,14 @@ class ContactLoader : LoaderManager.LoaderCallbacks<Cursor> {
             }
 
             Log.i("$TAG Contacts parsed, posting another task to handle adding them (or not)")
+            scope.coroutineContext.ensureActive()
             // Re-post another task to allow other tasks on Core thread
             coreContext.postOnCoreThreadWhenAvailableForHeavyTask({
                 addFriendsIfNeeded(friends)
             }, "add friends to Core")
+        } catch (ce: CancellationException) {
+            // The loader was replaced before this large import finished.
+            throw ce
         } catch (sde: StaleDataException) {
             Log.e("$TAG State Data Exception: $sde")
         } catch (ise: IllegalStateException) {
@@ -277,6 +283,7 @@ class ContactLoader : LoaderManager.LoaderCallbacks<Cursor> {
 
     @WorkerThread
     private fun addFriendsIfNeeded(friends: HashMap<String, Friend>) {
+        scope.coroutineContext.ensureActive()
         val core = coreContext.core
 
         if (core.globalState == GlobalState.Shutdown || core.globalState == GlobalState.Off) {

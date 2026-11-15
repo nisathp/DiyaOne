@@ -1,6 +1,5 @@
 package com.naminfo.ui.main.contacts.viewmodel
 
-import android.provider.ContactsContract
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.Observer
 import androidx.lifecycle.ViewModel
@@ -83,7 +82,7 @@ class MatchedContactsViewModel : ViewModel() {
 
                 val phoneContacts = withContext(Dispatchers.IO) {
                     if (PhoneContactNumbers.hasPermission(coreContext.context)) {
-                        readPhoneContacts()
+                        PhoneContactNumbers.readSavedNames(coreContext.context)
                     } else {
                         emptyMap()
                     }
@@ -150,54 +149,6 @@ class MatchedContactsViewModel : ViewModel() {
                 }
             }
         }
-    }
-
-    private fun readPhoneContacts(): Map<String, String> {
-        val context = coreContext.context
-
-        check(PhoneContactNumbers.hasPermission(context)) {
-            "Contacts permission is required."
-        }
-
-        val result = linkedMapOf<String, String>()
-
-        val cursor = context.contentResolver.query(
-            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-            arrayOf(
-                ContactsContract.CommonDataKinds.Phone.NUMBER,
-                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY
-            ),
-            null,
-            null,
-            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY +
-                    " COLLATE LOCALIZED ASC"
-        ) ?: error("Unable to read the phone book.")
-
-        cursor.use {
-            val numberColumn = it.getColumnIndexOrThrow(
-                ContactsContract.CommonDataKinds.Phone.NUMBER
-            )
-            val nameColumn = it.getColumnIndexOrThrow(
-                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY
-            )
-
-            while (it.moveToNext()) {
-                val number = PhoneContactNumbers.normalize(
-                    it.getString(numberColumn).orEmpty()
-                )
-                val name = it.getString(nameColumn).orEmpty().trim()
-
-                if (number.isNotBlank()) {
-                    if (!result.containsKey(number) ||
-                        result[number].isNullOrBlank()
-                    ) {
-                        result[number] = name
-                    }
-                }
-            }
-        }
-
-        return result
     }
 
     // Called only on the Core thread.
@@ -292,7 +243,7 @@ class MatchedContactsViewModel : ViewModel() {
             .sortedBy { it.contactName.orEmpty().lowercase() }
 
         core.config.sync()
-        coreContext.contactsManager.notifyContactsListChanged()
+        coreContext.contactsManager.invalidateCachesAndNotify()
 
         return result
     }

@@ -88,14 +88,14 @@ open class AccountLoginViewModel
                     core.removeListener(this)
 
                     val error = when (account.error) {
-                        Reason.Forbidden -> {
+                        Reason.Forbidden, Reason.Unauthorized -> {
                             AppUtils.getString(R.string.assistant_account_login_forbidden_error)
                         }
+                        Reason.IOError, Reason.NoResponse, Reason.ServerTimeout -> {
+                            AppUtils.getString(R.string.assistant_account_login_sip_server_unreachable_error)
+                        }
                         else -> {
-                            AppUtils.getFormattedString(
-                                R.string.assistant_account_login_error,
-                                account.error.toString()
-                            )
+                            AppUtils.getString(R.string.assistant_account_login_error)
                         }
                     }
                     accountLoginErrorEvent.postValue(Event(error))

@@ -2,6 +2,8 @@ package com.naminfo.ui.main.chat.viewmodel
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Handler
+import android.os.Looper
 import android.text.Spannable
 import android.view.inputmethod.EditorInfo
 import androidx.annotation.UiThread
@@ -18,6 +20,7 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.core.FileTransferApiLogger
+import com.naminfo.core.OfflineInboxRepository
 import com.naminfo.core.OutgoingMessageRetryManager
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
@@ -38,6 +41,8 @@ import com.naminfo.ui.GenericViewModel
 import com.naminfo.ui.main.chat.model.FileModel
 import com.naminfo.ui.main.chat.model.MessageModel
 import com.naminfo.ui.main.chat.model.ParticipantModel
+import com.naminfo.ui.main.chat.addReplyMetadataAndFallback
+import com.naminfo.ui.main.chat.ChatForwardDispatcher
 import com.naminfo.ui.main.chat.createOutgoingTextMessage
 import com.naminfo.ui.main.chat.ChatDraftRepository
 import com.naminfo.ui.main.chat.SingleFlightGate
@@ -217,12 +222,21 @@ class SendMessageInConversationViewModel
     fun configureChatRoom(room: ChatRoom) {
         Log.i("$TAG Chat room configured")
         chatRoom = room
-        val conversationId = LinphoneUtils.getConversationId(room)
-        if (configuredDraftConversationId != conversationId) {
-            configuredDraftConversationId = conversationId
-            textToSend.value = ChatDraftRepository.get(conversationId)
-        }
         coreContext.postOnCoreThread {
+            // A ChatRoom's native properties must never be read on the UI thread.
+            // While the Core thread marks a message read it holds the Core lock and
+            // asks the room for its unread history. Reading the room here used to
+            // invert those two locks and freeze Samsung devices for 10+ seconds.
+            val conversationId = LinphoneUtils.getConversationId(room)
+            Handler(Looper.getMainLooper()).post {
+                // The user may have navigated to another conversation meanwhile.
+                if (!::chatRoom.isInitialized || chatRoom !== room) return@post
+                if (configuredDraftConversationId != conversationId) {
+                    configuredDraftConversationId = conversationId
+                    textToSend.value = ChatDraftRepository.get(conversationId)
+                }
+            }
+
             chatRoom.addListener(chatRoomListener)
 
             val ime = if (chatRoom.hasCapability(ChatRoom.Capabilities.Encrypted.toInt())) {
@@ -329,143 +343,175 @@ class SendMessageInConversationViewModel
             return
         }
 
+        val toSend = textToSend.value.orEmpty().trim()
+        val pendingAttachments = attachments.value.orEmpty().toList()
+        val isVoiceRecordingSnapshot = isVoiceRecording.value == true
+
         coreContext.postOnCoreThread {
-            val isBasicChatRoom: Boolean = chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())
+            try {
+                if (!::chatRoom.isInitialized) {
+                    Log.w("$TAG Chat room isn't initialized yet, ignoring send request")
+                    return@postOnCoreThread
+                }
 
-            val toSend = textToSend.value.orEmpty().trim()
-            val messageToReplyTo = chatMessageToReplyTo
-            val messageToEdit = chatMessageToEdit
-            if (messageToReplyTo != null) {
-                Log.i("$TAG Sending message as reply to [${messageToReplyTo.messageId}]")
-            }
-            val message = createOutgoingTextMessage(chatRoom, messageToReplyTo, messageToEdit, toSend)
-            var contentAdded = toSend.isNotEmpty()
+                val isBasicChatRoom: Boolean = chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())
 
-            if (isVoiceRecording.value == true && voiceMessageRecorder.file != null) {
-                stopVoiceRecorder()
-                val content = voiceMessageRecorder.createContent()
-                if (content != null) {
-                    Log.i(
-                        "$TAG Voice recording content created, file name is ${content.name} and duration is ${content.fileDuration}"
-                    )
-                    if (isBasicChatRoom && contentAdded) {
-                        val voiceMessage = chatRoom.createEmptyMessage()
-                        voiceMessage.addContent(content)
-                        CustomImdn.prepareOutgoing(voiceMessage)
-                        OutgoingMessageRetryManager.watch(voiceMessage)
-                        voiceMessage.send()
-                        messageSentEvent.postValue(Event(voiceMessage))
+                val messageToReplyTo = chatMessageToReplyTo
+                val messageToEdit = chatMessageToEdit
+                // Basic SIP persists each file as a separate message. A reply caption must travel
+                // with the first attachment instead of becoming a detached text-only reply bubble.
+                val replyWillBeAttachedToMedia =
+                    isBasicChatRoom && messageToReplyTo != null && pendingAttachments.isNotEmpty()
+                if (messageToReplyTo != null) {
+                    Log.i("$TAG Sending message as reply to [${messageToReplyTo.messageId}]")
+                }
+                val message = createOutgoingTextMessage(chatRoom, messageToReplyTo, messageToEdit, toSend)
+                var contentAdded = toSend.isNotEmpty()
+
+                if (isVoiceRecordingSnapshot && ::voiceMessageRecorder.isInitialized && voiceMessageRecorder.file != null) {
+                    stopVoiceRecorder()
+                    val content = voiceMessageRecorder.createContent()
+                    if (content != null) {
+                        Log.i(
+                            "$TAG Voice recording content created, file name is ${content.name} and duration is ${content.fileDuration}"
+                        )
+                        if (isBasicChatRoom && contentAdded) {
+                            val voiceMessage = chatRoom.createEmptyMessage()
+                            voiceMessage.addContent(content)
+                            CustomImdn.prepareOutgoing(voiceMessage)
+                            OutgoingMessageRetryManager.watch(voiceMessage)
+                            voiceMessage.send()
+                            messageSentEvent.postValue(Event(voiceMessage))
+                        } else {
+                            message.addContent(content)
+                        }
                     } else {
-                        message.addContent(content)
+                        Log.e("$TAG Voice recording content couldn't be created!")
                     }
                 } else {
-                    Log.e("$TAG Voice recording content couldn't be created!")
-                }
-            } else {
-                for (attachment in attachments.value.orEmpty()) {
-                    val content = Factory.instance().createContent()
+                    pendingAttachments.forEachIndexed { index, attachment ->
+                        val content = Factory.instance().createContent()
 
-                    content.type = when (attachment.mimeType) {
-                        FileUtils.MimeType.Image -> "image"
-                        FileUtils.MimeType.Audio -> "audio"
-                        FileUtils.MimeType.Video -> "video"
-                        FileUtils.MimeType.Pdf -> "application"
-                        FileUtils.MimeType.PlainText -> "text"
-                        else -> "file"
-                    }
-                    content.subtype = if (attachment.mimeType == FileUtils.MimeType.PlainText) {
-                        "plain"
-                    } else {
-                        FileUtils.getExtensionFromFileName(attachment.fileName)
-                    }
-                    content.name = attachment.fileName
-                    // Let the file body handler take care of the upload
-                    content.filePath = attachment.path
+                        content.type = when (attachment.mimeType) {
+                            FileUtils.MimeType.Image -> "image"
+                            FileUtils.MimeType.Audio -> "audio"
+                            FileUtils.MimeType.Video -> "video"
+                            FileUtils.MimeType.Pdf -> "application"
+                            FileUtils.MimeType.PlainText -> "text"
+                            else -> "file"
+                        }
+                        content.subtype = if (attachment.mimeType == FileUtils.MimeType.PlainText) {
+                            "plain"
+                        } else {
+                            FileUtils.getExtensionFromFileName(attachment.fileName).ifEmpty { "octet-stream" }
+                        }
+                        content.name = attachment.fileName
+                        // Let the file body handler take care of the upload
+                        content.filePath = attachment.path
 
-                    if (isBasicChatRoom) {
-                        val fileMessage = chatRoom.createEmptyMessage()
-                        fileMessage.addFileContent(content)
-                        // Basic SIP carries one file per message. Send each selected
-                        // file as its own Core message so every item is persisted in
-                        // chat history and Linphone can retry the full batch after
-                        // the network returns. A ViewModel-owned queue loses all but
-                        // its active item when the chat screen is recreated.
-                        Log.i("$TAG Sending Basic SIP attachment [${attachment.fileName}]")
-                        val transferLogId = FileTransferApiLogger.beginUpload(
-                            core.fileTransferServer.orEmpty(),
-                            attachment.fileName,
-                            attachment.fileSize
-                        )
-                        fileMessage.addListener(object : ChatMessageListenerStub() {
-                            override fun onMsgStateChanged(
-                                changedMessage: ChatMessage,
-                                state: ChatMessage.State?
-                            ) {
-                                when (state) {
-                                    ChatMessage.State.FileTransferDone ->
-                                        FileTransferApiLogger.completeUpload(transferLogId)
-
-                                    ChatMessage.State.FileTransferError,
-                                    ChatMessage.State.NotDelivered ->
-                                        FileTransferApiLogger.failUpload(
-                                            transferLogId,
-                                            "File transfer ended with state $state"
-                                        )
-
-                                    else -> Unit
-                                }
+                        if (isBasicChatRoom) {
+                            val fileMessage = chatRoom.createEmptyMessage()
+                            fileMessage.addFileContent(content)
+                            messageToReplyTo?.let { replyTarget ->
+                                // Basic SIP rooms cannot send multipart (text + HFT XML) in a
+                                // single MESSAGE. Carry reply preview & caption via SIP headers
+                                // alone so HFT XML transmission stays intact.
+                                addReplyMetadataAndFallback(
+                                    fileMessage,
+                                    replyTarget,
+                                    if (index == 0) toSend else "",
+                                    includeBodyFallback = false
+                                )
                             }
-                        })
-                        CustomImdn.prepareOutgoing(fileMessage)
-                        OutgoingMessageRetryManager.watch(fileMessage)
-                        fileMessage.send()
-                        messageSentEvent.postValue(Event(fileMessage))
-                    } else {
-                        message.addFileContent(content)
-                        contentAdded = true
+                            // Basic SIP carries one file per message. Send each selected
+                            // file as its own Core message so every item is persisted in
+                            // chat history and Linphone can retry the full batch after
+                            // the network returns. A ViewModel-owned queue loses all but
+                            // its active item when the chat screen is recreated.
+                            Log.i("$TAG Sending Basic SIP attachment [${attachment.fileName}]")
+                            val transferLogId = FileTransferApiLogger.beginUpload(
+                                coreContext.core.fileTransferServer.orEmpty(),
+                                attachment.fileName,
+                                attachment.fileSize
+                            )
+                            fileMessage.addListener(object : ChatMessageListenerStub() {
+                                override fun onMsgStateChanged(
+                                    changedMessage: ChatMessage,
+                                    state: ChatMessage.State?
+                                ) {
+                                    when (state) {
+                                        ChatMessage.State.FileTransferDone -> {
+                                            FileTransferApiLogger.completeUpload(transferLogId)
+                                            // This listener receives the native HFT completion event
+                                            // reliably. FreeSWITCH can acknowledge SIP delivery while
+                                            // the peer handset is offline, so persist the signed HFT
+                                            // URL before that proxy acknowledgement is treated as final.
+                                            OfflineInboxRepository.enqueueUploadedMedia(changedMessage)
+                                        }
+
+                                        ChatMessage.State.FileTransferError,
+                                        ChatMessage.State.NotDelivered ->
+                                            FileTransferApiLogger.failUpload(
+                                                transferLogId,
+                                                "File transfer ended with state $state"
+                                            )
+
+                                        else -> Unit
+                                    }
+                                }
+                            })
+                            CustomImdn.prepareOutgoing(fileMessage)
+                            OutgoingMessageRetryManager.watch(fileMessage)
+                            fileMessage.send()
+                            messageSentEvent.postValue(Event(fileMessage))
+                        } else {
+                            message.addFileContent(content)
+                            contentAdded = true
+                        }
                     }
                 }
-            }
 
-            if (message.contents.isNotEmpty()) {
-                Log.i("$TAG Sending message")
-                // val customMessageId = java.util.UUID.randomUUID().toString()
-                // message.addCustomHeader("X-Diya-Message-ID", customMessageId)
+                if (message.contents.isNotEmpty() && !replyWillBeAttachedToMedia) {
+                    Log.i("$TAG Sending message")
+                    // val customMessageId = java.util.UUID.randomUUID().toString()
+                    // message.addCustomHeader("X-Diya-Message-ID", customMessageId)
 
-                // Log.i("[Custom IMDN] Sending original message id=$customMessageId")
-                CustomImdn.prepareOutgoing(message)
-                OutgoingMessageRetryManager.watch(message)
-                message.send()
-                messageSentEvent.postValue(Event(message))
-            }
+                    // Log.i("[Custom IMDN] Sending original message id=$customMessageId")
+                    CustomImdn.prepareOutgoing(message)
+                    OutgoingMessageRetryManager.watch(message)
+                    message.send()
+                    messageSentEvent.postValue(Event(message))
+                }
 
-            // Editing a sent message must not erase a separate unsent draft.
-            if (messageToEdit == null) {
-                configuredDraftConversationId?.let { ChatDraftRepository.save(it, "") }
-            }
+                // Editing a sent message must not erase a separate unsent draft.
+                if (messageToEdit == null) {
+                    configuredDraftConversationId?.let { ChatDraftRepository.save(it, "") }
+                }
 
-            Log.i("$TAG Message sent, re-setting defaults")
-            textToSend.postValue("")
-            isReplying.postValue(false)
-            isEditing.postValue(false)
-            isFileAttachmentsListOpen.postValue(false)
-            isParticipantsListOpen.postValue(false)
-            isEmojiPickerOpen.postValue(false)
+                Log.i("$TAG Message sent, re-setting defaults")
+                textToSend.postValue("")
+                isReplying.postValue(false)
+                isEditing.postValue(false)
+                isFileAttachmentsListOpen.postValue(false)
+                isParticipantsListOpen.postValue(false)
+                isEmojiPickerOpen.postValue(false)
 
-            if (::voiceMessageRecorder.isInitialized) {
-                stopVoiceRecorder()
-            }
-            isVoiceRecording.postValue(false)
+                if (::voiceMessageRecorder.isInitialized) {
+                    stopVoiceRecorder()
+                }
+                isVoiceRecording.postValue(false)
 
-            // Warning: do not delete files
-            val attachmentsList = arrayListOf<FileModel>()
-            attachments.postValue(attachmentsList)
+                // Warning: do not delete files
+                val attachmentsList = arrayListOf<FileModel>()
+                attachments.postValue(attachmentsList)
 
-            chatMessageToReplyTo = null
-            chatMessageToEdit = null
-            maxNumberOfAttachmentsReached.postValue(false)
-            coreContext.postOnMainThread {
-                sendRequestGate.complete()
+                chatMessageToReplyTo = null
+                chatMessageToEdit = null
+                maxNumberOfAttachmentsReached.postValue(false)
+            } finally {
+                coreContext.postOnMainThread {
+                    sendRequestGate.complete()
+                }
             }
         }
     }
@@ -606,32 +652,37 @@ class SendMessageInConversationViewModel
 
     @UiThread
     fun forwardMessage(toForward: MessageModel) {
-        coreContext.postOnCoreThread {
-            if (::chatRoom.isInitialized) {
-                val messageToForward = toForward.chatMessage
-                val forwardedMessage =
-                    chatRoom.createForwardMessage(messageToForward)
+        ChatForwardDispatcher.capturePayload(toForward) { captured ->
+            ChatForwardDispatcher.prepareLocalAttachments(captured) { prepared ->
+                coreContext.postOnCoreThread {
+                    if (!::chatRoom.isInitialized || prepared.isEmpty()) {
+                        Log.w("$TAG Cannot forward message: room missing or payload empty")
+                        prepared.cleanupStaging()
+                        showRedToast(
+                            R.string.conversation_message_forward_cancelled_toast,
+                            R.drawable.warning_circle
+                        )
+                        return@postOnCoreThread
+                    }
 
-                // Each forward is a new message.
-                // Clear any copied custom ID and receipt state.
-                forwardedMessage.appdata = null
-                forwardedMessage.removeCustomHeader("X-Diya-Message-ID")
-
-                CustomImdn.prepareOutgoing(forwardedMessage)
-                OutgoingMessageRetryManager.watch(forwardedMessage)
-
-                Log.i(
-                    "$TAG Sending forwarded message " +
-                            "customId=${CustomImdn.id(forwardedMessage)}"
-                )
-
-                forwardedMessage.send()
-                messageSentEvent.postValue(Event(forwardedMessage))
-
-                showGreenToast(
-                    R.string.conversation_message_forwarded_toast,
-                    R.drawable.forward
-                )
+                    val sent = ChatForwardDispatcher.dispatchPayloadToChatRoom(
+                        chatRoom = chatRoom,
+                        payload = prepared,
+                        onMessageSent = { messageSentEvent.postValue(Event(it)) }
+                    )
+                    prepared.cleanupStaging()
+                    if (sent) {
+                        showGreenToast(
+                            R.string.conversation_message_forwarded_toast,
+                            R.drawable.forward
+                        )
+                    } else {
+                        showRedToast(
+                            R.string.conversation_message_forward_cancelled_toast,
+                            R.drawable.warning_circle
+                        )
+                    }
+                }
             }
         }
     }

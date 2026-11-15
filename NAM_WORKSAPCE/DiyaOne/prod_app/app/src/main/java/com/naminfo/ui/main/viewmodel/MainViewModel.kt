@@ -315,7 +315,7 @@ class MainViewModel
             if (core.globalState != GlobalState.On) return // In case of late remote provisioning
 
             Log.w(
-                "$TAG Account [${account.params.identityAddress?.asStringUriOnly()}] has been removed!"
+                "$TAG An account has been removed!"
             )
             removeAlert(DEFAULT_ACCOUNT_DISABLED)
             removeAlert(NON_DEFAULT_ACCOUNT_NOT_CONNECTED)
@@ -552,9 +552,9 @@ class MainViewModel
         var count = 0
         for (account in coreContext.core.accountList) {
             if (account == coreContext.core.defaultAccount) continue
-            val unreadMessages = coreContext.core.chatRooms
+            val accountRooms = coreContext.core.chatRooms
                 .filter { LinphoneUtils.getAccountForAddress(it.localAddress) == account }
-                .sumOf(CustomImdn::visibleUnreadMessagesCount)
+            val unreadMessages = CustomImdn.visibleUnreadMessagesCount(accountRooms)
             count += unreadMessages + account.missedCallsCount
         }
         if (count != nonDefaultAccountNotificationsCount) {

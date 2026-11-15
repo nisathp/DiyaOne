@@ -10,6 +10,7 @@ import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.contacts.MobionContactsService
 import com.naminfo.core.ApiLogRepository
+import com.naminfo.core.MobionTokenRefresher
 import com.naminfo.R
 import com.naminfo.ui.main.contacts.viewmodel.ContactsListViewModel
 import org.linphone.core.Account
@@ -37,7 +38,6 @@ import androidx.lifecycle.*
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -280,15 +280,31 @@ class AccountProfileViewModel
                 performLogout()
                 ContactsListViewModel.resetMobionSessionCache()
 
-                withTimeout(30_000L) {
-                    unregisterAndRemoveAccount()
+                // Ask FreeSWITCH to unregister first.  An unreachable SIP server must not
+                // trap the user in a signed-in screen after the HTTP logout has already
+                // invalidated the app session.
+                val unregisterFailure = try {
+                    withTimeout(30_000L) {
+                        unregisterAndRemoveAccount()
+                    }
+                    null
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    Log.w(
+                        "$TAG SIP unregister was not confirmed; completing local sign-out: $error"
+                    )
+                    error
                 }
 
-                // Navigate away only after unregistration and cleanup succeed.
+                if (unregisterFailure != null) {
+                    removeAccountLocallyAfterUnregisterFailure()
+                }
+
+                // The API tokens are cleared by performLogout(). At this point the SIP
+                // account is removed either after a confirmed UNREGISTER or a safe local
+                // fallback, so the user can always return to the sign-in screen.
                 accountRemovedEvent.value = Event(true)
-            } catch (timeout: TimeoutCancellationException) {
-                signOutError.value =
-                    "Server did not confirm sign-out. Check your connection and retry."
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -301,10 +317,51 @@ class AccountProfileViewModel
         }
     }
 
+    /**
+     * Keeps chat history but removes the local SIP credentials if FreeSWITCH doesn't answer
+     * an UNREGISTER. This is deliberately a fallback; the normal path waits for Cleared.
+     */
+    private suspend fun removeAccountLocallyAfterUnregisterFailure(): Unit =
+        suspendCancellableCoroutine { continuation ->
+            coreContext.postOnCoreThread { core ->
+                try {
+                    if (!::account.isInitialized || core.accountList.none { it == account }) {
+                        continuation.resumeWith(Result.success(Unit))
+                        return@postOnCoreThread
+                    }
+
+                    val target = account
+                    val authInfo = target.findAuthInfo()
+                    val identity = target.params.identityAddress?.asStringUriOnly()
+                    val profileSection = "saved_profile_$identity"
+
+                    core.config.setString(
+                        profileSection,
+                        "display_name",
+                        target.params.identityAddress?.displayName
+                    )
+                    core.config.setString(profileSection, "picture_uri", target.params.pictureUri)
+                    core.removeAccount(target)
+
+                    if (authInfo != null && core.accountList.none { it.findAuthInfo() == authInfo }) {
+                        core.removeAuthInfo(authInfo)
+                    }
+                    if (core.accountList.isEmpty()) {
+                        core.provisioningUri = null
+                    }
+                    core.config.sync()
+
+                    Log.i("$TAG Removed local SIP account after unregister failure")
+                    continuation.resumeWith(Result.success(Unit))
+                } catch (error: Exception) {
+                    continuation.resumeWith(Result.failure(error))
+                }
+            }
+        }
+
     private suspend fun performLogout() = withContext(Dispatchers.IO) {
         val apiBase = corePreferences.apiDomain
         val refreshToken = corePreferences.refreshToken
-        val token = corePreferences.authToken
 
         if (apiBase.isNullOrEmpty()) {
             // A legacy or partially completed sign-in may have tokens without
@@ -319,35 +376,33 @@ class AccountProfileViewModel
             return@withContext
         }
 
-        var logoutLogId: Long? = null
         try {
             val logoutUrl = URL("${getApiBaseUrl(apiBase)}/auth/logout")
-            val conn = logoutUrl.openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-            if (!token.isNullOrEmpty()) {
-                conn.setRequestProperty("Authorization", "Bearer $token")
-            }
-            conn.connectTimeout = 10000
-            conn.readTimeout = 10000
-            conn.doOutput = true
-
             val body = JSONObject().apply {
                 if (!refreshToken.isNullOrEmpty()) {
                     put("refreshToken", refreshToken)
                 }
             }
 
-            logoutLogId = ApiLogRepository.begin("POST", logoutUrl.toString(), body.toString())
-            OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
-            val code = conn.responseCode
-            val response = (if (code in 200..299) conn.inputStream else conn.errorStream)
-                ?.bufferedReader()?.use { it.readText() }
-            ApiLogRepository.complete(requireNotNull(logoutLogId), code, response)
-            Log.i("$TAG Logout API response code: $code")
-            conn.disconnect()
+            // Access tokens are short-lived. Refresh first when it is near expiry, and if
+            // the server still returns 401, refresh once more then retry the logout request.
+            var bearerToken = MobionTokenRefresher.validAccessToken(
+                apiBase,
+                endSessionOnRefreshFailure = false
+            )
+                ?: corePreferences.authToken
+            var result = executeLogoutRequest(logoutUrl, body.toString(), bearerToken)
+            if (result.first == HttpURLConnection.HTTP_UNAUTHORIZED) {
+                bearerToken = MobionTokenRefresher.refreshAfterUnauthorized(
+                    apiBase,
+                    endSessionOnRefreshFailure = false
+                )
+                if (!bearerToken.isNullOrEmpty()) {
+                    result = executeLogoutRequest(logoutUrl, body.toString(), bearerToken)
+                }
+            }
+            Log.i("$TAG Logout API response code: ${result.first}")
         } catch (e: Exception) {
-            ApiLogRepository.fail(logoutLogId ?: ApiLogRepository.begin("POST", "${getApiBaseUrl(apiBase)}/auth/logout"), e)
             Log.w("$TAG Logout API exception: $e")
         } finally {
             // Logout is a local sign-out as well: do not retain credentials when
@@ -358,6 +413,41 @@ class AccountProfileViewModel
             corePreferences.refreshTokenExpiresAt = null
             corePreferences.apiDomain = null
             corePreferences.loginTime = null
+        }
+    }
+
+    @WorkerThread
+    private fun executeLogoutRequest(
+        logoutUrl: URL,
+        body: String,
+        bearerToken: String?
+    ): Pair<Int, String?> {
+        var logId: Long? = null
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = logoutUrl.openConnection() as HttpURLConnection
+            connection.requestMethod = "POST"
+            connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            connection.setRequestProperty("Accept", "application/json")
+            bearerToken?.takeIf { it.isNotEmpty() }?.let {
+                connection.setRequestProperty("Authorization", "Bearer $it")
+            }
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 10_000
+            connection.doOutput = true
+
+            logId = ApiLogRepository.begin("POST", logoutUrl.toString(), body)
+            OutputStreamWriter(connection.outputStream).use { it.write(body) }
+            val code = connection.responseCode
+            val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
+                ?.bufferedReader()?.use { it.readText() }
+            ApiLogRepository.complete(requireNotNull(logId), code, response)
+            code to response
+        } catch (error: Exception) {
+            ApiLogRepository.fail(logId ?: ApiLogRepository.begin("POST", logoutUrl.toString()), error)
+            throw error
+        } finally {
+            connection?.disconnect()
         }
     }
 
@@ -406,55 +496,67 @@ class AccountProfileViewModel
                                 completed = true
                                 core.removeListener(this)
 
-                                try {
-                                    val identity = target.params.identityAddress
-                                        ?.asStringUriOnly()
+                                // This callback is dispatched while liblinphone is still
+                                // handling the REGISTER 200 response. Removing the account
+                                // here frees SIP objects owned by that transaction and can
+                                // crash its Core Thread when response handling resumes.
+                                // Snapshot the profile while the account is valid, then run
+                                // the destructive cleanup in the next Core-thread task.
+                                val identity = target.params.identityAddress
+                                    ?.asStringUriOnly()
+                                val displayName = target.params.identityAddress?.displayName
+                                val pictureUri = target.params.pictureUri
 
-                                    val profileSection = "saved_profile_$identity"
+                                coreContext.postOnCoreThread { cleanupCore ->
+                                    try {
+                                        val profileSection = "saved_profile_$identity"
 
-                                    core.config.setString(
-                                        profileSection,
-                                        "display_name",
-                                        target.params.identityAddress?.displayName
-                                    )
+                                        cleanupCore.config.setString(
+                                            profileSection,
+                                            "display_name",
+                                            displayName
+                                        )
 
-                                    core.config.setString(
-                                        profileSection,
-                                        "picture_uri",
-                                        target.params.pictureUri
-                                    )
+                                        cleanupCore.config.setString(
+                                            profileSection,
+                                            "picture_uri",
+                                            pictureUri
+                                        )
 
-                                    // Keep conversations and call history.
-                                    // Do not use removeAccountWithData().
-                                    core.removeAccount(target)
-
-                                    // Remove credentials only after unregistration.
-                                    // Preserve credentials shared by another account.
-                                    if (
-                                        authInfo != null &&
-                                        core.accountList.none {
-                                            it.findAuthInfo() == authInfo
+                                        // Keep conversations and call history.
+                                        // Do not use removeAccountWithData().
+                                        if (cleanupCore.accountList.any { it == target }) {
+                                            cleanupCore.removeAccount(target)
                                         }
-                                    ) {
-                                        core.removeAuthInfo(authInfo)
-                                    }
 
-                                    if (core.accountList.isEmpty()) {
-                                        core.provisioningUri = null
-                                    }
+                                        // Remove credentials only after unregistration.
+                                        // Preserve credentials shared by another account.
+                                        if (
+                                            authInfo != null &&
+                                            cleanupCore.accountList.none {
+                                                it.findAuthInfo() == authInfo
+                                            }
+                                        ) {
+                                            cleanupCore.removeAuthInfo(authInfo)
+                                        }
 
-                                    core.config.sync()
+                                        if (cleanupCore.accountList.isEmpty()) {
+                                            cleanupCore.provisioningUri = null
+                                        }
 
-                                    if (continuation.isActive) {
-                                        continuation.resumeWith(
-                                            Result.success(Unit)
-                                        )
-                                    }
-                                } catch (error: Exception) {
-                                    if (continuation.isActive) {
-                                        continuation.resumeWith(
-                                            Result.failure(error)
-                                        )
+                                        cleanupCore.config.sync()
+
+                                        if (continuation.isActive) {
+                                            continuation.resumeWith(
+                                                Result.success(Unit)
+                                            )
+                                        }
+                                    } catch (error: Exception) {
+                                        if (continuation.isActive) {
+                                            continuation.resumeWith(
+                                                Result.failure(error)
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -549,7 +651,7 @@ class AccountProfileViewModel
     @UiThread
     fun setNewPicturePath(path: String) {
         coreContext.postOnCoreThread {
-            if (::account.isInitialized) {
+            if (::account.isInitialized && coreContext.core.accountList.any { it == account }) {
                 val params = account.params
                 val copy = params.clone()
 
@@ -571,28 +673,41 @@ class AccountProfileViewModel
                     params.identityAddress
                 )
                 model.friend.photo = path
-                model.picturePath.postValue(path)
+                model.applyResolvedProfile(
+                    displayName = model.contactName ?: params.identityAddress?.displayName.orEmpty(),
+                    photoUrl = path
+                )
 
                 account.params = copy
                 account.refreshRegister()
+
+                val identity = params.identityAddress?.asStringUriOnly()
+                if (!identity.isNullOrEmpty()) {
+                    coreContext.core.config.setString("saved_profile_$identity", "picture_uri", path)
+                    coreContext.core.config.sync()
+                }
+                MobionContactsService.bumpAvatarCacheEpoch()
+                coreContext.contactsManager.invalidateCachesAndNotify()
             }
         }
     }
 
     /** Uploads the selected Settings profile image to the DiyaOne API. */
     @UiThread
+    private fun resolveProfileSubscriberId(core: org.linphone.core.Core): String? {
+        val activeAccount = if (::account.isInitialized && core.accountList.any { it == account }) {
+            account
+        } else {
+            null
+        }
+        return (activeAccount ?: core.defaultAccount)?.params?.identityAddress?.username
+    }
+
     fun uploadProfilePicture(path: String) {
         if (path.isBlank()) return
 
         coreContext.postOnCoreThread { core ->
-            val subscriberId = (
-                if (::account.isInitialized) {
-                account.params.identityAddress?.username
-            } else {
-                null
-            }
-            )
-                ?: core.defaultAccount?.params?.identityAddress?.username
+            val subscriberId = resolveProfileSubscriberId(core)
             val apiBase = corePreferences.apiDomain
             val accessToken = corePreferences.authToken
 
@@ -634,11 +749,7 @@ class AccountProfileViewModel
         // the server confirms the deletion. The initials avatar is shown only after success.
         profilePictureDeleteInProgress.value = true
         coreContext.postOnCoreThread { core ->
-            val subscriberId = if (::account.isInitialized) {
-                account.params.identityAddress?.username
-            } else {
-                null
-            } ?: core.defaultAccount?.params?.identityAddress?.username
+            val subscriberId = resolveProfileSubscriberId(core)
             val apiBase = corePreferences.apiDomain
             val accessToken = corePreferences.authToken
 
@@ -682,7 +793,8 @@ class AccountProfileViewModel
         apiBase: String,
         accessToken: String,
         subscriberId: String,
-        localPath: String
+        localPath: String,
+        allowTokenRefreshRetry: Boolean = true
     ): Boolean {
         val filePath = Uri.parse(localPath).path ?: localPath.removePrefix("file:")
         val image = File(filePath)
@@ -698,7 +810,8 @@ class AccountProfileViewModel
         connection.connectTimeout = 15_000
         connection.readTimeout = 30_000
         connection.doOutput = true
-        connection.setRequestProperty("Authorization", "Bearer $accessToken")
+        val bearerToken = MobionTokenRefresher.validAccessToken(apiBase) ?: accessToken
+        connection.setRequestProperty("Authorization", "Bearer $bearerToken")
         connection.setRequestProperty("Accept", "application/json")
         connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
         val logId = ApiLogRepository.begin(
@@ -728,6 +841,18 @@ class AccountProfileViewModel
                 ?.bufferedReader()?.use { it.readText() }
             ApiLogRepository.complete(logId, responseCode, response)
             if (responseCode !in 200..299) {
+                if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED && allowTokenRefreshRetry) {
+                    connection.disconnect()
+                    if (MobionTokenRefresher.refreshAfterUnauthorized(apiBase) != null) {
+                        return putProfilePicture(
+                            apiBase,
+                            accessToken,
+                            subscriberId,
+                            localPath,
+                            allowTokenRefreshRetry = false
+                        )
+                    }
+                }
                 val message = response.orEmpty()
                 Log.e("$TAG Profile picture upload failed with HTTP $responseCode: $message")
                 false
@@ -743,13 +868,18 @@ class AccountProfileViewModel
         }
     }
 
-    private fun deleteRemoteProfilePicture(apiBase: String, accessToken: String): Boolean {
+    private fun deleteRemoteProfilePicture(
+        apiBase: String,
+        accessToken: String,
+        allowTokenRefreshRetry: Boolean = true
+    ): Boolean {
         val endpoint = "${apiBase.trimEnd('/')}/users/profile-picture"
         val connection = URL(endpoint).openConnection() as HttpURLConnection
         connection.requestMethod = "DELETE"
         connection.connectTimeout = 15_000
         connection.readTimeout = 30_000
-        connection.setRequestProperty("Authorization", "Bearer $accessToken")
+        val bearerToken = MobionTokenRefresher.validAccessToken(apiBase) ?: accessToken
+        connection.setRequestProperty("Authorization", "Bearer $bearerToken")
         connection.setRequestProperty("Accept", "application/json")
         val logId = ApiLogRepository.begin("DELETE", endpoint)
 
@@ -759,6 +889,16 @@ class AccountProfileViewModel
                 ?.bufferedReader()?.use { it.readText() }
             ApiLogRepository.complete(logId, responseCode, response)
             if (responseCode !in 200..299) {
+                if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED && allowTokenRefreshRetry) {
+                    connection.disconnect()
+                    if (MobionTokenRefresher.refreshAfterUnauthorized(apiBase) != null) {
+                        return deleteRemoteProfilePicture(
+                            apiBase,
+                            accessToken,
+                            allowTokenRefreshRetry = false
+                        )
+                    }
+                }
                 Log.e("$TAG Profile picture deletion failed with HTTP $responseCode: ${response.orEmpty()}")
                 false
             } else {
@@ -845,6 +985,9 @@ class AccountProfileViewModel
     @UiThread
     fun toggleRegister() {
         coreContext.postOnCoreThread { core ->
+            if (!::account.isInitialized || core.accountList.none { it == account }) {
+                return@postOnCoreThread
+            }
             val params = account.params
             val copy = params.clone()
             copy.isRegisterEnabled = !params.isRegisterEnabled

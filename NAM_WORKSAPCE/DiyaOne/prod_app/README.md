@@ -3,6 +3,11 @@
 This document details all backend API calls made within the **DiyaOneMCX** application, including endpoints, request/response examples using test credentials (`phone: 7845470737`).
 
 ---
+### TCAL visible
+
+1.history_call_list_cell.xml
+2.call_actions_generic.xml
+3.contact_fragment.xml
 
 ## Summary of APIs
 Current app-ல் HTTP API calls இவை:

@@ -7,7 +7,6 @@ import androidx.lifecycle.MutableLiveData
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.R
 import com.naminfo.contacts.AbstractAvatarModel
-import com.naminfo.contacts.getNativeContactPictureUri
 import org.linphone.core.Address
 import org.linphone.core.ChatRoom
 import org.linphone.core.ConsolidatedPresence
@@ -19,6 +18,7 @@ import com.naminfo.utils.AppUtils
 import com.naminfo.utils.TimestampUtils
 import androidx.core.net.toUri
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
+import com.naminfo.core.FirebasePresenceRepository
 
 class ContactAvatarModel
     @WorkerThread
@@ -40,6 +40,15 @@ class ContactAvatarModel
     val isFavourite = MutableLiveData<Boolean>()
 
     val lastPresenceInfo = MutableLiveData<String>()
+
+    @Volatile
+    private var latestPicturePath: String = ""
+
+    @Volatile
+    private var latestDisplayName: String = friend.name.orEmpty()
+
+    @Volatile
+    private var avatarEpoch: Long = com.naminfo.contacts.MobionContactsService.currentAvatarCacheEpoch()
 
     val name = MutableLiveData<String>()
 
@@ -72,9 +81,19 @@ class ContactAvatarModel
     fun compare(other: ContactAvatarModel?): Boolean {
         if (other == null) return false
 
-        val picture = picturePath.value
-        val otherPicture = other.picturePath.value
-        if (picture != null && otherPicture != null && picture != otherPicture) {
+        if (avatarEpoch != other.avatarEpoch) {
+            return false
+        }
+
+        val picture = picturePath.value ?: latestPicturePath
+        val otherPicture = other.picturePath.value ?: other.latestPicturePath
+        if (picture != otherPicture) {
+            return false
+        }
+
+        val currentName = name.value ?: latestDisplayName
+        val otherName = other.name.value ?: other.latestDisplayName
+        if (currentName != otherName) {
             return false
         }
 
@@ -113,12 +132,28 @@ class ContactAvatarModel
         isFavourite.postValue(friend.starred)
         initials.postValue(AppUtils.getInitials(friend.name.orEmpty()))
         showTrust.postValue(true)
+        val resolvedPath = getAvatarUri(friend)?.toString().orEmpty()
+        val resolvedName = friend.name.orEmpty()
+        latestPicturePath = resolvedPath
+        latestDisplayName = resolvedName
+        avatarEpoch = com.naminfo.contacts.MobionContactsService.currentAvatarCacheEpoch()
         // `null.toString()` becomes the literal "null", which Coil treats as a remote image
         // request and can leave a stale avatar visible after a server-side DELETE.
-        picturePath.postValue(getAvatarUri(friend)?.toString().orEmpty())
+        picturePath.postValue(resolvedPath)
 
-        name.postValue(friend.name)
+        name.postValue(resolvedName)
+        initials.postValue(AppUtils.getInitials(resolvedName))
         computePresence(address)
+    }
+
+    @AnyThread
+    fun applyResolvedProfile(displayName: String, photoUrl: String) {
+        latestDisplayName = displayName
+        latestPicturePath = photoUrl
+        avatarEpoch = com.naminfo.contacts.MobionContactsService.currentAvatarCacheEpoch()
+        name.postValue(displayName)
+        initials.postValue(AppUtils.getInitials(displayName))
+        picturePath.postValue(photoUrl)
     }
 
     @WorkerThread
@@ -179,27 +214,7 @@ class ContactAvatarModel
     }
 
     @WorkerThread
-    private fun getAvatarUri(friend: Friend): Uri? {
-        val picturePath = friend.photo
-        if (!picturePath.isNullOrEmpty()) {
-            return picturePath.toUri()
-        }
-
-        val refKey = friend.refKey
-        // Mobion entries use the authenticated `/users` profile-picture map as their sole
-        // image source. Once the server URL is removed, render initials rather than reviving a
-        // possibly unrelated Android-address-book photo.
-        if (refKey?.startsWith("mobion:") == true) return null
-        if (refKey != null) {
-            try {
-                return friend.getNativeContactPictureUri()
-            } catch (numberFormatException: NumberFormatException) {
-                // Expected for contacts created by Linphone
-            }
-        }
-
-        return null
-    }
+    private fun getAvatarUri(friend: Friend): Uri? = resolveFriendAvatarUri(friend)
 
     @WorkerThread
     private fun computePresence(address: Address? = null) {
@@ -262,5 +277,29 @@ class ContactAvatarModel
             else -> ""
         }
         lastPresenceInfo.postValue(presenceString)
+
+        // Firebase is deliberately additive: when it reports a recent SIP registration,
+        // show Online; otherwise retain the normal SIP presence result unchanged.
+        val phoneNumber = address?.username
+            ?: friend.phoneNumbersWithLabel.firstOrNull()?.phoneNumber
+            ?: friend.addresses.firstOrNull()?.username
+        FirebasePresenceRepository.fetchIfEnabled(phoneNumber) { online ->
+            if (online) {
+                presenceStatus.postValue(ConsolidatedPresence.Online)
+                lastPresenceInfo.postValue(AppUtils.getString(R.string.contact_presence_status_online))
+            }
+        }
     }
+}
+
+internal fun resolveFriendAvatarUri(friend: Friend): Uri? {
+    val picturePath = friend.photo?.trim()
+        ?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+    if (!picturePath.isNullOrEmpty()) {
+        return picturePath.toUri()
+    }
+
+    // Only server/app-assigned profile photos are shown; never fall back to Android
+    // phone-book/native contact photos.
+    return null
 }

@@ -28,6 +28,8 @@
             android:layout_height="@dimen/avatar_big_size"
             android:contentDescription="@null"
             coilBigAvatar="@{model}"
+            coilAvatarPicture="@{model.picturePath}"
+            coilAvatarInitials="@{model.initials}"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toTopOf="parent" />

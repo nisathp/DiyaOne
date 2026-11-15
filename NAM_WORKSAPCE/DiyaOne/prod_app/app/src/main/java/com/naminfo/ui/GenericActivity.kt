@@ -5,15 +5,22 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.res.Configuration
 import android.content.res.Resources
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.view.Gravity
 import android.provider.Settings
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
 import androidx.annotation.DrawableRes
 import androidx.annotation.MainThread
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.children
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -164,6 +171,83 @@ open class GenericActivity : AppCompatActivity() {
                     lifecycleScope,
                     duration
                 )
+            }
+        }
+    }
+
+    /**
+     * A long diagnostic error needs to remain readable, unlike the one-line status toast.
+     * It is still transient, but its body can be scrolled and dismissed by the user.
+     */
+    fun showScrollableErrorToast(
+        title: String,
+        details: String,
+        duration: Long = 12_000
+    ) {
+        lifecycleScope.launch {
+            withContext(Dispatchers.Main) {
+                val margin = (20 * resources.displayMetrics.density).toInt()
+                val padding = (16 * resources.displayMetrics.density).toInt()
+                val maxBodyHeight = (220 * resources.displayMetrics.density).toInt()
+                val textColor = ContextCompat.getColor(this@GenericActivity, R.color.red_danger_500)
+
+                val card = LinearLayout(this@GenericActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(padding, padding, padding, padding)
+                    background = GradientDrawable().apply {
+                        setColor(ContextCompat.getColor(context, R.color.background_color_dark_mode))
+                        setStroke((2 * resources.displayMetrics.density).toInt(), textColor)
+                        cornerRadius = (18 * resources.displayMetrics.density)
+                    }
+                    visibility = android.view.View.GONE
+                    layoutParams = ViewGroup.MarginLayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        marginStart = margin
+                        marginEnd = margin
+                        topMargin = (5 * resources.displayMetrics.density).toInt()
+                    }
+                }
+                card.addView(
+                    TextView(this@GenericActivity).apply {
+                    text = title
+                    setTypeface(typeface, Typeface.BOLD)
+                    textSize = 16f
+                    setTextColor(textColor)
+                }
+                )
+                val body = TextView(this@GenericActivity).apply {
+                    text = details
+                    textSize = 13f
+                    setTextColor(ContextCompat.getColor(context, R.color.bc_white))
+                    setTextIsSelectable(true)
+                    setPadding(0, (8 * resources.displayMetrics.density).toInt(), 0, 0)
+                }
+                card.addView(
+                    ScrollView(this@GenericActivity).apply {
+                    isFillViewport = true
+                    addView(body)
+                },
+                    LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    maxBodyHeight
+                )
+                )
+                card.addView(
+                    TextView(this@GenericActivity).apply {
+                    text = "Close"
+                    textSize = 13f
+                    gravity = Gravity.END
+                    setTypeface(typeface, Typeface.BOLD)
+                    setTextColor(textColor)
+                    setPadding(0, (10 * resources.displayMetrics.density).toInt(), 0, 0)
+                    setOnClickListener { toastsArea.removeView(card) }
+                }
+                )
+
+                toastsArea.addView(card)
+                card.slideInToastFromTopForDuration(toastsArea, lifecycleScope, duration)
             }
         }
     }

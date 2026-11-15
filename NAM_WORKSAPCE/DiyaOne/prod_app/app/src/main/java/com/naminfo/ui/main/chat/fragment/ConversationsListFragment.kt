@@ -255,12 +255,19 @@ class ConversationsListFragment : AbstractMainFragment() {
         sharedViewModel.goToAccountProfileEvent.observe(viewLifecycleOwner) {
             it.consume {
                 if (findNavController().currentDestination?.id == R.id.conversationsListFragment) {
-                    val identity = LinphoneUtils.getDefaultAccount()?.params?.identityAddress?.asStringUriOnly().orEmpty()
-                    val action =
-                        ConversationsListFragmentDirections.actionConversationsListFragmentToAccountProfileFragment(
-                            identity
-                        )
-                    findNavController().navigate(action)
+                    coreContext.postOnCoreThread {
+                        val identity =
+                            LinphoneUtils.getDefaultAccount()?.params?.identityAddress?.asStringUriOnly().orEmpty()
+                        coreContext.postOnMainThread {
+                            if (isAdded && findNavController().currentDestination?.id == R.id.conversationsListFragment) {
+                                val action =
+                                    ConversationsListFragmentDirections.actionConversationsListFragmentToAccountProfileFragment(
+                                        identity
+                                    )
+                                findNavController().navigate(action)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -316,13 +323,7 @@ class ConversationsListFragment : AbstractMainFragment() {
             viewLifecycleOwner
         ) {
             it.consume {
-                val displayChatRoom = sharedViewModel.displayedChatRoom
-                if (displayChatRoom != null) {
-                    val found = listViewModel.conversations.value.orEmpty().find { model ->
-                        model.conversationModel?.chatRoom == displayChatRoom
-                    }
-                    found?.conversationModel?.updateUnreadCount()
-                }
+                listViewModel.refreshConversationForChatRoom(sharedViewModel.displayedChatRoom)
                 listViewModel.updateUnreadMessagesCount()
             }
         }
@@ -353,6 +354,7 @@ class ConversationsListFragment : AbstractMainFragment() {
 
     override fun onResume() {
         super.onResume()
+        coreContext.contactsManager.syncMobionDirectoryAsync()
 
         if (listViewModel.hideConversations.value == true) {
             Log.w(

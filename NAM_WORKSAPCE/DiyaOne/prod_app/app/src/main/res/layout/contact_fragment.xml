@@ -268,6 +268,8 @@
                             app:layout_constraintStart_toStartOf="@id/video_call"
                             app:layout_constraintEnd_toEndOf="@id/video_call"/>
 
+
+                        <!-- android:visibility="@{viewModel.audioCallDisabled ? View.GONE : View.VISIBLE}"-->
                         <ImageView
                             android:id="@+id/t_call"
                             android:onClick="@{() -> viewModel.startTCall()}"
@@ -285,11 +287,14 @@
                             app:layout_constraintStart_toEndOf="@id/video_call"
                             app:layout_constraintEnd_toEndOf="parent" />
 
+
+                        <!--android:visibility="@{viewModel.audioCallDisabled ? View.GONE : View.VISIBLE}"-->
                         <androidx.appcompat.widget.AppCompatTextView
                             style="@style/default_text_style"
                             android:id="@+id/t_call_label"
                             android:onClick="@{() -> viewModel.startTCall()}"
                             android:visibility="@{viewModel.audioCallDisabled ? View.GONE : View.VISIBLE}"
+
                             android:enabled="@{viewModel.atLeastOneSipAddressOrPhoneNumber}"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"

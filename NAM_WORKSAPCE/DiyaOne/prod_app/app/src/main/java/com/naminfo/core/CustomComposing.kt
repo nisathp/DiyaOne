@@ -1,5 +1,6 @@
 package com.naminfo.core
 
+import com.naminfo.utils.LinphoneUtils
 import org.json.JSONObject
 import org.linphone.core.ChatMessage
 import org.linphone.core.ChatMessageListenerStub
@@ -26,8 +27,12 @@ object CustomComposing {
     private val activeSignals = ConcurrentHashMap.newKeySet<ActiveSignal>()
     private val observers = CopyOnWriteArraySet<(String, String, Boolean) -> Unit>()
 
-    fun roomKey(room: ChatRoom): String =
-        "${room.localAddress.asStringUriOnly()}|${room.peerAddress.asStringUriOnly()}"
+    /**
+     * Use the same canonical identity as the chat UI.  The SIP server may represent
+     * the same Basic room with or without the default :5060 port, which otherwise
+     * makes an incoming control message miss the currently displayed conversation.
+     */
+    fun roomKey(room: ChatRoom): String = LinphoneUtils.getConversationId(room)
 
     fun activeSenders(roomKey: String): List<String> =
         activeSignals.asSequence()
@@ -57,7 +62,9 @@ object CustomComposing {
             val state = JSONObject(body.removePrefix(PREFIX)).optString("state")
             val address = message.fromAddress.asStringUriOnly()
             if (address.isNotBlank() && (state == "active" || state == "idle")) {
-                update(roomKey(room), address, state == "active")
+                val key = roomKey(room)
+                Log.i("[Custom composing] Received [$state] from [$address] for [$key]")
+                update(key, address, state == "active")
             }
         } catch (exception: Exception) {
             Log.w("[Custom composing] Ignoring invalid control message: ${exception.message}")

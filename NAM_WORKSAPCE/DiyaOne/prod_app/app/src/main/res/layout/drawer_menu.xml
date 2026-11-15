@@ -99,7 +99,7 @@
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintTop_toBottomOf="@id/brand_name"
-                app:layout_constraintBottom_toTopOf="@id/api_logs">
+                app:layout_constraintBottom_toTopOf="@id/invite">
 
                 <LinearLayout
                     android:id="@+id/profile_section"
@@ -180,6 +180,7 @@
                 android:text="@string/drawer_menu_api_logs"
                 android:drawableStart="@drawable/info"
                 android:drawablePadding="8dp"
+                android:visibility="gone"
                 app:drawableTint="@color/secondary_button_label_color"
                 app:layout_constraintWidth_max="@dimen/button_max_width"
                 app:layout_constraintStart_toStartOf="parent"
@@ -198,6 +199,7 @@
                 android:text="@string/drawer_menu_logs"
                 android:drawableStart="@drawable/info"
                 android:drawablePadding="8dp"
+                android:visibility="gone"
                 app:drawableTint="@color/secondary_button_label_color"
                 app:layout_constraintWidth_max="@dimen/button_max_width"
                 app:layout_constraintStart_toStartOf="parent"

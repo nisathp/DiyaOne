@@ -130,7 +130,7 @@ class NotificationsManager
     private var keepAliveService: CoreKeepAliveThirdPartyAccountsService? = null
 
     private val callNotificationsMap: HashMap<String, Notifiable> = HashMap()
-    private val chatNotificationsMap: HashMap<String, Notifiable> = HashMap()
+    internal val chatNotificationsMap: HashMap<String, Notifiable> = HashMap()
     val notificationShowOriginalMap: ConcurrentHashMap<Int, Boolean> = ConcurrentHashMap()
     private val previousChatNotifications: ArrayList<Int> = arrayListOf()
     private val accountsErrorNotificationsMap: HashMap<String, Int> = HashMap()
@@ -207,6 +207,22 @@ class NotificationsManager
     }
 
     private lateinit var mediaPlayer: MediaPlayer
+
+    @WorkerThread
+    private fun resolveNotificationDisplayName(address: Address, knownFriend: Friend? = null): String {
+        val cleanNumber = address.username.orEmpty()
+            .replace(Regex("^(T_|tac_|tvc_)", RegexOption.IGNORE_CASE), "")
+            .trim()
+        val resolvedName = coreContext.contactsManager.findDisplayName(address).trim()
+        if (!com.naminfo.contacts.PhoneContactNumbers.isNumericPlaceholder(resolvedName, cleanNumber)) {
+            return resolvedName
+        }
+        val candidateName = knownFriend?.name?.trim().orEmpty()
+        if (!com.naminfo.contacts.PhoneContactNumbers.isNumericPlaceholder(candidateName, cleanNumber)) {
+            return candidateName
+        }
+        return resolvedName.ifBlank { LinphoneUtils.getDisplayName(address) }
+    }
 
     private val contactsListener = object : ContactsListener {
         @WorkerThread
@@ -390,7 +406,9 @@ class NotificationsManager
             if (corePreferences.disableChat) return
 
             val id = LinphoneUtils.getConversationId(chatRoom)
-            if (currentlyDisplayedChatRoomId.isNotEmpty() && id == currentlyDisplayedChatRoomId) {
+            if (currentlyDisplayedChatRoomId.isNotEmpty() &&
+                LinphoneUtils.conversationIdMatchesChatRoom(currentlyDisplayedChatRoomId, chatRoom)
+            ) {
                 Log.i(
                     "$TAG Do not notify received messages for currently displayed conversation [$id], but play sound if at least one message is incoming and not read"
                 )
@@ -584,7 +602,13 @@ class NotificationsManager
                 message.removeListener(this)
             }
 
-            if (state == ChatMessage.State.Delivered || state == ChatMessage.State.Displayed) {
+            if (
+                state == ChatMessage.State.Delivered ||
+                state == ChatMessage.State.Displayed ||
+                state == ChatMessage.State.DeliveredToUser ||
+                state == ChatMessage.State.InProgress ||
+                state == ChatMessage.State.Idle
+            ) {
                 val address = message.chatRoom.peerAddress.asStringUriOnly()
                 val notifiable = chatNotificationsMap[address]
                 if (notifiable != null) {
@@ -596,7 +620,7 @@ class NotificationsManager
                     Log.e("$TAG Couldn't find notification for conversation $address")
                     cancelNotification(id, CHAT_TAG)
                 }
-            } else if (state == ChatMessage.State.NotDelivered) {
+            } else if (state == ChatMessage.State.NotDelivered || state == ChatMessage.State.FileTransferError) {
                 Log.e("$TAG Reply wasn't delivered")
                 cancelNotification(id, CHAT_TAG)
             }
@@ -859,9 +883,9 @@ class NotificationsManager
                 context.getString(R.string.notification_missed_group_call)
                     .format(conferenceInfo.subject ?: LinphoneUtils.getDisplayName(remoteAddress))
             } else {
-                val friend: Friend? = coreContext.contactsManager.findContactByAddress(remoteAddress)
+                val displayName = resolveNotificationDisplayName(remoteAddress)
                 context.getString(R.string.notification_missed_call)
-                    .format(friend?.name ?: LinphoneUtils.getDisplayName(remoteAddress))
+                    .format(displayName)
             }
             Log.i("$TAG Creating missed call notification with title [$body]")
         }
@@ -1230,9 +1254,8 @@ class NotificationsManager
             }
         }
 
-        val contact =
-            coreContext.contactsManager.findContactByAddress(address)
-        val displayName = contact?.name ?: LinphoneUtils.getDisplayName(address)
+        val contact = coreContext.contactsManager.findContactByAddress(address)
+        val displayName = resolveNotificationDisplayName(address, contact)
 
         val originalMessage = LinphoneUtils.getPlainTextDescribingMessage(message)
         val text = AppUtils.getString(R.string.notification_chat_message_reaction_received).format(
@@ -1445,7 +1468,7 @@ class NotificationsManager
     private fun getNotifiableForChatMessage(message: ChatMessage): NotifiableMessage {
         val contact =
             coreContext.contactsManager.findContactByAddress(message.fromAddress)
-        val displayName = contact?.name ?: LinphoneUtils.getDisplayName(message.fromAddress)
+        val displayName = resolveNotificationDisplayName(message.fromAddress, contact)
 
         val text = LinphoneUtils.getPlainTextDescribingMessage(message)
         val address = message.fromAddress
@@ -1512,7 +1535,7 @@ class NotificationsManager
         } else {
             val contact = friend
                 ?: coreContext.contactsManager.findContactByAddress(remoteAddress)
-            getPerson(contact, LinphoneUtils.getDisplayName(remoteAddress))
+            getPerson(contact, resolveNotificationDisplayName(remoteAddress, contact))
         }
 
         val isVideo = LinphoneUtils.isVideoEnabled(call)
@@ -1940,7 +1963,21 @@ class NotificationsManager
     }
 
     @WorkerThread
-    private fun displayReplyMessageNotification(message: ChatMessage, notifiable: Notifiable) {
+    fun displayReplyMessageNotification(message: ChatMessage, notifiable: Notifiable) {
+        val replyKey = CustomImdn.id(message)
+            ?: message.messageId.takeIf { it.isNotBlank() }
+            ?: "reply:${System.identityHashCode(message)}"
+        val alreadyAdded = notifiable.messages.any { existing ->
+            existing.isOutgoing && (
+                existing.replyKey == replyKey ||
+                    (message.messageId.isNotBlank() && existing.messageId == message.messageId)
+                )
+        }
+        if (alreadyAdded) {
+            Log.i("$TAG Skipping duplicate notification reply entry [$replyKey]")
+            return
+        }
+
         Log.i(
             "$TAG Updating message notification with reply for notification ${notifiable.notificationId}"
         )
@@ -1954,7 +1991,8 @@ class NotificationsManager
             notifiable.myself ?: LinphoneUtils.getDisplayName(senderAddress),
             senderAddress.asStringUriOnly(),
             System.currentTimeMillis(),
-            isOutgoing = true
+            isOutgoing = true,
+            replyKey = replyKey
         )
         notifiable.messages.add(reply)
 
@@ -2441,6 +2479,7 @@ class NotificationsManager
         val isOutgoing: Boolean = false,
         val isReaction: Boolean = false,
         val reactionToMessageId: String? = null,
-        val reactionFrom: String? = null
+        val reactionFrom: String? = null,
+        val replyKey: String? = null
     )
 }

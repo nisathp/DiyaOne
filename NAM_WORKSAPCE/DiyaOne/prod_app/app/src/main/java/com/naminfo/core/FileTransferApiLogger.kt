@@ -1,11 +1,16 @@
 package com.naminfo.core
 
+import android.util.Log
 import java.util.ArrayDeque
 
 /** Bridges native Linphone file-transfer diagnostics into the API Logs screen. */
 object FileTransferApiLogger {
+    private const val TAG = "HFT-Response"
     private const val REQUEST_DESCRIPTION = "multipart/form-data; native SIP file transfer"
     private val httpError = Regex("Unhandled HTTP code response\\s+(\\d{3})\\s+for file transfer")
+    private val xmlFileName = Regex("<file-name>([^<]+)</file-name>")
+    private val xmlFileSize = Regex("<file-size>(\\d+)</file-size>")
+    private val xmlContentType = Regex("<content-type>([^<]+)</content-type>")
     private val lock = Any()
 
     private data class PendingUpload(
@@ -28,6 +33,26 @@ object FileTransferApiLogger {
     fun onNativeLog(message: String) {
         val line = message.trim()
         if (line.isEmpty()) return
+
+        // The SDK performs the HTTP transfer in native code. Mirror only safe response
+        // metadata into Android Logcat so the normal app filter can diagnose media
+        // uploads without disclosing the signed, tokenized download URL.
+        if (line.startsWith("HTTP/1.1 200")) {
+            Log.i(TAG, "HFT upload response status=200")
+        }
+        if (line.contains("<file") && line.contains("rcs:fthttp")) {
+            val fileName = xmlFileName.find(line)?.groupValues?.getOrNull(1) ?: "unknown"
+            val fileSize = xmlFileSize.find(line)?.groupValues?.getOrNull(1) ?: "unknown"
+            val contentType = xmlContentType.find(line)?.groupValues?.getOrNull(1) ?: "unknown"
+            val hasDownloadUrl = line.contains("<data ") && line.contains("url=")
+            Log.i(
+                TAG,
+                "HFT response XML received: file=$fileName size=$fileSize type=$contentType downloadUrl=$hasDownloadUrl"
+            )
+        }
+        if (line.contains("unable to parse file name or URL", ignoreCase = true)) {
+            Log.e(TAG, "HFT response XML was rejected by the SDK; check <data> is inside <file-info>")
+        }
 
         var result: Triple<Long, Int, String?>? = null
         synchronized(lock) {

@@ -124,6 +124,21 @@
             app:layout_constraintStart_toStartOf="@id/transfer_progress"
             app:layout_constraintEnd_toEndOf="@id/transfer_progress" />
 
+        <ImageView
+            android:id="@+id/cancel_transfer"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:onClick="@{() -> model.cancelTransfer()}"
+            android:padding="6dp"
+            android:background="@drawable/shape_squircle_file_background_left"
+            android:contentDescription="@string/dialog_cancel"
+            android:src="@drawable/cancel_transfer"
+            android:visibility="@{model.canCancelTransfer ? View.VISIBLE : View.GONE}"
+            app:layout_constraintTop_toTopOf="@id/transfer_progress"
+            app:layout_constraintBottom_toBottomOf="@id/transfer_progress"
+            app:layout_constraintStart_toStartOf="@id/transfer_progress"
+            app:layout_constraintEnd_toEndOf="@id/transfer_progress" />
+
         <View
             android:id="@+id/file_background"
             android:onClick="@{() -> model.onClick()}"

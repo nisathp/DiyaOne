@@ -15,8 +15,8 @@ import com.naminfo.core.CustomComposing
 import com.naminfo.core.CustomImdn
 import com.naminfo.translation.ChatTranslationLanguage
 import com.naminfo.translation.TranslationRepository
-import com.naminfo.ui.main.chat.decodeReplyPreviewEnvelope
 import com.naminfo.ui.main.chat.ChatDraftRepository
+import com.naminfo.ui.main.chat.isForwardedMessage
 import com.naminfo.ui.main.chat.RemoteComposingState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -175,7 +175,7 @@ class ConversationModel
         override fun onNewEvents(chatRoom: ChatRoom, eventLogs: Array<out EventLog>) {
             updateLastMessage()
             updateLastUpdatedTime()
-            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+            refreshUnreadCountAfterCoreCallback(chatRoom)
         }
 
         @WorkerThread
@@ -185,7 +185,7 @@ class ConversationModel
 
         @WorkerThread
         override fun onChatRoomRead(chatRoom: ChatRoom) {
-            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+            refreshUnreadCountAfterCoreCallback(chatRoom)
         }
 
         @WorkerThread
@@ -212,7 +212,7 @@ class ConversationModel
                 Log.i("$TAG Last message [${message.messageId}] has been retracted")
                 updateLastMessage()
             }
-            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+            refreshUnreadCountAfterCoreCallback(chatRoom)
         }
 
         @WorkerThread
@@ -224,10 +224,32 @@ class ConversationModel
         }
     }
 
+    private var hasLastMessageListener = false
+
     private val chatMessageListener = object : ChatMessageListenerStub() {
         @WorkerThread
         override fun onMsgStateChanged(message: ChatMessage, state: ChatMessage.State?) {
             updateLastMessageStatus(message)
+        }
+    }
+
+    /**
+     * Linphone invokes room listeners while holding its Core lock. Defer reading
+     * room.unreadHistory until the callback has returned; otherwise a UI room
+     * query can form a Core-lock/ChatRoom-lock deadlock and trigger an ANR.
+     */
+    @WorkerThread
+    private fun unreadCountForConversation(): Int =
+        CustomImdn.visibleUnreadMessagesCount(
+            LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
+        )
+
+    @WorkerThread
+    private fun refreshUnreadCountAfterCoreCallback(room: ChatRoom) {
+        coreContext.postOnCoreThread {
+            if (room == chatRoom || LinphoneUtils.areSameOneToOnePeer(room, chatRoom)) {
+                unreadMessageCount.postValue(unreadCountForConversation())
+            }
         }
     }
 
@@ -257,7 +279,15 @@ class ConversationModel
         updateLastMessage()
         updateLastUpdatedTime()
 
-        unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+        unreadMessageCount.postValue(unreadCountForConversation())
+    }
+
+    @WorkerThread
+    private fun detachLastMessageListener() {
+        if (hasLastMessageListener) {
+            lastMessage?.removeListener(chatMessageListener)
+            hasLastMessageListener = false
+        }
     }
 
     @WorkerThread
@@ -267,7 +297,7 @@ class ConversationModel
         ChatDraftRepository.removeObserver(draftObserver)
         remoteComposingState.clear()
         customReceiptState = null
-        lastMessage?.removeListener(chatMessageListener)
+        detachLastMessageListener()
         lastMessage = null
 
         chatRoom.removeListener(chatRoomListener)
@@ -290,8 +320,13 @@ class ConversationModel
     @UiThread
     fun markAsRead() {
         coreContext.postOnCoreThread {
-            chatRoom.markAsRead()
-            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+            val unreadRooms = LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
+                .filter { CustomImdn.visibleUnreadMessagesCount(it) > 0 }
+            CustomImdn.prepareRoomRead(unreadRooms)
+            unreadRooms.forEach { room ->
+                room.markAsRead()
+            }
+            unreadMessageCount.postValue(unreadCountForConversation())
             Log.i("$TAG Conversation [$id] has been marked as read")
         }
     }
@@ -299,8 +334,15 @@ class ConversationModel
     @UiThread
     fun updateUnreadCount() {
         coreContext.postOnCoreThread {
-            unreadMessageCount.postValue(CustomImdn.visibleUnreadMessagesCount(chatRoom))
+            unreadMessageCount.postValue(unreadCountForConversation())
         }
+    }
+
+    @WorkerThread
+    fun refreshFromSiblingRooms() {
+        unreadMessageCount.postValue(unreadCountForConversation())
+        updateLastMessage()
+        updateLastUpdatedTime()
     }
 
     @UiThread
@@ -367,7 +409,7 @@ class ConversationModel
 
     @WorkerThread
     private fun updateLastMessageStatus(message: ChatMessage) {
-        val isOutgoing = message.isOutgoing
+        val isOutgoing = message.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(message)
 
         if (isGroup && !isOutgoing) {
             val fromAddress = message.fromAddress
@@ -382,9 +424,9 @@ class ConversationModel
             lastMessageTextSender.postValue("")
         }
         val textContent = message.contents.find { it.isText && !it.isFile }?.utf8Text?.trim().orEmpty()
-        val decodedReply = decodeReplyPreviewEnvelope(textContent)
-        val visibleText = decodedReply?.second ?: textContent
-        val rawSpannable = if (decodedReply != null) {
+        val visibleText = LinphoneUtils.stripMessageEnvelopes(textContent)
+        val hasEnvelope = visibleText != textContent
+        val rawSpannable = if (hasEnvelope && visibleText.isNotEmpty() && !LinphoneUtils.isFileTransferMetadata(visibleText)) {
             SpannableStringBuilder(visibleText).toSpannable()
         } else {
             LinphoneUtils.getFormattedTextDescribingMessage(message)
@@ -433,7 +475,7 @@ class ConversationModel
 
         if (message.isRetracted) {
             lastMessageContentIcon.postValue(R.drawable.trash)
-        } else if (message.isForward) {
+        } else if (isForwardedMessage(message)) {
             lastMessageContentIcon.postValue(R.drawable.forward)
         } else {
             var icon = 0
@@ -447,17 +489,12 @@ class ConversationModel
 
     @WorkerThread
     fun updateLastMessage() {
-        lastMessage?.removeListener(chatMessageListener)
+        detachLastMessageListener()
         lastMessage = null
 
-        val latestMessage = chatRoom.lastMessageInHistory
-        val message = if (CustomImdn.isHiddenControlMessage(latestMessage)) {
-            chatRoom.getHistoryMessageEvents(0).asSequence()
-                .mapNotNull { it.chatMessage }
-                .lastOrNull { !CustomImdn.isHiddenControlMessage(it) }
-        } else {
-            latestMessage
-        }
+        val message = LinphoneUtils.findLatestVisibleMessage(
+            LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
+        )
         if (message == null || CustomImdn.key(message) != customReceiptState?.first) {
             customReceiptState = null
         }
@@ -465,13 +502,15 @@ class ConversationModel
             lastMessage = message
             updateLastMessageStatus(message)
 
-            if (message.isOutgoing && message.state != ChatMessage.State.Displayed) {
+            if (message.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(message) && message.state != ChatMessage.State.Displayed) {
                 message.addListener(chatMessageListener)
+                hasLastMessageListener = true
             } else if (message.contents.find { it.isFileTransfer } != null) {
                 message.addListener(chatMessageListener)
+                hasLastMessageListener = true
             }
 
-            val timestamp = message.time
+            val timestamp = CustomImdn.timestampMillis(message) / 1000L
             val humanReadableTimestamp = when {
                 TimestampUtils.isToday(timestamp) -> {
                     TimestampUtils.timeToString(timestamp)
@@ -522,7 +561,8 @@ class ConversationModel
 
     @WorkerThread
     private fun updateLastUpdatedTime() {
-        val timestamp = chatRoom.lastUpdateTime
+        val timestamp = LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
+            .maxOfOrNull { it.lastUpdateTime } ?: chatRoom.lastUpdateTime
         lastUpdateTime.postValue(timestamp)
     }
 

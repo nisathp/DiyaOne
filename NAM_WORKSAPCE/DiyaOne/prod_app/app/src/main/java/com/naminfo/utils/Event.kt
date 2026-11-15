@@ -32,6 +32,10 @@ open class Event<out T>
     constructor(private val content: T) {
     private val handled = AtomicBoolean(false)
 
+    /** Returns the event payload without marking it consumed. */
+    @AnyThread
+    fun peekContent(): T = content
+
     @UiThread
     fun consume(handleContent: (T) -> Unit) {
         if (!handled.get()) {

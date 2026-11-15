@@ -87,6 +87,15 @@ class RecyclerViewSwipeUtilsCallback(
             }
         }
 
-        super.onChildDraw(canvas, recyclerView, viewHolder, dX, dY, actionState, isCurrentlyActive)
+        val maxSwipe = (viewHolder.itemView.width * 0.28f).coerceAtLeast(120f)
+        val visualDx = dX.coerceIn(-maxSwipe, maxSwipe)
+        super.onChildDraw(canvas, recyclerView, viewHolder, visualDx, dY, actionState, isCurrentlyActive)
+    }
+
+    override fun clearView(recyclerView: RecyclerView, viewHolder: RecyclerView.ViewHolder) {
+        super.clearView(recyclerView, viewHolder)
+        viewHolder.itemView.translationX = 0f
+        viewHolder.itemView.translationY = 0f
+        viewHolder.itemView.alpha = 1f
     }
 }

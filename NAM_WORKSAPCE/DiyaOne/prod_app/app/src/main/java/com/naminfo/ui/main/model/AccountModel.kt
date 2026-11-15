@@ -61,6 +61,7 @@ class AccountModel
             state: RegistrationState?,
             message: String
         ) {
+            if (!isAccountAlive()) return
             Log.i(
                 "$TAG Account [${account.params.identityAddress?.asStringUriOnly()}] registration state changed: [$state]($message)"
             )
@@ -85,6 +86,7 @@ class AccountModel
             account: Account,
             mwi: MessageWaitingIndication
         ) {
+            if (!isAccountAlive()) return
             Log.i(
                 "$TAG Account [${account.params.identityAddress?.asStringUriOnly()}] has received a MWI NOTIFY. ${if (mwi.hasMessageWaiting()) "Message(s) are waiting." else "No message is waiting."}}"
             )
@@ -130,9 +132,24 @@ class AccountModel
         }
     }
 
+    @Volatile
+    private var isDestroyed = false
+
+    private val contactsListener = object : com.naminfo.contacts.ContactsManager.ContactsListener {
+        override fun onContactsLoaded() {
+            coreContext.postOnCoreThread {
+                update()
+            }
+        }
+
+        override fun onContactFoundInRemoteDirectory(friend: org.linphone.core.Friend) {
+        }
+    }
+
     init {
         account.addListener(accountListener)
         coreContext.core.addListener(coreListener)
+        coreContext.contactsManager.addListener(contactsListener)
 
         isDefault.postValue(false)
         presenceStatus.postValue(ConsolidatedPresence.Offline)
@@ -142,9 +159,17 @@ class AccountModel
         update()
     }
 
+    private fun isAccountAlive(): Boolean =
+        !isDestroyed && coreContext.isReady() && coreContext.core.accountList.any { it == account }
+
     @WorkerThread
     fun destroy() {
-        coreContext.core.removeListener(coreListener)
+        if (isDestroyed) return
+        isDestroyed = true
+        coreContext.contactsManager.removeListener(contactsListener)
+        if (coreContext.isReady()) {
+            coreContext.core.removeListener(coreListener)
+        }
         account.removeListener(accountListener)
     }
 
@@ -190,6 +215,7 @@ class AccountModel
     @UiThread
     fun callVoicemailUri() {
         coreContext.postOnCoreThread {
+            if (!isAccountAlive()) return@postOnCoreThread
             val voicemail = account.params.voicemailAddress
             if (voicemail != null) {
                 Log.i("$TAG Calling voicemail address [${voicemail.asStringUriOnly()}]")
@@ -200,14 +226,16 @@ class AccountModel
 
     @WorkerThread
     fun computeNotificationsCount() {
-        val unreadMessages = coreContext.core.chatRooms
+        if (!isAccountAlive()) return
+        val accountRooms = coreContext.core.chatRooms
             .filter { LinphoneUtils.getAccountForAddress(it.localAddress) == account }
-            .sumOf(CustomImdn::visibleUnreadMessagesCount)
+        val unreadMessages = CustomImdn.visibleUnreadMessagesCount(accountRooms)
         notificationsCount.postValue(unreadMessages + account.missedCallsCount)
     }
 
     @WorkerThread
     fun updateRegistrationState() {
+        if (!isAccountAlive()) return
         val state = if (account.state == RegistrationState.None) {
             // If the account has been disabled manually, use the Cleared status instead of None
             if (!account.params.isRegisterEnabled) {
@@ -278,6 +306,7 @@ class AccountModel
 
     @WorkerThread
     private fun update() {
+        if (!isAccountAlive()) return
         Log.i(
             "$TAG Refreshing info for account [${account.params.identityAddress?.asStringUriOnly()}]"
         )
@@ -285,7 +314,13 @@ class AccountModel
         trust.postValue(SecurityLevel.EndToEndEncryptedAndVerified)
         showTrust.postValue(isEndToEndEncryptionMandatory())
 
-        val name = LinphoneUtils.getDisplayName(account.params.identityAddress)
+        // The drawer is the signed-in user's profile area. Prefer the label saved for this
+        // number in the handset/SIM contacts, rather than the SIP profile display name. If the
+        // phone is not saved locally, show its number so the account remains identifiable.
+        val identityAddress = account.params.identityAddress
+        val phoneNumber = identityAddress?.username.orEmpty()
+        val name = identityAddress?.let(coreContext.contactsManager::findSavedNativeName)
+            ?: phoneNumber.ifBlank { LinphoneUtils.getDisplayName(identityAddress) }
         displayName.postValue(name)
 
         initials.postValue(AppUtils.getInitials(name))

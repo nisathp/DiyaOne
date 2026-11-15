@@ -5,6 +5,7 @@ import androidx.annotation.WorkerThread
 import androidx.lifecycle.MediatorLiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
+import com.google.firebase.crashlytics.FirebaseCrashlytics
 import java.util.Locale
 import java.net.HttpURLConnection
 import java.net.URL
@@ -16,8 +17,10 @@ import kotlinx.coroutines.withContext
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.core.ApiLogRepository
+import com.naminfo.core.MobionSessionExpiryHandler
 import com.naminfo.core.MobionTlsCompatibility
 import com.naminfo.contacts.MobionContactsService
+import com.naminfo.contacts.PhoneContactNumbers
 import com.naminfo.R
 import org.linphone.core.Account
 import org.linphone.core.AuthInfo
@@ -44,6 +47,11 @@ class ThirdPartySipAccountLoginViewModel
         val success: Boolean,
         val failureReason: String? = null,
         val profilePictureUrl: String? = null
+    )
+
+    data class ApiFailureDiagnostic(
+        val title: String,
+        val details: String
     )
 
     val username = MutableLiveData<String>()
@@ -86,6 +94,10 @@ class ThirdPartySipAccountLoginViewModel
         MutableLiveData()
     }
 
+    val apiFailureDiagnosticEvent: MutableLiveData<Event<ApiFailureDiagnostic>> by lazy {
+        MutableLiveData()
+    }
+
     val defaultTransportIndexEvent: MutableLiveData<Event<Int>> by lazy {
         MutableLiveData()
     }
@@ -122,17 +134,14 @@ class ThirdPartySipAccountLoginViewModel
                     core.removeListener(this)
 
                     val error = when (account.error) {
-                        Reason.Forbidden -> {
+                        Reason.Forbidden, Reason.Unauthorized -> {
                             AppUtils.getString(R.string.assistant_account_login_forbidden_error)
                         }
-                        Reason.IOError -> {
+                        Reason.IOError, Reason.NoResponse, Reason.ServerTimeout -> {
                             AppUtils.getString(R.string.assistant_account_login_sip_server_unreachable_error)
                         }
                         else -> {
-                            AppUtils.getFormattedString(
-                                R.string.assistant_account_login_error,
-                                account.error.toString()
-                            )
+                            AppUtils.getString(R.string.assistant_account_login_error)
                         }
                     }
                     accountLoginErrorEvent.postValue(Event(error))
@@ -144,7 +153,7 @@ class ThirdPartySipAccountLoginViewModel
                     val disabledAccountParams = account.params.clone()
                     disabledAccountParams.isRegisterEnabled = false
                     account.params = disabledAccountParams
-                    core.removeAuthInfo(newlyCreatedAuthInfo)
+                    clearCachedSipAuthInfos(core, newlyCreatedAccount.params.identityAddress?.username.orEmpty(), newlyCreatedAccount.params.identityAddress?.domain.orEmpty())
                     core.removeAccount(newlyCreatedAccount)
                 }
             }
@@ -152,7 +161,7 @@ class ThirdPartySipAccountLoginViewModel
     }
 
     init {
-        expandAdvancedSettings.value = true
+        expandAdvancedSettings.value = false
         registrationInProgress.value = false
         registrationFailed.value = false
 
@@ -220,10 +229,19 @@ class ThirdPartySipAccountLoginViewModel
             if (!authentication.success) {
                 registrationInProgress.value = false
                 registrationFailed.value = true
-                val reason = authentication.failureReason ?: "Unknown API error"
-                accountLoginErrorEvent.value = Event(
-                    AppUtils.getFormattedString(R.string.assistant_account_login_error, reason)
-                )
+                val rawReason = authentication.failureReason.orEmpty().lowercase()
+                val error = when {
+                    rawReason.contains("forbidden") || rawReason.contains("unauthorized") || rawReason.contains("credential") || rawReason.contains("password") || rawReason.contains("invalid") -> {
+                        AppUtils.getString(R.string.assistant_account_login_forbidden_error)
+                    }
+                    rawReason.contains("timeout") || rawReason.contains("connection") || rawReason.contains("unreachable") || rawReason.contains("socket") -> {
+                        AppUtils.getString(R.string.assistant_account_login_sip_server_unreachable_error)
+                    }
+                    else -> {
+                        AppUtils.getString(R.string.assistant_account_login_error)
+                    }
+                }
+                accountLoginErrorEvent.value = Event(error)
                 return@launch
             }
 
@@ -281,13 +299,20 @@ class ThirdPartySipAccountLoginViewModel
                     return@postOnCoreThread
                 }
 
+                // A digest challenge can make Linphone persist a second AuthInfo with the
+                // registrar realm (for example 10.x.x.x). Removing only the account's direct
+                // AuthInfo on sign-out leaves that realm entry behind. On the next login it can
+                // win the lookup and submit an obsolete password, which the UI reports as
+                // "Invalid username". Keep exactly one fresh credential for this user/domain.
+                val authDomain = domainAddress?.domain ?: domainValue
+                clearCachedSipAuthInfos(core, parsedUser, authDomain)
                 newlyCreatedAuthInfo = Factory.instance().createAuthInfo(
                     parsedUser,
                     userId,
                     pwd,
                     null,
                     null,
-                    domainAddress?.domain ?: domainValue
+                    authDomain
                 )
                 core.addAuthInfo(newlyCreatedAuthInfo)
 
@@ -364,6 +389,20 @@ class ThirdPartySipAccountLoginViewModel
             sipDomain.value.orEmpty().isNotBlank()
     }
 
+    @WorkerThread
+    private fun clearCachedSipAuthInfos(core: Core, username: String, domain: String) {
+        if (username.isBlank() || domain.isBlank()) return
+        val staleInfos = core.authInfoList.filter { authInfo ->
+            authInfo.username == username &&
+                (authInfo.domain.isNullOrBlank() || authInfo.domain.equals(domain, ignoreCase = true))
+        }
+        staleInfos.forEach { authInfo ->
+            Log.i("$TAG Removing cached SIP auth info for [$username] realm=[${authInfo.realm}]")
+            core.removeAuthInfo(authInfo)
+        }
+        if (staleInfos.isNotEmpty()) core.config.sync()
+    }
+
    /* @UiThread
     private fun isLoginButtonEnabled(): Boolean {
         val mobileNumber = username.value.orEmpty().trim()
@@ -423,11 +462,22 @@ class ThirdPartySipAccountLoginViewModel
                 signupCode in 200..299 -> Log.i("$TAG Signup API succeeded with HTTP $signupCode")
                 userAlreadyExists -> Log.i("$TAG Signup reports existing user (HTTP $signupCode), signing in")
                 else -> {
+                    reportApiFailure(
+                        operation = "Signup",
+                        endpoint = signupUrl.toString(),
+                        statusCode = signupCode,
+                        response = signupError
+                    )
                     Log.w("$TAG Signup API returned HTTP $signupCode, attempting signin fallback")
                 }
             }
         } catch (e: Exception) {
             ApiLogRepository.fail(signupLogId ?: ApiLogRepository.begin("POST", "$apiBase/users"), e)
+            reportApiFailure(
+                operation = "Signup",
+                endpoint = "$apiBase/users",
+                exception = e
+            )
             Log.w("$TAG Signup API unavailable (${e.javaClass.simpleName}: ${e.message}), attempting signin fallback")
         }
 
@@ -464,14 +514,18 @@ class ThirdPartySipAccountLoginViewModel
                     if (token.isNotEmpty()) corePreferences.authToken = token
                     if (refreshToken.isNotEmpty()) corePreferences.refreshToken = refreshToken
                     corePreferences.accessTokenExpiresAt = accessTokenExpiresAt.ifEmpty { null }
+                    MobionSessionExpiryHandler.resetForNewSession()
                     corePreferences.refreshTokenExpiresAt = refreshTokenExpiresAt.ifEmpty { null }
                     corePreferences.apiDomain = apiBase
                     val now = java.text.SimpleDateFormat("dd MMM yyyy, hh:mm a", java.util.Locale.getDefault()).format(java.util.Date())
                     corePreferences.loginTime = now
-                    // This single-user endpoint is intentionally used only for
-                    // the account that just signed in. Contact photos come from
-                    // the single bulk `/users` map, never N individual calls.
-                    profilePictureUrl = MobionContactsService.fetchProfilePictureUrl(subscriberId)
+                    // A successful sign-in starts a fresh account session. Fetch the full
+                    // directory now (rather than reusing a previous user's disk cache), save
+                    // it for offline fallback, and use the same response for our profile photo.
+                    val normalizedSubscriberId = PhoneContactNumbers.normalize(subscriberId)
+                    profilePictureUrl = MobionContactsService.fetchContacts(forceRefresh = true)
+                        .firstOrNull { it.mobileNumber == normalizedSubscriberId }
+                        ?.profilePictureUrl
                 } catch (e: Exception) {
                     Log.w("$TAG Failed to parse signin response JSON: $e")
                 }
@@ -483,12 +537,23 @@ class ThirdPartySipAccountLoginViewModel
             } else {
                 val errorText = signinConn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
                 ApiLogRepository.complete(requireNotNull(signinLogId), signinCode, errorText)
+                reportApiFailure(
+                    operation = "Signin",
+                    endpoint = signinUrl.toString(),
+                    statusCode = signinCode,
+                    response = errorText
+                )
                 Log.e("$TAG Signin API failed with HTTP $signinCode")
                 signinConn.disconnect()
                 return@withContext ApiAuthenticationResult(false, "Signin API HTTP $signinCode")
             }
         } catch (e: Exception) {
             ApiLogRepository.fail(signinLogId ?: ApiLogRepository.begin("POST", "$apiBase/auth/signin"), e)
+            reportApiFailure(
+                operation = "Signin",
+                endpoint = "$apiBase/auth/signin",
+                exception = e
+            )
             val errorMsg = if (e is java.net.SocketTimeoutException) {
                 "Server Connection Timeout"
             } else {
@@ -496,6 +561,37 @@ class ThirdPartySipAccountLoginViewModel
             }
             Log.e("$TAG Signin API unavailable: ${e.javaClass.simpleName}")
             return@withContext ApiAuthenticationResult(false, errorMsg)
+        }
+    }
+
+    private fun reportApiFailure(
+        operation: String,
+        endpoint: String,
+        statusCode: Int? = null,
+        response: String? = null,
+        exception: Exception? = null
+    ) {
+        val safeResponse = ApiLogRepository.sanitizeForDisplay(response).orEmpty().take(4_000)
+        val exceptionDetails = exception?.let { "${it.javaClass.simpleName}: ${it.message.orEmpty()}" }.orEmpty()
+        val details = buildString {
+            append("Endpoint: $endpoint")
+            statusCode?.let { append("\nHTTP status: $it") }
+            if (safeResponse.isNotBlank()) append("\nServer response: $safeResponse")
+            if (exceptionDetails.isNotBlank()) append("\nException: $exceptionDetails")
+            append("\n\nFull request/response: Menu > API Logs")
+        }
+        apiFailureDiagnosticEvent.postValue(Event(ApiFailureDiagnostic("$operation API failed", details)))
+
+        runCatching {
+            FirebaseCrashlytics.getInstance().apply {
+                setCustomKey("api_operation", operation)
+                setCustomKey("api_endpoint", endpoint)
+                statusCode?.let { setCustomKey("api_http_status", it) }
+                log("$operation API failure: ${statusCode ?: exception?.javaClass?.simpleName.orEmpty()}")
+                recordException(exception ?: IllegalStateException("$operation API HTTP $statusCode"))
+            }
+        }.onFailure { error ->
+            Log.w("$TAG Couldn't record $operation API failure in Crashlytics: ${error.message}")
         }
     }
 

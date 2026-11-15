@@ -54,6 +54,7 @@ import com.naminfo.ui.NotoSansFont
 import com.naminfo.ui.call.conference.model.ConferenceParticipantDeviceModel
 import com.naminfo.ui.call.view.VuMeterView
 import com.naminfo.ui.call.view.RoundCornersTextureView
+import java.io.File
 
 /**
  * This file contains all the data binding necessary for the app
@@ -310,6 +311,37 @@ fun ImageView.loadFileImage(file: String?) {
     }
 }
 
+/** Loads a small reply quote thumbnail without forcing an attachment download. */
+@UiThread
+@BindingAdapter("coilReplyPreview")
+fun ImageView.loadReplyPreview(file: String?) {
+    val size = resources.getDimension(R.dimen.chat_bubble_reply_media_preview_size).toInt()
+    if (file.isNullOrBlank()) {
+        setImageResource(R.drawable.image)
+        return
+    }
+    val source: Any = if (file.startsWith("http", ignoreCase = true) || file.startsWith("content://")) {
+        file
+    } else {
+        val localFile = File(file)
+        if (!localFile.isFile || localFile.length() <= 0L) {
+            setImageResource(R.drawable.image)
+            return
+        }
+        localFile
+    }
+    load(source) {
+        placeholder(R.drawable.image)
+        transformations(
+            RoundedCornersTransformation(
+                resources.getDimension(R.dimen.chat_bubble_images_rounded_corner_radius)
+            )
+        )
+        size(Dimension(size), Dimension(size))
+        listener(onError = { _, _ -> setImageResource(R.drawable.image) })
+    }
+}
+
 @UiThread
 @BindingAdapter("coilBubble", "coilBubbleFallback")
 fun ImageView.loadImageForChatBubbleSingle(file: String?, fallback: View?) {
@@ -328,22 +360,42 @@ private fun loadImageForChatBubble(
     grid: Boolean,
     fallback: View?
 ) {
-    if (file.isNullOrEmpty()) return
+    if (file.isNullOrEmpty()) {
+        // Clear any bitmap retained from a recycled ViewHolder so undownloaded items reveal
+        // the placeholder icon instead of painting a stale previous photo over it.
+        imageView.dispose()
+        imageView.setImageDrawable(null)
+        imageView.visibility = View.GONE
+        return
+    }
 
     val isImage = FileUtils.isExtensionImage((file))
     val isVideo = FileUtils.isExtensionVideo(file)
     if (isImage || isVideo) {
+        imageView.visibility = View.VISIBLE
+    } else {
+        imageView.dispose()
+        imageView.setImageDrawable(null)
+        imageView.visibility = View.GONE
+    }
+    if (isImage || isVideo) {
         val dimen = if (grid) {
             imageView.resources.getDimension(R.dimen.chat_bubble_grid_file_size).toInt()
         } else {
-            imageView.resources.getDimension(R.dimen.chat_bubble_big_image_max_size).toInt()
+            imageView.resources.getDimension(R.dimen.chat_bubble_compact_media_size).toInt()
         }
-        val width = if (grid) Dimension(dimen) else Dimension.Undefined
+        // A single-media bubble used an undefined width. Coil then decoded the full source
+        // image (often 3–4 MB) before it could draw a small chat thumbnail, which stalled
+        // opening a media-heavy conversation for seconds. Both dimensions are an upper bound;
+        // the ImageView's fitCenter scale type still preserves the original aspect ratio.
+        val width = Dimension(dimen)
         val height = Dimension(dimen)
         val radius = imageView.resources.getDimension(
             R.dimen.chat_bubble_images_rounded_corner_radius
         )
 
+        imageView.visibility = View.VISIBLE
+        fallback?.visibility = View.GONE
         if (isVideo) {
             imageView.load(file) {
                 placeholder(R.drawable.file_video)
@@ -405,33 +457,79 @@ fun ImageView.loadCircleFileWithCoil(file: String?) {
 }
 
 @UiThread
-@BindingAdapter("coilAvatar")
-fun ImageView.loadAvatarWithCoil(model: AbstractAvatarModel?) {
-    loadContactPictureWithCoil(this, model)
+@BindingAdapter(
+    value = ["coilAvatar", "coilAvatarPicture", "coilAvatarInitials"],
+    requireAll = false
+)
+fun ImageView.loadAvatarWithCoil(
+    model: AbstractAvatarModel?,
+    picturePath: String?,
+    initials: String?
+) {
+    loadContactPictureWithCoil(this, model, picturePathOverride = picturePath)
 }
 
 @UiThread
-@BindingAdapter("coilBubbleAvatar")
-fun ImageView.loadBubbleAvatarWithCoil(model: AbstractAvatarModel?) {
+@BindingAdapter(
+    value = ["coilBubbleAvatar", "coilAvatarPicture", "coilAvatarInitials"],
+    requireAll = false
+)
+fun ImageView.loadBubbleAvatarWithCoil(
+    model: AbstractAvatarModel?,
+    picturePath: String?,
+    initials: String?
+) {
     val size = R.dimen.avatar_bubble_size
     val initialsSize = R.dimen.avatar_initials_bubble_text_size
-    loadContactPictureWithCoil(this, model, size = size, textSize = initialsSize)
+    loadContactPictureWithCoil(
+        this,
+        model,
+        size = size,
+        textSize = initialsSize,
+        picturePathOverride = picturePath
+    )
 }
 
 @UiThread
-@BindingAdapter("coilBigAvatar")
-fun ImageView.loadBigAvatarWithCoil(model: AbstractAvatarModel?) {
+@BindingAdapter(
+    value = ["coilBigAvatar", "coilAvatarPicture", "coilAvatarInitials"],
+    requireAll = false
+)
+fun ImageView.loadBigAvatarWithCoil(
+    model: AbstractAvatarModel?,
+    picturePath: String?,
+    initials: String?
+) {
     val size = R.dimen.avatar_big_size
     val initialsSize = R.dimen.avatar_initials_big_text_size
-    loadContactPictureWithCoil(this, model, size = size, textSize = initialsSize)
+    loadContactPictureWithCoil(
+        this,
+        model,
+        size = size,
+        textSize = initialsSize,
+        picturePathOverride = picturePath
+    )
 }
 
 @UiThread
-@BindingAdapter("coilHugeAvatar")
-fun ImageView.loadCallAvatarWithCoil(model: AbstractAvatarModel?) {
+@BindingAdapter(
+    value = ["coilHugeAvatar", "coilAvatarPicture", "coilAvatarInitials"],
+    requireAll = false
+)
+fun ImageView.loadCallAvatarWithCoil(
+    model: AbstractAvatarModel?,
+    picturePath: String?,
+    initials: String?
+) {
     val size = R.dimen.avatar_in_call_size
     val initialsSize = R.dimen.avatar_initials_call_text_size
-    loadContactPictureWithCoil(this, model, size = size, textSize = initialsSize)
+    loadContactPictureWithCoil(
+        this,
+        model,
+        size = size,
+        textSize = initialsSize,
+        picturePathOverride = picturePath
+    )
 }
 
 @SuppressLint("ResourceType")
@@ -439,7 +537,8 @@ private fun loadContactPictureWithCoil(
     imageView: ImageView,
     model: AbstractAvatarModel?,
     @DimenRes size: Int = 0,
-    @DimenRes textSize: Int = 0
+    @DimenRes textSize: Int = 0,
+    picturePathOverride: String? = null
 ) {
     imageView.dispose()
 
@@ -453,7 +552,9 @@ private fun loadContactPictureWithCoil(
             return
         }
 
-        val image = model.picturePath.value.orEmpty()
+        val image = (picturePathOverride ?: model.picturePath.value).orEmpty()
+            .takeIf { it != "null" }
+            .orEmpty()
         if (image.isNotEmpty()) {
             // Keep a stable initials avatar in recycled list cells until the
             // remote profile image is ready, and expose the image fetch with a
@@ -461,6 +562,13 @@ private fun loadContactPictureWithCoil(
             imageView.load(getErrorImageLoader(context, model, size, textSize))
             imageView.setAvatarLoading(true)
             imageView.load(image) {
+                if (image.startsWith("http://", ignoreCase = true) ||
+                    image.startsWith("https://", ignoreCase = true)
+                ) {
+                    val epoch = com.naminfo.contacts.MobionContactsService.currentAvatarCacheEpoch()
+                    memoryCacheKey("$image#v=$epoch")
+                    diskCacheKey("$image#v=$epoch")
+                }
                 transformations(CircleCropTransformation())
                 listener(
                     onSuccess = { _, _ ->

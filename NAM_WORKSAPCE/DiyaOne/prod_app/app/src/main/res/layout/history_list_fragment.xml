@@ -184,6 +184,7 @@
                             android:layout_marginStart="4dp"
                             android:gravity="center"
                             android:text="@string/history_filter_t_calls"
+                            android:visibility="visible"
                             android:textSize="13sp"
                             android:textStyle="bold"
                             android:background="@{viewModel.selectedHistoryFilterMode == com.naminfo.ui.main.history.viewmodel.CallHistoryFilterMode.T_CALLS ? @drawable/primary_button_background : @drawable/secondary_button_background}"
