@@ -1,0 +1,47 @@
+name: Build DiyaOne Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'NAM_WORKSAPCE/DiyaOne/prod_app/**'
+      - '.github/workflows/diyaone-android-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug-apk:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: NAM_WORKSAPCE/DiyaOne/prod_app
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: diyaone-debug-apk
+          path: NAM_WORKSAPCE/DiyaOne/prod_app/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
