@@ -47,6 +47,7 @@ import com.naminfo.translation.CallLanguageSyncApi
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
 import org.json.JSONObject
 
 class CoreContext
@@ -55,6 +56,8 @@ class CoreContext
     companion object {
         private const val TAG = "[Core Context]"
         const val MEDIA_ENCRYPTION_DEFAULT_NONE_KEY = "media_encryption_default_none_v1"
+        private const val PUSH_WAKE_API_URL = "https://androidpushnotification.vercel.app/api/wake-call"
+        private val mobileNumberRegex = Regex("^\\d{6,15}$")
     }
 
     lateinit var core: Core
@@ -1329,7 +1332,8 @@ class CoreContext
         callParams: CallParams? = null,
         forceZRTP: Boolean = false,
         localAddress: Address? = null,
-        skipNetworkReachabilityTest: Boolean = false
+        skipNetworkReachabilityTest: Boolean = false,
+        skipCalleeWake: Boolean = false
     ) {
         if (isLinphoneFallbackAddress(address)) {
             Log.e("$TAG Refusing outgoing call to Linphone fallback identity [${address.asStringUriOnly()}]")
@@ -1344,6 +1348,14 @@ class CoreContext
 
         if (!skipNetworkReachabilityTest && !core.isNetworkReachable) {
             Log.e("$TAG Network unreachable, abort outgoing call")
+            return
+        }
+
+        // For ordinary DiyaOne subscriber calls, Phone A owns the FCM wake
+        // handshake. Do not send a SIP INVITE until Phone B acknowledges a
+        // fresh SIP REGISTER through the backend. FreeSWITCH stays unaware of
+        // FCM and continues to route only the later SIP INVITE.
+        if (!skipCalleeWake && !isTranslationCallRequest && queueCalleeWake(address, callParams, forceZRTP, localAddress, skipNetworkReachabilityTest)) {
             return
         }
 
@@ -1449,6 +1461,95 @@ class CoreContext
     }
 
     @WorkerThread
+    private fun queueCalleeWake(
+        destination: Address,
+        callParams: CallParams?,
+        forceZRTP: Boolean,
+        localAddress: Address?,
+        skipNetworkReachabilityTest: Boolean
+    ): Boolean {
+        val callerNumber = core.defaultAccount?.params?.identityAddress?.username.orEmpty().filter(Char::isDigit)
+        val calleeNumber = destination.username.orEmpty().filter(Char::isDigit)
+        if (!mobileNumberRegex.matches(callerNumber) || !mobileNumberRegex.matches(calleeNumber) || callerNumber == calleeNumber) {
+            return false
+        }
+
+        val callId = UUID.randomUUID().toString().replace("-", "")
+        Log.i("$TAG Waiting for receiver SIP readiness: callId=[$callId], caller=[$callerNumber], callee=[$calleeNumber]")
+        Thread {
+            var conn: HttpURLConnection? = null
+            try {
+                val apiBase = corePreferences.apiDomain?.takeIf { it.isNotBlank() }
+                    ?: "https://mobionglobal.info/Diyaone/api"
+                val accessToken = MobionTokenRefresher.validAccessToken(apiBase)
+                if (accessToken.isNullOrBlank()) {
+                    Log.w("$TAG Wake call aborted because the caller has no valid Mobion session")
+                    notifyCalleeUnavailable()
+                    return@Thread
+                }
+
+                conn = URL(PUSH_WAKE_API_URL).openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setRequestProperty("Authorization", "Bearer $accessToken")
+                conn.connectTimeout = 5_000
+                // Mobion session validation, high-priority FCM delivery, and
+                // the receiver's six-second SIP-ready wait all happen in this
+                // single caller-owned request.
+                conn.readTimeout = 15_000
+                conn.doOutput = true
+                val requestBody = JSONObject().apply {
+                    put("callId", callId)
+                    put("callerNumber", callerNumber)
+                    put("calleeNumber", calleeNumber)
+                }.toString()
+                val logId = ApiLogRepository.begin("POST", PUSH_WAKE_API_URL, requestBody)
+                OutputStreamWriter(conn.outputStream).use { it.write(requestBody) }
+                val responseCode = conn.responseCode
+                val response = (if (responseCode in 200..299) conn.inputStream else conn.errorStream)
+                    ?.bufferedReader()?.use { it.readText() }
+                ApiLogRepository.complete(logId, responseCode, response)
+                val sipReady = responseCode in 200..299 && JSONObject(response ?: "{}").optBoolean("sipReady", false)
+                if (!sipReady) {
+                    Log.w("$TAG Receiver did not become SIP-ready: callId=[$callId], status=[$responseCode]")
+                    notifyCalleeUnavailable()
+                    return@Thread
+                }
+
+                Log.i("$TAG Receiver SIP-ready; starting SIP INVITE for callId=[$callId]")
+                postOnCoreThread {
+                    startCall(
+                        destination,
+                        callParams,
+                        forceZRTP,
+                        localAddress,
+                        skipNetworkReachabilityTest,
+                        skipCalleeWake = true
+                    )
+                }
+            } catch (error: Exception) {
+                Log.w("$TAG Wake call failed for [$callId]: ${error.message}")
+                notifyCalleeUnavailable()
+            } finally {
+                conn?.disconnect()
+            }
+        }.start()
+        return true
+    }
+
+    @AnyThread
+    private fun notifyCalleeUnavailable() {
+        showRedToastEvent.postValue(
+            Event(
+                Pair(
+                    com.naminfo.R.string.call_error_temporarily_unavailable_toast,
+                    com.naminfo.R.drawable.warning_circle
+                )
+            )
+        )
+    }
+
+    @WorkerThread
     private fun isLinphoneFallbackAddress(address: Address?): Boolean {
         // The domain can be sip.linphone.org or a local IPv4/IPv6 address,
         // depending on which fallback path liblinphone took. The username is
@@ -1478,6 +1579,11 @@ class CoreContext
     private fun acknowledgePendingWakeCall() {
         val callId = pendingWakeCallId ?: return
         val readyToken = pendingWakeReadyToken ?: return
+        val receiverNumber = core.defaultAccount?.params?.identityAddress?.username.orEmpty().filter(Char::isDigit)
+        if (!mobileNumberRegex.matches(receiverNumber)) {
+            Log.w("$TAG Not acknowledging wake call [$callId]: receiver SIP identity is invalid")
+            return
+        }
         synchronized(pendingWakeAckLock) {
             if (pendingWakeAckInProgressFor == callId) return
             pendingWakeAckInProgressFor = callId
@@ -1501,6 +1607,8 @@ class CoreContext
                     val body = JSONObject().apply {
                         put("callId", callId)
                         put("readyToken", readyToken)
+                        put("receiverNumber", receiverNumber)
+                        put("sipReady", true)
                     }.toString()
                     val logId = ApiLogRepository.begin("POST", "https://androidpushnotification.vercel.app/api/call-ready", body)
                     OutputStreamWriter(conn.outputStream).use { it.write(body) }
@@ -1530,7 +1638,7 @@ class CoreContext
                 }
                 Log.i("$TAG Vercel API acknowledged SIP readiness for call [$callId] in [${android.os.SystemClock.elapsedRealtime() - startedAt}ms]")
             } else {
-                Log.w("$TAG Could not acknowledge SIP readiness for call [$callId]; FreeSWITCH will fail this wake call closed")
+                Log.w("$TAG Could not acknowledge SIP readiness for call [$callId]; caller app will report the call unavailable")
             }
             synchronized(pendingWakeAckLock) {
                 if (pendingWakeAckInProgressFor == callId) pendingWakeAckInProgressFor = null
