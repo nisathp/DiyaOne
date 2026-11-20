@@ -25,23 +25,33 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 /**
- * Durable inbox for items delivered by the Vercel offline queue.
+ * Durable inbox for items delivered by the Firebase Functions offline queue.
  *
- * The HFT server owns file bytes and Vercel owns delivery metadata. When B reconnects, it
+ * The HFT server owns file bytes and Firebase owns delivery metadata. When B reconnects, it
  * downloads signed media URLs itself and injects a persisted incoming message into the existing
  * local SIP chat room. A therefore does not need to remain online for B to receive media.
  */
 object OfflineInboxRepository {
     private const val TAG = "[Offline Inbox]"
-    private const val ENDPOINT = "https://androidpushnotification.vercel.app/api/offline-queue"
+    private const val ENDPOINT =
+        "https://asia-south1-nam-info-projects-a46e0.cloudfunctions.net/api/offline-queue"
     private const val SIGNATURE = "015a3e11e51129f1e74326b993b508103506093f884b4f66e94404d334473820"
     private const val PREFS = "offline_inbox"
     private const val ITEMS_KEY = "items"
     private const val DOWNLOADED_MEDIA_KEY = "downloaded_media"
     private const val PENDING_OUTBOX_KEY = "pending_outbox"
+    // Native Basic-SIP history can be recreated after a screen is reopened.  Keep a local
+    // tombstone for a user-deleted message so a stale Core row or our durable fallback cannot
+    // render it again on the next history merge.
+    private const val DELETED_MESSAGE_TOMBSTONES_KEY = "deleted_message_tombstones"
     private const val CACHED_FCM_TOKEN_KEY = "cached_fcm_token"
     private const val MAX_STORED_ITEMS = 200
+    private const val MAX_DELETED_MESSAGE_TOMBSTONES = 400
     private const val NOTIFICATION_ID = 7412
+    // The queue push can reach an already registered handset before the same SIP MESSAGE.
+    // Give a direct SIP MESSAGE a brief head start. The durable fallback now exists before
+    // materialization, so a long multi-second wait only makes the receiver UI feel sluggish.
+    private const val SIP_DELIVERY_GRACE_PERIOD_MS = 750L
     const val QUEUE_MEDIA_HEADER = "X-Diya-Queue-Media"
 
     private val pulling = ConcurrentHashMap.newKeySet<String>()
@@ -50,6 +60,11 @@ object OfflineInboxRepository {
     private val queuedOutgoingIds = ConcurrentHashMap.newKeySet<String>()
     private val queuedMediaOutgoingIds = ConcurrentHashMap.newKeySet<String>()
     private val downloadingMediaKeys = ConcurrentHashMap.newKeySet<String>()
+    private val pendingIncomingMaterializationIds = ConcurrentHashMap.newKeySet<String>()
+    // Some Android 14 vendor Core builds create a Basic room but omit it from Core.chatRooms
+    // after process restart. Retain recovered queue rooms for the current process so UI can
+    // merge them back into the list.
+    private val localFallbackRooms = ConcurrentHashMap<String, ChatRoom>()
     private val outboxExecutor = Executors.newSingleThreadExecutor()
     private val lock = Any()
 
@@ -78,6 +93,29 @@ object OfflineInboxRepository {
         flushPendingOutboxAsync(clean)
     }
 
+    /**
+     * Clears transient work at sign-out but retains recipient-scoped inbox history. This lets
+     * the same SIP account recover its history on its next login without exposing it to a
+     * different account using the same handset.
+     */
+    fun clearSessionData() {
+        synchronized(lock) {
+            runCatching { preferences().edit().remove(PENDING_OUTBOX_KEY).apply() }
+        }
+        pulling.clear()
+        pendingRepull.clear()
+        cancelledOutgoingIds.clear()
+        queuedOutgoingIds.clear()
+        queuedMediaOutgoingIds.clear()
+        downloadingMediaKeys.clear()
+        pendingIncomingMaterializationIds.clear()
+        localFallbackRooms.clear()
+        downloadingMediaCallbacks.clear()
+        inMemoryQueuedMediaByKey.clear()
+        NotificationManagerCompat.from(coreContext.context).cancel(NOTIFICATION_ID)
+        Log.i("$TAG Cleared transient offline inbox work at sign-out; retained recipient-scoped history")
+    }
+
     private fun resolveCachedFcmToken(): String? {
         cachedFcmToken?.takeIf { it.isNotBlank() }?.let { return it }
         return try {
@@ -94,6 +132,7 @@ object OfflineInboxRepository {
 
     fun pullForRegisteredAccount(phoneNumber: String?) {
         val number = normalize(phoneNumber) ?: return
+        restoreLocalFallbackRooms()
         if (!pulling.add(number)) {
             pendingRepull.add(number)
             return
@@ -151,6 +190,21 @@ object OfflineInboxRepository {
         val receivedAt: Long
     )
 
+    /** Durable local fallback when a vendor Core build rejects a synthetic Basic chat event. */
+    data class LocalFallbackItem(
+        val id: String,
+        val sender: String,
+        val text: String,
+        val mediaJson: String?,
+        val timestampMillis: Long,
+        val isRead: Boolean,
+        val isOutgoing: Boolean,
+        val deliveryStatus: String?,
+        val replyToId: String?,
+        val replyPreview: String?,
+        val isForward: Boolean
+    )
+
     data class QueuedMedia(
         val messageId: String,
         val index: Int,
@@ -161,11 +215,19 @@ object OfflineInboxRepository {
         val localPath: String?
     )
 
+    private data class OutgoingHistoryMedia(val attachments: List<QueuedMedia>)
+
+    private data class OutgoingHistoryKey(val local: String, val peer: String, val id: String)
+
+    private var indexedHistoryJson: String? = null
+    private var outgoingHistoryIndex: Map<OutgoingHistoryKey, JSONObject> = emptyMap()
+
     fun storedItems(): List<InboxItem> = synchronized(lock) {
         val items = readStoredItems()
         buildList {
             for (index in 0 until items.length()) {
                 val item = items.optJSONObject(index) ?: continue
+                if (item.optBoolean("localOutgoing", false)) continue
                 add(
                     InboxItem(
                         sender = item.optString("sender", "Unknown"),
@@ -178,8 +240,426 @@ object OfflineInboxRepository {
         }.asReversed()
     }
 
+    /** Returns queue rows that have no corresponding native Core event for this 1:1 room. */
+    fun localFallbackItems(chatRoom: ChatRoom, nativeMessageIds: Set<String> = emptySet()): List<LocalFallbackItem> =
+        synchronized(lock) {
+            val peer = normalize(chatRoom.peerAddress.username) ?: return@synchronized emptyList()
+            val localRecipient = normalize(chatRoom.localAddress.username) ?: return@synchronized emptyList()
+            buildList {
+                val items = readStoredItems()
+                for (index in 0 until items.length()) {
+                    val item = items.optJSONObject(index) ?: continue
+                    val id = item.optString("id")
+                    if (!id.matches(Regex("[A-Za-z0-9._-]{8,200}")) || id in nativeMessageIds) continue
+                    if (normalize(item.optString("sender")) != peer) continue
+                    val storedRecipient = normalize(item.optString("localRecipient"))
+                        ?: normalize(item.optString("recipient"))
+                    // Unscoped legacy rows cannot safely be assigned after an account switch.
+                    if (storedRecipient != localRecipient) continue
+                    if (isLocallyDeletedLocked(peer, localRecipient, setOf(id))) continue
+                    add(
+                        LocalFallbackItem(
+                            id = id,
+                            sender = peer,
+                            text = item.optString("text"),
+                            mediaJson = item.optJSONArray("media")?.takeIf { it.length() > 0 }?.toString(),
+                            timestampMillis = itemTimestampMillis(item).takeIf { it > 0L }
+                                ?: item.optLong("receivedAt", System.currentTimeMillis()),
+                            isRead = item.optBoolean("localRead", false),
+                            isOutgoing = item.optBoolean("localOutgoing", false),
+                            deliveryStatus = item.optString("deliveryStatus")
+                                .takeIf { it == "delivered" || it == "displayed" },
+                            replyToId = item.optString("replyToId").takeIf { it.isNotBlank() },
+                            replyPreview = item.optString("replyPreview").takeIf { it.isNotBlank() },
+                            isForward = item.optBoolean("isForward", false) || item.optBoolean("isForwarded", false)
+                        )
+                    )
+                }
+            }.sortedBy { it.timestampMillis }
+        }
+
     /**
-     * Vercel is the durable offline authority for every chat payload: text, image, video and
+     * Deletes the durable rendering snapshot alongside the Core event.  This is intentionally
+     * local-only: "delete for me" must not manufacture a remote retraction, but it must remain
+     * deleted after Basic-SIP reloads/restarts on vendor devices.
+     */
+    fun markMessageDeletedLocally(message: ChatMessage): Set<String> =
+        storeLocalDeletes(message.chatRoom, messageIdentifiers(message))
+
+    private fun storeLocalDeletes(chatRoom: ChatRoom, selectedIds: Set<String>): Set<String> {
+        val peerAddress = chatRoom.peerAddress
+        val localAddress = chatRoom.localAddress
+        val peer = normalize(peerAddress.username) ?: peerAddress.asStringUriOnly()
+        val localRecipient = normalize(localAddress.username) ?: localAddress.asStringUriOnly()
+        if (selectedIds.isEmpty()) return emptySet()
+
+        val ids = synchronized(lock) {
+            val deletedIds = selectedIds.toMutableSet()
+            val stored = readStoredItems()
+            val retained = JSONArray()
+            for (index in 0 until stored.length()) {
+                val item = stored.optJSONObject(index) ?: continue
+                val itemRecipient = normalize(item.optString("localRecipient"))
+                    ?: normalize(item.optString("recipient"))
+                val itemId = item.optString("id")
+                val nativeId = item.optString("nativeMessageId")
+                val sameConversation = normalize(item.optString("sender")) == peer &&
+                    itemRecipient == localRecipient
+                if (sameConversation && (itemId in selectedIds || nativeId in selectedIds)) {
+                    if (itemId.isNotBlank()) deletedIds.add(itemId)
+                    if (nativeId.isNotBlank()) deletedIds.add(nativeId)
+                } else {
+                    retained.put(item)
+                }
+            }
+            if (deletedIds.isEmpty()) return@synchronized emptySet()
+
+            val tombstones = loadDeletedTombstonesLocked()
+            val updatedTombstones = JSONArray()
+            for (index in 0 until tombstones.length()) {
+                val entry = tombstones.optJSONObject(index) ?: continue
+                val sameConversation = entry.optString("peer") == peer &&
+                    entry.optString("localRecipient") == localRecipient
+                // Replace old copies of these IDs with one current tombstone below.
+                if (!sameConversation || entry.optString("id") !in deletedIds) {
+                    updatedTombstones.put(entry)
+                }
+            }
+            val now = System.currentTimeMillis()
+            deletedIds.forEach { id ->
+                updatedTombstones.put(
+                    JSONObject().apply {
+                        put("id", id)
+                        put("peer", peer)
+                        put("localRecipient", localRecipient)
+                        put("deletedAt", now)
+                    }
+                )
+            }
+            while (updatedTombstones.length() > MAX_DELETED_MESSAGE_TOMBSTONES) {
+                updatedTombstones.remove(0)
+            }
+            preferences().edit()
+                .putString(ITEMS_KEY, retained.toString())
+                .putString(DELETED_MESSAGE_TOMBSTONES_KEY, updatedTombstones.toString())
+                .apply()
+            deletedIds
+        }
+        // A queued fallback can otherwise arrive later and re-create this locally deleted row.
+        ids.forEach { id ->
+            cancelledOutgoingIds.add(id)
+            queuedOutgoingIds.remove(id)
+            queuedMediaOutgoingIds.remove(id)
+            removePendingOutboxItem(id)
+        }
+        return ids
+    }
+
+    /** True if this event was deleted locally, even if a vendor Core supplies it again. */
+    fun isMessageDeletedLocally(chatRoom: ChatRoom, message: ChatMessage): Boolean {
+        val peer = normalize(chatRoom.peerAddress.username) ?: chatRoom.peerAddress.asStringUriOnly()
+        val localRecipient = normalize(chatRoom.localAddress.username) ?: chatRoom.localAddress.asStringUriOnly()
+        val ids = messageIdentifiers(message)
+        if (ids.isEmpty()) return false
+        return synchronized(lock) { isLocallyDeletedLocked(peer, localRecipient, ids) }
+    }
+
+    fun messageIdentifiers(message: ChatMessage): Set<String> = buildSet {
+        CustomImdn.id(message)?.takeIf { it.isNotBlank() }?.let(::add)
+        message.getCustomHeader("X-Diya-Message-ID")?.trim()?.takeIf { it.isNotBlank() }?.let(::add)
+        message.messageId.trim().takeIf { it.isNotBlank() }?.let(::add)
+    }
+
+    private fun loadDeletedTombstonesLocked(): JSONArray = try {
+        val raw = preferences().getString(DELETED_MESSAGE_TOMBSTONES_KEY, null)
+        if (raw.isNullOrBlank()) JSONArray() else JSONArray(raw)
+    } catch (_: Exception) {
+        JSONArray()
+    }
+
+    private fun isLocallyDeletedLocked(
+        peer: String,
+        localRecipient: String,
+        ids: Set<String>
+    ): Boolean {
+        if (ids.isEmpty()) return false
+        val tombstones = loadDeletedTombstonesLocked()
+        for (index in 0 until tombstones.length()) {
+            val entry = tombstones.optJSONObject(index) ?: continue
+            if (
+                entry.optString("peer") == peer &&
+                entry.optString("localRecipient") == localRecipient &&
+                entry.optString("id") in ids
+            ) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Creates transient display-only messages; they are never re-injected into the Core. */
+    fun localFallbackMessages(chatRoom: ChatRoom, nativeMessageIds: Set<String> = emptySet()): List<ChatMessage> =
+        localFallbackItems(chatRoom, nativeMessageIds).mapNotNull { item ->
+            runCatching {
+                val body = item.text.takeIf { it.isNotBlank() }
+                    ?: item.mediaJson?.takeUnless { item.isOutgoing }
+                val message = if (body != null) chatRoom.createMessageFromUtf8(body) else chatRoom.createEmptyMessage()
+                message.setToBeStored(false)
+                message.addCustomHeader("X-Diya-Message-ID", item.id)
+                message.addCustomHeader(CustomImdn.ORIGINAL_TIMESTAMP_HEADER, item.timestampMillis.toString())
+                if (item.isOutgoing) {
+                    CustomImdn.restoreOutgoingReceiptState(message, item.deliveryStatus)
+                    // These display-only messages never pass through the SDK's file-transfer
+                    // pipeline. Keep attachment data on the local wrapper for the UI to render.
+                    message.userData = OutgoingHistoryMedia(readOutgoingHistoryMedia(item))
+                } else {
+                    message.addCustomHeader(CustomImdn.QUEUE_DELIVERY_HEADER, "1")
+                    item.mediaJson?.let { message.addCustomHeader(QUEUE_MEDIA_HEADER, it) }
+                }
+                item.replyToId?.let { message.addCustomHeader(com.naminfo.ui.main.chat.DIYA_REPLY_MESSAGE_ID_HEADER, it) }
+                item.replyPreview?.let { message.addCustomHeader(com.naminfo.ui.main.chat.DIYA_REPLY_PREVIEW_HEADER, it) }
+                if (item.isForward) message.addCustomHeader(com.naminfo.ui.main.chat.DIYA_FORWARDED_HEADER, "1")
+                message
+            }.onFailure { error ->
+                Log.w("$TAG Couldn't create local fallback row [${item.id}]: ${error.message}")
+            }.getOrNull()
+        }
+
+    /**
+     * Some Android 14 vendor builds deliver an outgoing Basic SIP MESSAGE but later omit its
+     * event or its file contents from local Core history. Keep an account-scoped snapshot
+     * before SIP send so display can recover either the whole message or just the attachment.
+     */
+    fun retainOutgoingForLocalHistory(message: ChatMessage) {
+        val id = CustomImdn.id(message) ?: return
+        val localAccount = normalize(message.chatRoom.localAddress.username) ?: return
+        val peer = normalize(message.peerAddress.username) ?: return
+        val text = message.contents.firstOrNull {
+            it.isText && !it.isFile && !LinphoneUtils.isFileTransferMetadata(it.utf8Text.orEmpty())
+        }?.utf8Text.orEmpty().trim().ifBlank {
+            message.utf8Text.orEmpty().trim().takeUnless(LinphoneUtils::isFileTransferMetadata).orEmpty()
+        }
+        val media = JSONArray()
+        message.contents.filter { it.isFile || it.isFileTransfer || it.isVoiceRecording }.forEach { content ->
+            val path = content.filePath.orEmpty()
+            val name = content.name.orEmpty()
+            if (path.isBlank() && name.isBlank()) return@forEach
+            var mimeType = "${content.type.orEmpty()}/${content.subtype.orEmpty()}".trimEnd('/')
+            val isVoice = content.isVoiceRecording || name.startsWith("voice-recording-", ignoreCase = true)
+            if (isVoice && !mimeType.contains("voice-recording", ignoreCase = true)) {
+                mimeType = "$mimeType;voice-recording=yes"
+            }
+            media.put(
+                JSONObject().apply {
+                put("name", name.ifBlank { "Attachment" })
+                put("mimeType", mimeType.ifBlank { "application/octet-stream" })
+                put("localPath", path)
+                put("size", content.fileSize)
+            }
+            )
+        }
+        if (text.isBlank() && media.length() == 0) return
+
+        val timestamp = CustomImdn.timestampMillis(message)
+        synchronized(lock) {
+            val stored = readStoredItems()
+            for (index in 0 until stored.length()) {
+                if (stored.optJSONObject(index)?.optString("id") == id) return
+            }
+            stored.put(
+                JSONObject().apply {
+                put("id", id)
+                // Local fallback matching uses sender as the peer for both directions.
+                put("sender", peer)
+                put("recipient", localAccount)
+                put("localRecipient", localAccount)
+                put("text", text)
+                put("media", media)
+                put("sentAt", timestamp)
+                put("receivedAt", timestamp)
+                put("localRead", true)
+                put("localOutgoing", true)
+            }
+            )
+            while (stored.length() > MAX_STORED_ITEMS) stored.remove(0)
+            preferences().edit().putString(ITEMS_KEY, stored.toString()).apply()
+        }
+        Log.i("$TAG Retained outgoing fallback [$id] for $localAccount -> $peer")
+    }
+
+    /** Stores send completion and recipient receipts in order of progression. */
+    fun updateLocalOutgoingStatus(
+        messageId: String,
+        local: String?,
+        recipient: String?,
+        status: String,
+        nativeMessageId: String? = null
+    ): Boolean {
+        val localNumber = normalize(local) ?: return false
+        val peer = normalize(recipient) ?: return false
+        val nextRank = outgoingStatusRank(status)
+        if (nextRank == 0) return false
+        val key = OutgoingHistoryKey(localNumber, peer, messageId)
+        return synchronized(lock) {
+            val stored = readStoredItems()
+            for (index in 0 until stored.length()) {
+                val item = stored.optJSONObject(index) ?: continue
+                if (outgoingHistoryKey(item) != key) continue
+                val statusChanged = outgoingStatusRank(item.optString("deliveryStatus")) < nextRank
+                val nativeIdChanged = !nativeMessageId.isNullOrBlank() && item.optString("nativeMessageId") != nativeMessageId
+                if (statusChanged) item.put("deliveryStatus", status)
+                if (nativeIdChanged) item.put("nativeMessageId", nativeMessageId)
+                if (statusChanged || nativeIdChanged) preferences().edit().putString(ITEMS_KEY, stored.toString()).apply()
+                return@synchronized statusChanged
+            }
+            false
+        }
+    }
+
+    private fun outgoingStatusRank(status: String): Int = when (status) {
+        "sent" -> 1
+        "delivered" -> 2
+        "displayed" -> 3
+        else -> 0
+    }
+
+    private fun outgoingHistoryKey(item: JSONObject): OutgoingHistoryKey? {
+        if (!item.optBoolean("localOutgoing", false)) return null
+        val local = normalize(item.optString("localRecipient")) ?: normalize(item.optString("recipient")) ?: return null
+        val peer = normalize(item.optString("sender")) ?: return null
+        return OutgoingHistoryKey(local, peer, item.optString("id"))
+    }
+
+    private fun findOutgoingHistory(message: ChatMessage): JSONObject? {
+        val id = CustomImdn.id(message) ?: message.messageId.takeIf { it.isNotBlank() } ?: return null
+        val prefs = safePreferences() ?: return null
+        val local = normalize(message.chatRoom.localAddress.username) ?: return null
+        val peer = normalize(message.chatRoom.peerAddress.username) ?: return null
+        return synchronized(lock) {
+            val raw = prefs.getString(ITEMS_KEY, null) ?: return@synchronized null
+            if (indexedHistoryJson != raw) {
+                val stored = runCatching { JSONArray(raw) }.getOrElse { JSONArray() }
+                outgoingHistoryIndex = buildMap {
+                    for (index in 0 until stored.length()) {
+                        val item = stored.optJSONObject(index) ?: continue
+                        val key = outgoingHistoryKey(item) ?: continue
+                        put(key, item)
+                        item.optString("nativeMessageId").takeIf { it.isNotBlank() }?.let {
+                            put(key.copy(id = it), item)
+                        }
+                    }
+                }
+                indexedHistoryJson = raw
+            }
+            outgoingHistoryIndex[OutgoingHistoryKey(local, peer, id)]
+        }
+    }
+
+    fun outgoingHistoryStatus(message: ChatMessage): String? =
+        findOutgoingHistory(message)?.optString("deliveryStatus")
+
+    fun outgoingHistoryId(message: ChatMessage): String? =
+        findOutgoingHistory(message)?.optString("id")?.takeIf { it.isNotBlank() }
+
+    fun outgoingHistoryMedia(message: ChatMessage): List<QueuedMedia> {
+        (message.userData as? OutgoingHistoryMedia)?.let { return it.attachments }
+        val saved = findOutgoingHistory(message) ?: return emptyList()
+        return readOutgoingHistoryMedia(saved.optString("id"), saved.optJSONArray("media"))
+    }
+
+    private fun readOutgoingHistoryMedia(item: LocalFallbackItem): List<QueuedMedia> {
+        return readOutgoingHistoryMedia(item.id, item.mediaJson?.let(::JSONArray))
+    }
+
+    private fun readOutgoingHistoryMedia(id: String, media: JSONArray?): List<QueuedMedia> {
+        if (media == null) return emptyList()
+        return (0 until media.length()).mapNotNull { index ->
+            val attachment = media.optJSONObject(index) ?: return@mapNotNull null
+            val localPath = attachment.optString("localPath").takeIf { it.isNotBlank() && File(it).isFile }
+            QueuedMedia(
+                messageId = id,
+                index = index,
+                name = attachment.optString("name", "Attachment"),
+                url = "",
+                mimeType = attachment.optString("mimeType", "application/octet-stream"),
+                size = attachment.optLong("size", 0L).takeIf { it > 0L }
+                    ?: localPath?.let { File(it).length() } ?: 0L,
+                localPath = localPath
+            )
+        }
+    }
+
+    /** Recovered Basic rooms that must supplement the vendor Core's chat-room snapshot. */
+    fun restoredLocalFallbackRooms(): List<ChatRoom> = localFallbackRooms.values.toList()
+
+    /** Marks locally retained queue rows as read once their 1:1 conversation becomes visible. */
+    fun markLocalFallbackItemsRead(chatRoom: ChatRoom) {
+        val peer = normalize(chatRoom.peerAddress.username) ?: return
+        val localRecipient = normalize(chatRoom.localAddress.username)
+        val newlyReadIds = synchronized(lock) {
+            val items = readStoredItems()
+            val ids = mutableListOf<String>()
+            for (index in 0 until items.length()) {
+                val item = items.optJSONObject(index) ?: continue
+                val storedRecipient = normalize(item.optString("localRecipient"))
+                    ?: normalize(item.optString("recipient"))
+                if (
+                    !item.optBoolean("localOutgoing", false) &&
+                    normalize(item.optString("sender")) == peer &&
+                    storedRecipient == localRecipient &&
+                    !item.optBoolean("localRead", false)
+                ) {
+                    item.put("localRead", true)
+                    item.optString("id").takeIf { it.isNotBlank() }?.let(ids::add)
+                }
+            }
+            if (ids.isNotEmpty()) preferences().edit().putString(ITEMS_KEY, items.toString()).apply()
+            ids
+        }
+        // Local fallback rows don't have a writable Core history event, so room.markAsRead()
+        // cannot make them emit an IMDN displayed receipt. Send the authenticated queue read
+        // acknowledgement explicitly; A receives OFFLINE_QUEUE_READ and becomes double tick.
+        if (newlyReadIds.isNotEmpty()) {
+            notifyRead(peer, localRecipient, newlyReadIds)
+            refreshNotificationSummary()
+        }
+    }
+
+    /**
+     * Recreates Basic rooms for local-only queue rows after process death.  When a vendor Core
+     * rejected receiveChatMessage() there is no native event, and therefore no room for the
+     * conversations list to bind to on the next app launch.  The rows themselves stay in our
+     * durable store and are rendered only if Core still has no event with the same stable id.
+     */
+    private fun restoreLocalFallbackRooms() {
+        coreContext.postOnCoreThread { core ->
+            val accountNumber = normalize(core.defaultAccount?.params?.identityAddress?.username) ?: return@postOnCoreThread
+            val senders = synchronized(lock) {
+                buildSet {
+                    val items = readStoredItems()
+                    for (index in 0 until items.length()) {
+                        val item = items.optJSONObject(index) ?: continue
+                        val storedRecipient = normalize(item.optString("localRecipient"))
+                            ?: normalize(item.optString("recipient"))
+                        if (storedRecipient == accountNumber) {
+                            normalize(item.optString("sender"))?.let(::add)
+                        }
+                    }
+                }
+            }
+            senders.forEach { sender ->
+                if (findOrCreateBasicRoomForSender(sender)?.also { room ->
+                        localFallbackRooms[fallbackRoomKey(accountNumber, sender)] = room
+                    } != null
+                ) {
+                    Log.i("$TAG Restored local queue room for [$sender]")
+                }
+            }
+        }
+    }
+
+    /**
+     * Firebase Functions is the durable offline authority for every chat payload: text, image, video and
      * files. Text can be queued immediately. A media item is queued only when its HFT URL is
      * available, so B never restores a caption without its attachment metadata.
      */
@@ -193,16 +673,21 @@ object OfflineInboxRepository {
     }
 
     /** Queues a completed HFT upload even when SIP immediately reports `Delivered`. */
-    fun enqueueUploadedMedia(message: ChatMessage) {
-        enqueueOutgoing(message, requireMedia = true)
+    fun enqueueUploadedMedia(message: ChatMessage, uploadedMedia: JSONObject? = null) {
+        enqueueOutgoing(message, requireMedia = true, uploadedMedia = uploadedMedia)
     }
 
-    private fun enqueueOutgoing(message: ChatMessage, requireMedia: Boolean) {
+    private fun enqueueOutgoing(
+        message: ChatMessage,
+        requireMedia: Boolean,
+        uploadedMedia: JSONObject? = null
+    ) {
         val id = CustomImdn.id(message)
         if (id == null) {
             Log.w("$TAG Completed outgoing message has no stable ID; it cannot be queued")
             return
         }
+        if (id in cancelledOutgoingIds || isMessageDeletedLocally(message.chatRoom, message)) return
         Log.i("$TAG Evaluating completed outgoing message [$id] for durable queue")
         val sender = normalize(coreContext.core.defaultAccount?.params?.identityAddress?.username) ?: return
         val recipient = normalize(message.peerAddress.username) ?: return
@@ -245,7 +730,17 @@ object OfflineInboxRepository {
         } else {
             baseText
         }
-        val media = extractHftMedia(message)
+        val media = uploadedMedia?.let { metadata ->
+            JSONArray().apply {
+                val copy = JSONObject(metadata.toString())
+                val isVoice = message.contents.any { it.isVoiceRecording } ||
+                    copy.optString("name").startsWith("voice-recording-", ignoreCase = true)
+                if (isVoice && !copy.optString("mimeType").contains("voice-recording", ignoreCase = true)) {
+                    copy.put("mimeType", "${copy.optString("mimeType", "audio/wav")};voice-recording=yes")
+                }
+                put(copy)
+            }
+        } ?: extractHftMedia(message)
         val hasMedia = media.length() > 0
         if ((requireMedia && !hasMedia) || (baseText.isBlank() && !hasMedia)) {
             Log.w("$TAG No reusable HFT URL was found for completed message [$id]; it won't be queued")
@@ -461,7 +956,7 @@ object OfflineInboxRepository {
             val items = JSONObject(response).optJSONArray("items") ?: return
             if (items.length() == 0) return
 
-            // Vercel is the single durable offline store for text and media. Validate all queue
+            // Firebase is the single durable offline store for text and media. Validate all queue
             // entries and materialize them by sender time before entering the Core thread. Media
             // bytes remain on HFT until the recipient explicitly taps its attachment.
             val prepared = buildList {
@@ -474,29 +969,51 @@ object OfflineInboxRepository {
             }.sortedWith(compareBy<JSONObject>({ itemTimestampMillis(it) }, { it.optString("id") }))
             if (prepared.isEmpty()) return
 
-            coreContext.postOnCoreThread {
-                val delivered = prepared.filter(::injectIncomingMessage)
-                if (delivered.isEmpty()) return@postOnCoreThread
-
-                // Record only after it has been inserted into the local chat history. If the
-                // process dies before this point, the id remains on Vercel and is retried.
-                val deliveredJson = JSONArray(delivered)
-                val newIds = persistNewItems(deliveredJson)
-                if (newIds.isNotEmpty()) {
-                    val newItems = delivered.filter { it.optString("id") in newIds }
-                    showNotification(newItems)
-                }
-
-                // A prior pull may have stored an item locally but failed before its ACK
-                // reached Vercel. In that case it is not new on the next pull, yet it must
-                // still be acknowledged or it will be delivered again after every login.
-                val acknowledgedIds = delivered.mapNotNull { item ->
-                    item.optString("id").takeIf { it.matches(Regex("[A-Za-z0-9._-]{8,200}")) }
-                }.distinct()
-                if (acknowledgedIds.isNotEmpty()) {
-                    Thread { acknowledge(phoneNumber, fcmToken, acknowledgedIds) }.start()
-                }
+            // When both handsets are online, FreeSWITCH's native SIP MESSAGE and the Firebase
+            // queue push race one another. Previously the push won on Vivo Android 14, claimed
+            // the message ID, and then receiveChatMessage() failed to create a SQLite event;
+            // CustomImdn consequently discarded the later, valid SIP message as a duplicate.
+            // Delay materialization just long enough for normal SIP delivery to land. The
+            // existing native-history check in injectIncomingMessage() then ACKs the queue item
+            // without creating a duplicate local event.
+            val toMaterialize = prepared.filter { item ->
+                pendingIncomingMaterializationIds.add(item.optString("id"))
             }
+            if (toMaterialize.isEmpty()) return
+
+            coreContext.postOnCoreThreadDelayed(
+                {
+                    try {
+                        val activeRecipient =
+                            normalize(coreContext.core.defaultAccount?.params?.identityAddress?.username)
+                        // A pull that completes after sign-out belongs to its original recipient.
+                        // Leave the items on the server for that account's next login.
+                        if (activeRecipient != phoneNumber) return@postOnCoreThreadDelayed
+                        // Store before receiveChatMessage(). On Vivo, the Core callback can run
+                        // even when SQLite rejects the synthetic event; the UI then has a durable
+                        // fallback available during that very callback.
+                        val newIds = persistNewItems(JSONArray(toMaterialize), phoneNumber)
+                        val delivered = toMaterialize.filter(::injectIncomingMessage)
+                        if (delivered.isNotEmpty()) {
+                            if (newIds.isNotEmpty()) {
+                                val newItems = toMaterialize.filter { it.optString("id") in newIds }
+                                showNotification()
+                            }
+
+                            // Only ACK entries that were either persisted locally or matched an
+                            // already persisted native SIP message. ACKing a failed injection
+                            // would otherwise make a real offline message disappear permanently.
+                            val acknowledgedIds = delivered.map { it.optString("id") }.distinct()
+                            Thread { acknowledge(phoneNumber, fcmToken, acknowledgedIds) }.start()
+                        }
+                    } finally {
+                        toMaterialize.forEach { item ->
+                            pendingIncomingMaterializationIds.remove(item.optString("id"))
+                        }
+                    }
+                },
+                SIP_DELIVERY_GRACE_PERIOD_MS
+            )
         } catch (exception: Exception) {
             Log.w("$TAG Queue pull failed: ${exception.message}")
         } finally {
@@ -504,7 +1021,7 @@ object OfflineInboxRepository {
         }
     }
 
-    private fun persistNewItems(items: JSONArray): List<String> = synchronized(lock) {
+    private fun persistNewItems(items: JSONArray, localRecipient: String): List<String> = synchronized(lock) {
         val stored = readStoredItems()
         val existingIds = buildSet {
             for (index in 0 until stored.length()) add(stored.optJSONObject(index)?.optString("id").orEmpty())
@@ -514,7 +1031,11 @@ object OfflineInboxRepository {
             val item = items.optJSONObject(index) ?: continue
             val id = item.optString("id")
             if (!id.matches(Regex("[A-Za-z0-9._-]{8,200}")) || id in existingIds) continue
+            val sender = normalize(item.optString("sender")) ?: continue
+            if (isLocallyDeletedLocked(sender, localRecipient, setOf(id))) continue
             item.put("receivedAt", System.currentTimeMillis())
+            item.put("localRead", false)
+            item.put("localRecipient", localRecipient)
             stored.put(item)
             accepted += id
         }
@@ -540,7 +1061,7 @@ object OfflineInboxRepository {
         return item
     }
 
-    /** Returns queue attachment metadata stored with a locally injected incoming message. */
+    /** Returns attachment metadata for locally restored chat messages. */
     fun queuedMedia(message: ChatMessage): List<QueuedMedia> {
         val stableId = CustomImdn.id(message)
         val sipMessageId = message.messageId?.takeIf { it.isNotBlank() }
@@ -552,7 +1073,11 @@ object OfflineInboxRepository {
                     it.startsWith("[") &&
                     com.naminfo.utils.LinphoneUtils.isFileTransferMetadata(it)
             }
-            ?: return emptyList()
+            ?: return if (!CustomImdn.isSemanticallyIncoming(message)) {
+                outgoingHistoryMedia(message)
+            } else {
+                emptyList()
+            }
         val id = stableId ?: sipMessageId ?: return emptyList()
         val configuredHost = configuredHftHost()
         return try {
@@ -590,6 +1115,10 @@ object OfflineInboxRepository {
 
     /** Downloads an offline queue attachment asynchronously, coalescing concurrent callers for the same item. */
     fun downloadQueuedMedia(media: QueuedMedia, onResult: (String?) -> Unit) {
+        if (media.url.isBlank()) {
+            onResult(media.localPath)
+            return
+        }
         val existing = downloadedMediaPath(media.messageId, media.index)
         if (existing != null) {
             onResult(existing)
@@ -697,7 +1226,11 @@ object OfflineInboxRepository {
         }
         val existing = matchingRooms.firstOrNull { it.account == defaultAccount }
             ?: matchingRooms.firstOrNull()
-        if (existing != null) return existing
+        if (existing != null) {
+            return existing.also { room ->
+                defaultLocal?.let { localFallbackRooms[fallbackRoomKey(it, sender)] = room }
+            }
+        }
 
         val domain = defaultAccount.params.identityAddress?.domain
             ?: defaultAccount.params.serverAddress?.domain
@@ -715,14 +1248,22 @@ object OfflineInboxRepository {
             }
         }
         val localAddress = defaultAccount.params.identityAddress
-        return LinphoneUtils.findExistingOneToOneChatRoom(core, params, localAddress, canonicalPeer)
+        return (
+            LinphoneUtils.findExistingOneToOneChatRoom(core, params, localAddress, canonicalPeer)
             ?: core.createChatRoom(params, arrayOf(canonicalPeer))
+        )?.also { room ->
+            defaultLocal?.let { localFallbackRooms[fallbackRoomKey(it, sender)] = room }
+        }
     }
+
+    private fun fallbackRoomKey(localNumber: String, sender: String): String = "$localNumber:$sender"
 
     /** Must run on the Linphone Core thread. Creates a durable, incoming local chat event. */
     private fun injectIncomingMessage(item: JSONObject): Boolean {
         val id = item.optString("id")
         val sender = normalize(item.optString("sender")) ?: return false
+        val local = normalize(coreContext.core.defaultAccount?.params?.identityAddress?.username) ?: return false
+        if (synchronized(lock) { isLocallyDeletedLocked(sender, local, setOf(id)) }) return true
         val room = findOrCreateBasicRoomForSender(sender)
         if (room == null) {
             Log.w("$TAG No local chat room for queued sender [$sender], keeping [$id] for retry")
@@ -763,17 +1304,6 @@ object OfflineInboxRepository {
             return true
         }
         return try {
-            val message = room.createEmptyMessage()
-            message.setToBeStored(true)
-            message.addCustomHeader("X-Diya-Message-ID", id)
-            message.addCustomHeader(CustomImdn.QUEUE_DELIVERY_HEADER, "1")
-            val originalTimestamp = itemTimestampMillis(item)
-            if (originalTimestamp > 0L) {
-                message.addCustomHeader(
-                    CustomImdn.ORIGINAL_TIMESTAMP_HEADER,
-                    originalTimestamp.toString()
-                )
-            }
             val rawText = item.optString("text").orEmpty()
             val decodedForwardText = com.naminfo.ui.main.chat.decodeForwardEnvelope(rawText)
             val replyToId = item.optString("replyToId").takeIf { it.isNotBlank() }
@@ -782,18 +1312,31 @@ object OfflineInboxRepository {
                 item.optBoolean("isForwarded", false) ||
                 decodedForwardText != null
             val itemText = (decodedForwardText ?: rawText).takeIf { it.isNotBlank() }
-            if (itemText != null) {
-                message.addUtf8TextContent(
-                    if (isForward && replyToId == null) {
-                        com.naminfo.ui.main.chat.encodeForwardEnvelope(itemText)
-                    } else {
-                        itemText
-                    }
+            val storedText = itemText?.let { text ->
+                if (isForward && replyToId == null) {
+                    com.naminfo.ui.main.chat.encodeForwardEnvelope(text)
+                } else {
+                    text
+                }
+            } ?: mediaJson
+            // createEmptyMessage() followed by addUtf8TextContent() produces an event that
+            // Vivo's Android 14 Core accepts in memory but rejects in SQLite. Construct text
+            // payloads with the native text-message factory instead; receiveChatMessage() can
+            // then persist and expose them exactly like a real incoming SIP MESSAGE.
+            val message = if (storedText != null) {
+                room.createMessageFromUtf8(storedText)
+            } else {
+                room.createEmptyMessage()
+            }
+            message.setToBeStored(true)
+            message.addCustomHeader("X-Diya-Message-ID", id)
+            message.addCustomHeader(CustomImdn.QUEUE_DELIVERY_HEADER, "1")
+            val originalTimestamp = itemTimestampMillis(item).takeIf { it > 0L } ?: System.currentTimeMillis()
+            if (originalTimestamp > 0L) {
+                message.addCustomHeader(
+                    CustomImdn.ORIGINAL_TIMESTAMP_HEADER,
+                    originalTimestamp.toString()
                 )
-            } else if (mediaJson != null) {
-                // Liblinphone's Basic SQLite history marks zero-content injected messages as
-                // NotDelivered (`Unsupported content-type: /`) and drops them after restart.
-                message.addUtf8TextContent(mediaJson)
             }
             if (mediaJson != null) message.addCustomHeader(QUEUE_MEDIA_HEADER, mediaJson)
             if (replyToId != null) {
@@ -841,6 +1384,31 @@ object OfflineInboxRepository {
         if (status !in 200..299) Log.w("$TAG Queue acknowledgement failed with HTTP $status")
     }
 
+    fun notifyRead(sender: String?, recipient: String?, ids: List<String>) {
+        val cleanSender = normalize(sender) ?: return
+        val cleanRecipient = normalize(recipient) ?: return
+        val cleanIds = ids.mapNotNull { it.trim().takeIf(String::isNotBlank) }.distinct()
+        if (cleanIds.isEmpty()) return
+
+        val token = resolveCachedFcmToken() ?: return
+        Thread {
+            val status = postJson(
+                JSONObject().apply {
+                    put("action", "read")
+                    put("sender", cleanSender)
+                    put("recipient", cleanRecipient)
+                    put("fcmToken", token)
+                    put("ids", JSONArray(cleanIds))
+                }
+            )
+            if (status in 200..299) {
+                Log.i("$TAG Notified read for [${cleanIds.size}] message(s) to $cleanSender")
+            } else {
+                Log.w("$TAG Failed to notify read (HTTP $status)")
+            }
+        }.start()
+    }
+
     private fun requestReplay(phoneNumber: String, fcmToken: String, ids: List<String>) {
         val status = postJson(
             JSONObject().apply {
@@ -860,7 +1428,7 @@ object OfflineInboxRepository {
         NotificationManagerCompat.from(coreContext.context).cancel(NOTIFICATION_ID)
     }
 
-    /** Called on A after Vercel confirms B is online and asks for a native SIP replay. */
+    /** Called on A after Firebase confirms B is online and asks for a native SIP replay. */
     fun replayQueuedOutgoing(messageId: String?, recipient: String?) {
         val id = messageId.orEmpty()
         val expectedRecipient = normalize(recipient)
@@ -968,11 +1536,21 @@ object OfflineInboxRepository {
         }
         return uri.host.equals(configuredHost, ignoreCase = true) ||
             uri.host.equals("203.95.216.68", ignoreCase = true) ||
+            uri.host.equals("mobionglobal.info", ignoreCase = true) ||
             uri.host.equals("mobionglobal.com", ignoreCase = true)
     }
 
-    private fun showNotification(newItems: List<JSONObject>) {
-        if (newItems.isEmpty()) return
+    /**
+     * Keep one summary notification for all unread durable queue rows. A queue push can be
+     * delivered once per message, so using only the current HTTP batch made the shade always
+     * say "1 message received" even when several messages were waiting.
+     */
+    private fun showNotification() {
+        val count = unreadStoredItemsCount()
+        if (count == 0) {
+            NotificationManagerCompat.from(coreContext.context).cancel(NOTIFICATION_ID)
+            return
+        }
         val context = coreContext.context
         val intent = Intent(context, OfflineInboxActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
@@ -984,8 +1562,7 @@ object OfflineInboxRepository {
         // This can arrive while the user is online as well: the durable queue mirrors SIP
         // delivery for reliability. Keep the notification neutral instead of calling it
         // "offline" and do not leak sender numbers or HFT metadata on the lock screen.
-        val count = newItems.size
-        val summary = "$count message${if (count == 1) "" else "s"} received"
+        val summary = "$count ${context.getString(R.string.app_name)} message${if (count == 1) "" else "s"} received"
         val notification = NotificationCompat.Builder(context, context.getString(R.string.notification_channel_chat_id))
             .setSmallIcon(R.drawable.chat_teardrop_text)
             .setContentTitle(context.getString(R.string.app_name))
@@ -1003,6 +1580,77 @@ object OfflineInboxRepository {
             Log.w("$TAG Notification permission isn't granted")
         }
     }
+
+    private fun refreshNotificationSummary() {
+        try {
+            showNotification()
+        } catch (exception: Exception) {
+            Log.w("$TAG Couldn't refresh chat notification summary: ${exception.message}")
+        }
+    }
+
+    /**
+     * Counts durable incoming rows that native Core history did not already count.  Some
+     * Android 14 Basic-SIP implementations report a queue-injected event as read immediately;
+     * its durable row remains the source of truth until the user opens the conversation.
+     */
+    fun unreadStoredItemsCountForRecipient(
+        recipient: String?,
+        alreadyCountedIds: Set<String> = emptySet()
+    ): Int = synchronized(lock) {
+        val currentRecipient = normalize(recipient) ?: return@synchronized 0
+        val items = readStoredItems()
+        var unread = 0
+        val seen = alreadyCountedIds.toMutableSet()
+        for (index in 0 until items.length()) {
+            val item = items.optJSONObject(index) ?: continue
+            val storedRecipient = normalize(item.optString("localRecipient"))
+                ?: normalize(item.optString("recipient"))
+            if (
+                storedRecipient == currentRecipient &&
+                !item.optBoolean("localOutgoing", false) &&
+                !item.optBoolean("localRead", false) &&
+                item.optString("id").isNotBlank() &&
+                seen.add(item.optString("id"))
+            ) {
+                unread++
+            }
+        }
+        unread
+    }
+
+    fun unreadStoredItemsCountForRoom(
+        chatRoom: ChatRoom,
+        alreadyCountedIds: Set<String> = emptySet()
+    ): Int = synchronized(lock) {
+        val peer = normalize(chatRoom.peerAddress.username) ?: return@synchronized 0
+        val localRecipient = normalize(chatRoom.localAddress.username) ?: return@synchronized 0
+        val items = readStoredItems()
+        var unread = 0
+        val seen = alreadyCountedIds.toMutableSet()
+        for (index in 0 until items.length()) {
+            val item = items.optJSONObject(index) ?: continue
+            val storedRecipient = normalize(item.optString("localRecipient"))
+                ?: normalize(item.optString("recipient"))
+            val id = item.optString("id")
+            if (
+                normalize(item.optString("sender")) == peer &&
+                storedRecipient == localRecipient &&
+                !item.optBoolean("localOutgoing", false) &&
+                !item.optBoolean("localRead", false) &&
+                id.isNotBlank() &&
+                seen.add(id)
+            ) {
+                unread++
+            }
+        }
+        unread
+    }
+
+    private fun unreadStoredItemsCount(): Int =
+        unreadStoredItemsCountForRecipient(
+            coreContext.core.defaultAccount?.params?.identityAddress?.username
+        )
 
     private fun readStoredItems(): JSONArray = try {
         JSONArray(preferences().getString(ITEMS_KEY, "[]"))

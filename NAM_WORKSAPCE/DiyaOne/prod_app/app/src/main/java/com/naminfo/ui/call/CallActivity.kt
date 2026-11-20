@@ -31,6 +31,7 @@ import androidx.window.layout.WindowLayoutInfo
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
 import kotlin.math.max
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
@@ -61,6 +62,8 @@ import com.naminfo.utils.AppUtils
 class CallActivity : GenericActivity() {
     companion object {
         private const val TAG = "[Call Activity]"
+        const val EXTRA_PENDING_WAKE_CALL_ID = "pending_wake_call_id"
+        const val EXTRA_PENDING_CALLEE_DISPLAY_NAME = "pending_callee_display_name"
     }
 
     private lateinit var binding: CallActivityBinding
@@ -74,6 +77,7 @@ class CallActivity : GenericActivity() {
     private var isPipSupported = false
 
     private var keepActivityAliveEvenIfNoCall = false
+    private var pendingWakeCallId: String? = null
 
     private val requestCameraPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -133,6 +137,9 @@ class CallActivity : GenericActivity() {
         enableEdgeToEdge(style, style)
         super.onCreate(savedInstanceState)
 
+        pendingWakeCallId = intent.getStringExtra(EXTRA_PENDING_WAKE_CALL_ID)
+        keepActivityAliveEvenIfNoCall = !pendingWakeCallId.isNullOrBlank()
+
         binding = DataBindingUtil.setContentView(this, R.layout.call_activity)
         binding.lifecycleOwner = this
         setUpToastsArea(binding.toastsArea)
@@ -175,6 +182,12 @@ class CallActivity : GenericActivity() {
             ViewModelProvider(this)[CurrentCallViewModel::class.java]
         }
         binding.callViewModel = callViewModel
+
+        if (keepActivityAliveEvenIfNoCall) {
+            callViewModel.showPendingOutgoingCall(
+                intent.getStringExtra(EXTRA_PENDING_CALLEE_DISPLAY_NAME).orEmpty()
+            )
+        }
 
         callsViewModel = run {
             ViewModelProvider(this)[CallsViewModel::class.java]
@@ -302,8 +315,28 @@ class CallActivity : GenericActivity() {
 
         callsViewModel.showOutgoingCallEvent.observe(this) {
             it.consume {
+                pendingWakeCallId = null
+                keepActivityAliveEvenIfNoCall = false
+                callViewModel.clearPendingOutgoingCall()
                 val action = OutgoingCallFragmentDirections.actionGlobalOutgoingCallFragment()
                 findNavController(R.id.call_nav_container).navigate(action)
+            }
+        }
+
+        coreContext.calleeWakeUnavailableEvent.observe(this) { event ->
+            event.consume { failedCallId ->
+                if (failedCallId != pendingWakeCallId) return@consume
+
+                pendingWakeCallId = null
+                keepActivityAliveEvenIfNoCall = false
+                showRedToast(
+                    getString(R.string.call_error_temporarily_unavailable_toast),
+                    R.drawable.warning_circle
+                )
+                lifecycleScope.launch {
+                    delay(1500)
+                    if (!isFinishing) finish()
+                }
             }
         }
 

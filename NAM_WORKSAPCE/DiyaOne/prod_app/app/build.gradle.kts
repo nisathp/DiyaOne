@@ -42,7 +42,8 @@ if (crashlyticsAvailable) {
     println("Crashlytics has been disabled because google-services.json wasn't found")
 }
 
-var gitVersion = "2.0.4"
+val appVersionName = "2.3.2"
+var gitVersion = appVersionName
 var gitBranch = ""
 try {
     val gitDescribeProcess = ProcessBuilder()
@@ -111,8 +112,8 @@ android {
         applicationId = packageName
         minSdk = 28
         targetSdk = 36
-        versionCode = 602006 // 6.02.006
-        versionName = "2.2.9"
+        versionCode = 602008 // 6.02.008
+        versionName = appVersionName
 
         manifestPlaceholders["appAuthRedirectScheme"] = packageName
 
@@ -170,7 +171,7 @@ android {
             isDebuggable = true
             isJniDebuggable = true
 
-            val appVersion = gitVersion
+            val appVersion = appVersionName
             val appBranch = gitBranch
             println("Debug flavor app version is [$appVersion], app branch is [$appBranch]")
             resValue("string", "linphone_app_version", appVersion)
@@ -208,7 +209,7 @@ android {
                 signingConfig = signingConfigs.findByName("release")
             }
 
-            val appVersion = gitVersion
+            val appVersion = appVersionName
             val appBranch = gitBranch
             println("Release flavor app version is [$appVersion], app branch is [$appBranch]")
             resValue("string", "linphone_app_version", appVersion)

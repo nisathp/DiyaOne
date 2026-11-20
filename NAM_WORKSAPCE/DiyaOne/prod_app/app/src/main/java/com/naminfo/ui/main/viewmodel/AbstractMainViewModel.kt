@@ -6,6 +6,7 @@ import androidx.lifecycle.MutableLiveData
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.core.CustomImdn
+import com.naminfo.core.OfflineInboxRepository
 import org.linphone.core.Account
 import org.linphone.core.Call
 import org.linphone.core.ChatMessage
@@ -24,6 +25,8 @@ open class AbstractMainViewModel
     constructor() : GenericViewModel() {
     companion object {
         private const val TAG = "[Abstract Main ViewModel]"
+        // onMessagesReceived can precede the native unread-history refresh.
+        private const val UNREAD_HISTORY_SETTLE_DELAY_MS = 500L
     }
 
     val title = MutableLiveData<String>()
@@ -183,6 +186,11 @@ open class AbstractMainViewModel
             moreThanOneAccount.postValue(core.accountList.size > 1)
             core.addListener(coreListener)
             configure()
+            // A fragment can be recreated after messages arrived while the app was in the
+            // background. Populate both badges from the Core instead of waiting for another
+            // callback that may never come.
+            computeUnreadMessagesCount()
+            updateMissedCallsCount()
         }
 
         searchBarVisible.value = false
@@ -280,6 +288,10 @@ open class AbstractMainViewModel
         // Core callbacks are invoked with the native Core lock held. Querying
         // ChatRoom history in that callback can deadlock against UI navigation.
         coreContext.postOnCoreThread { computeUnreadMessagesCount() }
+        coreContext.postOnCoreThreadDelayed(
+            { computeUnreadMessagesCount() },
+            UNREAD_HISTORY_SETTLE_DELAY_MS
+        )
     }
 
     @WorkerThread
@@ -302,9 +314,22 @@ open class AbstractMainViewModel
     @WorkerThread
     fun computeUnreadMessagesCount() {
         val account = LinphoneUtils.getDefaultAccount()
-        val accountRooms = coreContext.core.chatRooms
-            .filter { account == null || LinphoneUtils.getAccountForAddress(it.localAddress) == account }
-        val count = CustomImdn.visibleUnreadMessagesCount(accountRooms)
+        // With one account, localAddress can retain the old SIP identity after a domain
+        // migration. Counting every room avoids silently dropping a valid unread message.
+        // Multi-account installations still show only the selected account's messages.
+        val accountRooms = if (coreContext.core.accountList.size <= 1 || account == null) {
+            coreContext.core.chatRooms.asIterable()
+        } else {
+            coreContext.core.chatRooms.filter {
+                LinphoneUtils.getAccountForAddress(it.localAddress) == account
+            }
+        }
+        val nativeUnreadIds = CustomImdn.visibleUnreadMessageIds(accountRooms)
+        val count = CustomImdn.visibleUnreadMessagesCount(accountRooms) +
+            OfflineInboxRepository.unreadStoredItemsCountForRecipient(
+                account?.params?.identityAddress?.username,
+                nativeUnreadIds
+            )
         val moreThanOne = count > 1
         Log.i(
             "$TAG There ${if (moreThanOne) "are" else "is"} [$count] unread ${if (moreThanOne) "messages" else "message"}"

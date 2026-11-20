@@ -59,6 +59,7 @@ object OutgoingMessageRetryManager {
                     ChatMessage.State.Delivered,
                     ChatMessage.State.DeliveredToUser,
                     ChatMessage.State.Displayed -> {
+                        CustomImdn.recordLocalSendCompletion(changedMessage, state)
                         // `Delivered` only acknowledges that FreeSWITCH accepted the SIP
                         // MESSAGE. The durable item stays until CustomImdn receives B's
                         // delivery receipt (or B acknowledges the queue itself).
@@ -66,6 +67,7 @@ object OutgoingMessageRetryManager {
                     }
 
                     ChatMessage.State.FileTransferDone -> {
+                        CustomImdn.recordLocalSendCompletion(changedMessage, state)
                         // The signed URL is now ready. Delivery still waits for the
                         // SIP-receipt grace period below so online users don't see a
                         // duplicate queue copy of the same attachment.
@@ -88,6 +90,10 @@ object OutgoingMessageRetryManager {
         entry = PendingMessage(key, message, listener = listener)
         pending[key] = entry
         message.addListener(listener)
+        // Preserve a local, account-scoped rendering fallback before the send. A few Android 14
+        // vendor Core builds can successfully deliver a Basic SIP message yet drop its local
+        // event after the conversation screen is recreated.
+        OfflineInboxRepository.retainOutgoingForLocalHistory(message)
         // Store every message in Vercel before relying on the best-effort SIP transport. Text
         // queues immediately; media waits inside the repository for its HFT upload to finish.
         OfflineInboxRepository.enqueueOutgoingAsSourceOfTruth(message)
@@ -141,6 +147,10 @@ object OutgoingMessageRetryManager {
     @WorkerThread
     private fun retry(entry: PendingMessage, immediate: Boolean) {
         if (pending[entry.key] !== entry || entry.attempts >= MAX_RETRIES) return
+        if (OfflineInboxRepository.isMessageDeletedLocally(entry.message.chatRoom, entry.message)) {
+            complete(entry)
+            return
+        }
         entry.retryScheduled = false
         if (!isRetryable(entry.message.state)) return
 

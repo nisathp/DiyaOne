@@ -32,6 +32,7 @@ import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.compatibility.Compatibility
 import com.naminfo.contacts.ContactsManager
+import com.naminfo.contacts.PhoneContactNumbers
 import org.linphone.core.tools.Log
 import com.naminfo.notifications.NotificationsManager
 import com.naminfo.telecom.TelecomManager
@@ -56,7 +57,14 @@ class CoreContext
     companion object {
         private const val TAG = "[Core Context]"
         const val MEDIA_ENCRYPTION_DEFAULT_NONE_KEY = "media_encryption_default_none_v1"
-        private const val PUSH_WAKE_API_URL = "https://androidpushnotification.vercel.app/api/wake-call"
+        const val FIREBASE_PUSH_API_BASE_URL =
+            "https://asia-south1-nam-info-projects-a46e0.cloudfunctions.net/api"
+        private const val PUSH_WAKE_API_URL = "$FIREBASE_PUSH_API_BASE_URL/wake-call"
+        private const val CALL_READY_API_URL = "$FIREBASE_PUSH_API_BASE_URL/call-ready"
+        private const val CALL_STATUS_API_URL = "$FIREBASE_PUSH_API_BASE_URL/call-status"
+        private const val SAVE_TOKEN_API_URL = "$FIREBASE_PUSH_API_BASE_URL/save-token"
+        private const val CALL_READY_TIMEOUT_MS = 12_000L
+        private const val CALL_READY_POLL_INTERVAL_MS = 300L
         private val mobileNumberRegex = Regex("^\\d{6,15}$")
     }
 
@@ -68,8 +76,33 @@ class CoreContext
     @Volatile
     var pendingWakeReadyToken: String? = null
 
+    /** The call whose FCM-triggered SIP REGISTER must finish before its readiness ACK is sent. */
+    @Volatile
+    var pendingWakeRegistrationCallId: String? = null
+
     private val pendingWakeAckLock = Any()
     private var pendingWakeAckInProgressFor: String? = null
+
+    /** Clears an in-flight call wake when the handset changes user or signs out. */
+    fun clearPendingWakeCall() {
+        val callId = pendingWakeCallId
+        pendingWakeCallId = null
+        pendingWakeReadyToken = null
+        pendingWakeRegistrationCallId = null
+        synchronized(pendingWakeAckLock) {
+            pendingWakeAckInProgressFor = null
+        }
+        if (!callId.isNullOrBlank()) {
+            notificationsManager.cancelIncomingCallWakeNotification(callId)
+        }
+    }
+
+    // A successful REGISTER can emit several Ok/Refreshing callbacks in rapid
+    // succession. Token persistence is network I/O, so only one request for a
+    // given account/token pair may be active at a time.
+    private val fcmTokenSyncLock = Any()
+    private var fcmTokenSyncInProgressFor: String? = null
+    private var lastPersistedFcmTokenFor: String? = null
 
     fun isCoreAvailable(): Boolean {
         return ::core.isInitialized
@@ -121,6 +154,15 @@ class CoreContext
     }
 
     val showRedToastEvent: MutableLiveData<Event<Pair<Int, Int>>> by lazy {
+        MutableLiveData()
+    }
+
+    /**
+     * Identifies a caller-owned wake attempt that ended before a SIP INVITE could be made.
+     * The CallActivity uses this to report the failure in the call UI instead of leaving the
+     * user on the originating screen with only a transient toast.
+     */
+    val calleeWakeUnavailableEvent: MutableLiveData<Event<String>> by lazy {
         MutableLiveData()
     }
 
@@ -218,6 +260,9 @@ class CoreContext
         private fun onDefaultAccountReady(account: Account) {
             if (core.accountList.none { it == account }) return
             OfflineInboxRepository.cacheConfiguredHftHost(core)
+            // This is the reliable registration lifecycle hook. Do not depend on an account
+            // settings screen being opened before registering the handset's live FCM token.
+            fetchAndSyncFcmToken()
             contactsManager.syncMobionDirectoryAsync()
             FirebasePresenceRepository.syncRegistration(
                 account.params.identityAddress?.username.orEmpty(),
@@ -232,7 +277,6 @@ class CoreContext
             // In that case onCoreStarted() has nothing to configure, so
             // enable push once the account has actually registered.
             enablePushNotificationsForConfiguredFreeSwitchAccounts()
-            acknowledgePendingWakeCallIfRegistered()
         }
 
         @WorkerThread
@@ -245,7 +289,10 @@ class CoreContext
             Log.i("$TAG SIP registration callback state=[$state] message=[$message]")
             if (account != core.defaultAccount) return
             when (state) {
-                RegistrationState.Ok -> onDefaultAccountReady(account)
+                RegistrationState.Ok -> {
+                    onDefaultAccountReady(account)
+                    acknowledgePendingWakeCallAfterRegistration(account)
+                }
                 RegistrationState.Cleared, RegistrationState.Failed -> FirebasePresenceRepository.syncRegistration(
                     account.params.identityAddress?.username.orEmpty(),
                     online = false
@@ -738,7 +785,7 @@ class CoreContext
         }
     }
 
-    private var logcatEnabled: Boolean = corePreferences.printLogsInLogcat
+    private var logcatEnabled: Boolean = true
 
     private var crashlyticsEnabled: Boolean = corePreferences.sendLogsToCrashlytics
     private var crashlyticsAvailable = BuildConfig.CRASHLYTICS_ENABLED
@@ -900,10 +947,9 @@ class CoreContext
             Log.i("$TAG File transfer server configured as [$localFileTransferServer]")
         }
         configureSharedHftDigestAuth()
-        // Keep received HFT media as a file-transfer attachment. The conversation UI then
-        // shows a compact placeholder and starts the transfer only after the user taps it.
-        core.maxSizeForAutoDownloadIncomingFiles = -1
-        Log.i("$TAG Disabled automatic download for incoming HFT media")
+        // Automatically download incoming media up to 20 MB like WhatsApp so images, audio, and videos appear directly in chat bubbles
+        core.maxSizeForAutoDownloadIncomingFiles = 20 * 1024 * 1024
+        Log.i("$TAG Enabled automatic download for incoming media up to 20 MB")
         Log.i("$TAG Core has been configured with user-agent [${core.userAgent}], starting it")
         core.start()
     }
@@ -1288,7 +1334,15 @@ class CoreContext
         val found = core.accountList.find {
             it.params.identityAddress?.weakEqual(address) == true
         }
-        return found != null
+        if (found != null) return true
+
+        // A subscriber can change the SIP domain in the login screen. Own-number calls and
+        // messages must still be blocked when a stale contact/chat room uses the previous
+        // domain, otherwise weakEqual() alone lets a self action through.
+        val targetNumber = PhoneContactNumbers.normalize(address.username.orEmpty())
+        return targetNumber.isNotEmpty() && core.accountList.any { account ->
+            PhoneContactNumbers.normalize(account.params.identityAddress?.username.orEmpty()) == targetNumber
+        }
     }
 
     @WorkerThread
@@ -1335,6 +1389,18 @@ class CoreContext
         skipNetworkReachabilityTest: Boolean = false,
         skipCalleeWake: Boolean = false
     ) {
+        if (isAddressMyself(address)) {
+            Log.w("$TAG Refusing outgoing call to own account [${address.asStringUriOnly()}]")
+            showRedToastEvent.postValue(
+                Event(
+                    Pair(
+                        com.naminfo.R.string.call_error_cannot_call_yourself,
+                        com.naminfo.R.drawable.warning_circle
+                    )
+                )
+            )
+            return
+        }
         if (isLinphoneFallbackAddress(address)) {
             Log.e("$TAG Refusing outgoing call to Linphone fallback identity [${address.asStringUriOnly()}]")
             notifyFallbackIdentityBlocked()
@@ -1424,19 +1490,24 @@ class CoreContext
             return
         }
 
-        // Cached contacts, call logs and chat rooms may still contain the old Linphone domain.
-        // Resolve it here so every audio/video call entry point uses the configured SIP server.
-        val destination = if (address.domain.equals("sip.linphone.org", ignoreCase = true)) {
-            val accountDomain = params.account?.params?.identityAddress?.domain
-            val serverDomain = accountDomain?.takeIf {
-                it.isNotBlank() && !it.equals("sip.linphone.org", ignoreCase = true)
-            } ?: corePreferences.thirdPartySipAccountDefaultDomain
+        // A directory/contact cache can retain an old LAN address (for example
+        // 192.168.x.x) even after the account has been moved to FreeSWITCH.  A
+        // normal DiyaOne call must always enter through the active account's SIP
+        // domain; otherwise it bypasses FreeSWITCH and times out with 408.
+        // T Calls deliberately keep their specialised destination untouched.
+        val configuredSipDomain = outgoingAccount.params.identityAddress?.domain
+            ?.takeIf { it.isNotBlank() && !it.equals("sip.linphone.org", ignoreCase = true) }
+            ?: corePreferences.thirdPartySipAccountDefaultDomain
                 .removePrefix("sips:").removePrefix("sip:").substringBefore(":")
-            if (serverDomain.isBlank() || serverDomain.equals("sip.linphone.org", ignoreCase = true)) {
-                Log.e("$TAG No configured third-party server available, aborting legacy-domain call")
-                return
-            }
-            address.clone().apply { domain = serverDomain }
+        if (configuredSipDomain.isBlank() || configuredSipDomain.equals("sip.linphone.org", ignoreCase = true)) {
+            Log.e("$TAG No configured third-party server available, aborting outgoing call")
+            return
+        }
+        val destination = if (!isTranslationCallRequest && !address.domain.equals(configuredSipDomain, ignoreCase = true)) {
+            Log.i(
+                "$TAG Rewriting stale call destination domain [${address.domain}] to active SIP domain [$configuredSipDomain]"
+            )
+            address.clone().apply { domain = configuredSipDomain }
         } else {
             address
         }
@@ -1476,15 +1547,26 @@ class CoreContext
 
         val callId = UUID.randomUUID().toString().replace("-", "")
         Log.i("$TAG Waiting for receiver SIP readiness: callId=[$callId], caller=[$callerNumber], callee=[$calleeNumber]")
+        // The pending CallActivity is displayed before a SIP Call exists. Resolve the name now
+        // from the contact selected by the user instead of passing the bare phone number and
+        // briefly making the outgoing screen look like an unknown caller.
+        val calleeDisplayName = contactsManager.findDisplayName(destination)
+            .takeIf { !PhoneContactNumbers.isNumericPlaceholder(it, calleeNumber) }
+            ?: calleeNumber
+        postOnMainThread {
+            showCallActivity(
+                pendingWakeCallId = callId,
+                pendingCalleeDisplayName = calleeDisplayName
+            )
+        }
         Thread {
             var conn: HttpURLConnection? = null
             try {
-                val apiBase = corePreferences.apiDomain?.takeIf { it.isNotBlank() }
-                    ?: "https://mobionglobal.info/Diyaone/api"
+                val apiBase = corePreferences.mobionApiBaseUrl
                 val accessToken = MobionTokenRefresher.validAccessToken(apiBase)
                 if (accessToken.isNullOrBlank()) {
                     Log.w("$TAG Wake call aborted because the caller has no valid Mobion session")
-                    notifyCalleeUnavailable()
+                    notifyCalleeUnavailable(callId)
                     return@Thread
                 }
 
@@ -1493,10 +1575,7 @@ class CoreContext
                 conn.setRequestProperty("Content-Type", "application/json")
                 conn.setRequestProperty("Authorization", "Bearer $accessToken")
                 conn.connectTimeout = 5_000
-                // Mobion session validation, high-priority FCM delivery, and
-                // the receiver's six-second SIP-ready wait all happen in this
-                // single caller-owned request.
-                conn.readTimeout = 15_000
+                conn.readTimeout = 6_000
                 conn.doOutput = true
                 val requestBody = JSONObject().apply {
                     put("callId", callId)
@@ -1509,14 +1588,18 @@ class CoreContext
                 val response = (if (responseCode in 200..299) conn.inputStream else conn.errorStream)
                     ?.bufferedReader()?.use { it.readText() }
                 ApiLogRepository.complete(logId, responseCode, response)
-                val sipReady = responseCode in 200..299 && JSONObject(response ?: "{}").optBoolean("sipReady", false)
-                if (!sipReady) {
-                    Log.w("$TAG Receiver did not become SIP-ready: callId=[$callId], status=[$responseCode]")
-                    notifyCalleeUnavailable()
+                if (responseCode !in 200..299) {
+                    Log.w("$TAG Firebase wake request failed for [$callId], status=[$responseCode]")
+                    notifyCalleeUnavailable(callId)
                     return@Thread
                 }
-
+                if (!waitForCalleeSipReady(callId, callerNumber, accessToken)) {
+                    Log.w("$TAG Receiver did not report SIP-ready before timeout for callId=[$callId]")
+                    notifyCalleeUnavailable(callId)
+                    return@Thread
+                }
                 Log.i("$TAG Receiver SIP-ready; starting SIP INVITE for callId=[$callId]")
+
                 postOnCoreThread {
                     startCall(
                         destination,
@@ -1529,7 +1612,7 @@ class CoreContext
                 }
             } catch (error: Exception) {
                 Log.w("$TAG Wake call failed for [$callId]: ${error.message}")
-                notifyCalleeUnavailable()
+                notifyCalleeUnavailable(callId)
             } finally {
                 conn?.disconnect()
             }
@@ -1537,8 +1620,49 @@ class CoreContext
         return true
     }
 
+    /**
+     * Calls are caller-owned: after Firebase wakes B, only A polls this endpoint and sends
+     * the SIP INVITE once B's fresh Linphone REGISTER has been acknowledged by /call-ready.
+     */
+    @WorkerThread
+    private fun waitForCalleeSipReady(callId: String, callerNumber: String, accessToken: String): Boolean {
+        val deadline = android.os.SystemClock.elapsedRealtime() + CALL_READY_TIMEOUT_MS
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            var statusConnection: HttpURLConnection? = null
+            try {
+                val statusUrl = URL("$CALL_STATUS_API_URL?callId=$callId&callerNumber=$callerNumber")
+                statusConnection = statusUrl.openConnection() as HttpURLConnection
+                statusConnection.requestMethod = "GET"
+                statusConnection.setRequestProperty("Authorization", "Bearer $accessToken")
+                statusConnection.connectTimeout = 4_000
+                statusConnection.readTimeout = 4_000
+                val statusCode = statusConnection.responseCode
+                val statusResponse = (if (statusCode in 200..299) statusConnection.inputStream else statusConnection.errorStream)
+                    ?.bufferedReader()?.use { it.readText() }
+                if (statusCode in 200..299 && JSONObject(statusResponse ?: "{}").optBoolean("sipReady", false)) {
+                    return true
+                }
+                val state = JSONObject(statusResponse ?: "{}").optString("status")
+                if (state == "cancelled" || state == "expired" || state == "failed") return false
+            } catch (error: Exception) {
+                Log.w("$TAG Call readiness poll failed for [$callId]: ${error.message}")
+            } finally {
+                statusConnection?.disconnect()
+            }
+            try {
+                Thread.sleep(CALL_READY_POLL_INTERVAL_MS)
+            } catch (_: InterruptedException) {
+                return false
+            }
+        }
+        return false
+    }
+
     @AnyThread
-    private fun notifyCalleeUnavailable() {
+    private fun notifyCalleeUnavailable(callId: String? = null) {
+        if (!callId.isNullOrBlank()) {
+            calleeWakeUnavailableEvent.postValue(Event(callId))
+        }
         showRedToastEvent.postValue(
             Event(
                 Pair(
@@ -1569,10 +1693,15 @@ class CoreContext
         )
     }
 
-    /** A current RegistrationState.Ok is valid readiness even if refresh emits no new callback. */
-    fun acknowledgePendingWakeCallIfRegistered() {
-        if (!isCoreAvailable() || core.defaultAccount?.state != RegistrationState.Ok) return
-
+    /**
+     * A WAKE_CALL must be acknowledged only after the REGISTER initiated by that FCM
+     * has received a fresh [RegistrationState.Ok] callback. A previously cached Ok can
+     * point FreeSWITCH at an expired contact and results in a SIP 408 for the caller.
+     */
+    @WorkerThread
+    private fun acknowledgePendingWakeCallAfterRegistration(account: Account) {
+        val callId = pendingWakeCallId ?: return
+        if (pendingWakeRegistrationCallId != callId || account != core.defaultAccount) return
         acknowledgePendingWakeCall()
     }
 
@@ -1590,19 +1719,19 @@ class CoreContext
         }
 
         val startedAt = android.os.SystemClock.elapsedRealtime()
-        Log.i("$TAG RegistrationState.Ok confirmed for FCM wake call [$callId]; acknowledging Vercel API")
+        Log.i("$TAG RegistrationState.Ok confirmed for FCM wake call [$callId]; acknowledging Firebase API")
         Thread {
             var acknowledged = false
             repeat(3) { attempt ->
                 if (acknowledged) return@repeat
                 var conn: HttpURLConnection? = null
                 try {
-                    conn = URL("https://androidpushnotification.vercel.app/api/call-ready")
+                    conn = URL(CALL_READY_API_URL)
                         .openConnection() as HttpURLConnection
                     conn.requestMethod = "POST"
                     conn.setRequestProperty("Content-Type", "application/json")
-                    conn.connectTimeout = 1500
-                    conn.readTimeout = 1500
+                    conn.connectTimeout = 6000
+                    conn.readTimeout = 6000
                     conn.doOutput = true
                     val body = JSONObject().apply {
                         put("callId", callId)
@@ -1610,7 +1739,7 @@ class CoreContext
                         put("receiverNumber", receiverNumber)
                         put("sipReady", true)
                     }.toString()
-                    val logId = ApiLogRepository.begin("POST", "https://androidpushnotification.vercel.app/api/call-ready", body)
+                    val logId = ApiLogRepository.begin("POST", CALL_READY_API_URL, body)
                     OutputStreamWriter(conn.outputStream).use { it.write(body) }
                     val responseCode = conn.responseCode
                     val response = (if (responseCode in 200..299) conn.inputStream else conn.errorStream)
@@ -1622,7 +1751,7 @@ class CoreContext
                                 "status=[$responseCode], elapsedMs=[${android.os.SystemClock.elapsedRealtime() - startedAt}]"
                     )
                 } catch (e: Exception) {
-                    ApiLogRepository.begin("POST", "https://androidpushnotification.vercel.app/api/call-ready")
+                    ApiLogRepository.begin("POST", CALL_READY_API_URL)
                         .also { ApiLogRepository.fail(it, e) }
                     Log.w("$TAG Call-ready ACK attempt ${attempt + 1} failed: ${e.message}")
                 } finally {
@@ -1635,8 +1764,9 @@ class CoreContext
                 if (pendingWakeCallId == callId) {
                     pendingWakeCallId = null
                     pendingWakeReadyToken = null
+                    pendingWakeRegistrationCallId = null
                 }
-                Log.i("$TAG Vercel API acknowledged SIP readiness for call [$callId] in [${android.os.SystemClock.elapsedRealtime() - startedAt}ms]")
+                Log.i("$TAG Firebase API acknowledged SIP readiness for call [$callId] in [${android.os.SystemClock.elapsedRealtime() - startedAt}ms]")
             } else {
                 Log.w("$TAG Could not acknowledge SIP readiness for call [$callId]; caller app will report the call unavailable")
             }
@@ -1648,21 +1778,30 @@ class CoreContext
 
     fun saveTokenToFirestoreBackend(phoneNumber: String, fcmToken: String) {
         if (phoneNumber.isBlank() || fcmToken.isBlank()) return
-        OfflineInboxRepository.updateCachedFcmToken(fcmToken)
+        val normalizedToken = fcmToken.trim()
+        val syncKey = "$phoneNumber:$normalizedToken"
+        synchronized(fcmTokenSyncLock) {
+            if (fcmTokenSyncInProgressFor == syncKey || lastPersistedFcmTokenFor == syncKey) {
+                Log.i("$TAG Skipping duplicate FCM token save for [$phoneNumber]")
+                return
+            }
+            fcmTokenSyncInProgressFor = syncKey
+        }
+        OfflineInboxRepository.updateCachedFcmToken(normalizedToken)
         Thread {
             try {
-                val url = URL("https://androidpushnotification.vercel.app/api/save-token")
+                val url = URL(SAVE_TOKEN_API_URL)
                 val conn = url.openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json")
                 conn.setRequestProperty("x-signature", "015a3e11e51129f1e74326b993b508103506093f884b4f66e94404d334473820")
-                conn.connectTimeout = 3000
-                conn.readTimeout = 3000
+                conn.connectTimeout = 6000
+                conn.readTimeout = 10000
                 conn.doOutput = true
 
                 val jsonBody = JSONObject().apply {
                     put("phoneNumber", phoneNumber)
-                    put("fcmToken", fcmToken.trim())
+                    put("fcmToken", normalizedToken)
                 }
                 val logId = ApiLogRepository.begin("POST", url.toString(), jsonBody.toString())
 
@@ -1677,6 +1816,9 @@ class CoreContext
                 ApiLogRepository.complete(logId, code, response)
                 Log.i("$TAG Token auto-save to Firestore backend for [$phoneNumber] status: $code")
                 if (code in 200..299) {
+                    synchronized(fcmTokenSyncLock) {
+                        lastPersistedFcmTokenFor = syncKey
+                    }
                     postOnCoreThread {
                         val defaultAccount = core.defaultAccount
                         val defaultUsername = defaultAccount?.params?.identityAddress?.username
@@ -1686,9 +1828,15 @@ class CoreContext
                     }
                 }
             } catch (e: Exception) {
-                ApiLogRepository.begin("POST", "https://androidpushnotification.vercel.app/api/save-token")
+                ApiLogRepository.begin("POST", SAVE_TOKEN_API_URL)
                     .also { ApiLogRepository.fail(it, e) }
                 Log.e("$TAG Error saving token to Firestore backend: $e")
+            } finally {
+                synchronized(fcmTokenSyncLock) {
+                    if (fcmTokenSyncInProgressFor == syncKey) {
+                        fcmTokenSyncInProgressFor = null
+                    }
+                }
             }
         }.start()
     }
@@ -1705,25 +1853,36 @@ class CoreContext
     }
 
     private fun fetchAndSyncFcmTokenForUser(username: String, prid: String) {
-        if (prid.isNotBlank()) {
-            Log.i("$TAG Syncing FCM token from pushNotificationConfig.prid for $username: $prid")
-            saveTokenToFirestoreBackend(username, prid)
-            return
-        }
+        // `pn-prid` belongs to Linphone's SIP-push configuration. It can be a stale or
+        // provider-specific identifier and is not necessarily this Android installation's
+        // Firebase registration token. Saving it as the FCM token leaves this handset absent
+        // from the queue backend, so delivery/read acknowledgements cannot be pushed back.
+        // Always resolve the live Firebase token first; retain pn-prid only as a last-resort
+        // compatibility fallback when Firebase itself cannot provide a token.
         try {
             com.google.firebase.messaging.FirebaseMessaging.getInstance().token
                 .addOnCompleteListener { task ->
                     if (task.isSuccessful && !task.result.isNullOrBlank()) {
                         val token = task.result
-                        Log.i("$TAG Fetched current live FCM token: $token for $username")
+                        Log.i("$TAG Fetched current live FCM token for $username")
                         OfflineInboxRepository.updateCachedFcmToken(token)
                         saveTokenToFirestoreBackend(username, token)
                     } else {
-                        Log.e("$TAG Failed to fetch FCM token: ${task.exception}")
+                        if (prid.isNotBlank()) {
+                            Log.w("$TAG Live FCM token unavailable; using SIP push identifier as compatibility fallback for $username")
+                            saveTokenToFirestoreBackend(username, prid)
+                        } else {
+                            Log.e("$TAG Failed to fetch FCM token: ${task.exception}")
+                        }
                     }
                 }
         } catch (e: Exception) {
-            Log.e("$TAG Exception fetching FCM token: $e")
+            if (prid.isNotBlank()) {
+                Log.w("$TAG Couldn't fetch live FCM token; using SIP push identifier as compatibility fallback for $username: $e")
+                saveTokenToFirestoreBackend(username, prid)
+            } else {
+                Log.e("$TAG Exception fetching FCM token: $e")
+            }
         }
     }
 
@@ -1902,9 +2061,16 @@ class CoreContext
     }
 
     @UiThread
-    fun showCallActivity() {
+    fun showCallActivity(
+        pendingWakeCallId: String? = null,
+        pendingCalleeDisplayName: String? = null
+    ) {
         Log.i("$TAG Starting Call activity")
         val intent = Intent(context, CallActivity::class.java)
+        if (!pendingWakeCallId.isNullOrBlank()) {
+            intent.putExtra(CallActivity.EXTRA_PENDING_WAKE_CALL_ID, pendingWakeCallId)
+            intent.putExtra(CallActivity.EXTRA_PENDING_CALLEE_DISPLAY_NAME, pendingCalleeDisplayName)
+        }
         // This flag is required to start an Activity from a Service context
         intent.addFlags(
             Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT

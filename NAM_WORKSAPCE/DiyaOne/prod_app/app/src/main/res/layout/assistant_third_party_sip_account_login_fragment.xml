@@ -169,7 +169,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:visibility="@{viewModel.expandAdvancedSettings ? View.VISIBLE : View.GONE, default=gone}"
-                    app:constraint_referenced_ids="api_domain_label,api_domain,sip_domain_label,sip_domain,transport_label,transport,transport_caret" />
+                    app:constraint_referenced_ids="api_domain_label,api_domain,sip_domain_label,sip_domain,tcall_domain_label,tcall_domain,tchat_domain_label,tchat_domain,transport_label,transport,transport_caret" />
 
                 <androidx.appcompat.widget.AppCompatTextView
                     android:id="@+id/api_domain_label"
@@ -236,6 +236,70 @@
                     app:layout_constraintWidth_max="@dimen/text_input_max_width" />
 
                 <androidx.appcompat.widget.AppCompatTextView
+                    android:id="@+id/tcall_domain_label"
+                    style="@style/header_style"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginTop="18dp"
+                    android:labelFor="@id/tcall_domain"
+                    android:text="@string/assistant_sip_account_tcall_domain"
+                    app:layout_constraintStart_toStartOf="@id/tcall_domain"
+                    app:layout_constraintTop_toBottomOf="@id/sip_domain" />
+
+                <androidx.appcompat.widget.AppCompatEditText
+                    android:id="@+id/tcall_domain"
+                    style="@style/default_text_style"
+                    android:layout_width="0dp"
+                    android:layout_height="50dp"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginEnd="16dp"
+                    android:background="@drawable/edit_text_background"
+                    android:hint="@string/assistant_sip_account_tcall_domain"
+                    android:inputType="text|textUri"
+                    android:paddingStart="20dp"
+                    android:paddingEnd="20dp"
+                    android:text="@={viewModel.tCallDomain}"
+                    android:textColor="?attr/color_main2_600"
+                    android:textSize="14sp"
+                    app:layout_constraintEnd_toEndOf="parent"
+                    app:layout_constraintStart_toStartOf="parent"
+                    app:layout_constraintTop_toBottomOf="@id/tcall_domain_label"
+                    app:layout_constraintWidth_max="@dimen/text_input_max_width" />
+
+                <androidx.appcompat.widget.AppCompatTextView
+                    android:id="@+id/tchat_domain_label"
+                    style="@style/header_style"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginTop="18dp"
+                    android:labelFor="@id/tchat_domain"
+                    android:text="@string/assistant_sip_account_tchat_domain"
+                    app:layout_constraintStart_toStartOf="@id/tchat_domain"
+                    app:layout_constraintTop_toBottomOf="@id/tcall_domain" />
+
+                <androidx.appcompat.widget.AppCompatEditText
+                    android:id="@+id/tchat_domain"
+                    style="@style/default_text_style"
+                    android:layout_width="0dp"
+                    android:layout_height="50dp"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginEnd="16dp"
+                    android:background="@drawable/edit_text_background"
+                    android:hint="@string/assistant_sip_account_tchat_domain"
+                    android:inputType="text|textUri"
+                    android:paddingStart="20dp"
+                    android:paddingEnd="20dp"
+                    android:text="@={viewModel.tChatDomain}"
+                    android:textColor="?attr/color_main2_600"
+                    android:textSize="14sp"
+                    app:layout_constraintEnd_toEndOf="parent"
+                    app:layout_constraintStart_toStartOf="parent"
+                    app:layout_constraintTop_toBottomOf="@id/tchat_domain_label"
+                    app:layout_constraintWidth_max="@dimen/text_input_max_width" />
+
+                <androidx.appcompat.widget.AppCompatTextView
                     android:id="@+id/transport_label"
                     style="@style/header_style"
                     android:layout_width="wrap_content"
@@ -245,7 +309,7 @@
                     android:labelFor="@id/transport"
                     android:text="@string/assistant_sip_account_transport_protocol"
                     app:layout_constraintStart_toStartOf="@id/transport"
-                    app:layout_constraintTop_toBottomOf="@id/sip_domain" />
+                    app:layout_constraintTop_toBottomOf="@id/tchat_domain" />
 
                 <androidx.appcompat.widget.AppCompatSpinner
                     android:id="@+id/transport"

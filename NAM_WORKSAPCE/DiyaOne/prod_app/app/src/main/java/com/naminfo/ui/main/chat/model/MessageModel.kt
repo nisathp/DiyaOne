@@ -93,9 +93,10 @@ class MessageModel
     var isRead = chatMessage.isRead
 
     // Queue-delivered media is created locally only because the Basic SIP SDK has no
-    // public incoming-message factory.  It is nevertheless received media, so never
+    // public incoming-message factory. It is nevertheless received media, so never
     // render it as an outgoing bubble or show sender delivery controls on it.
-    val isOutgoing = chatMessage.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(chatMessage)
+    // Also FreeSWITCH can occasionally deliver remote SIP messages with an outgoing flag.
+    val isOutgoing = !CustomImdn.isSemanticallyIncoming(chatMessage)
 
     init {
         if (!isOutgoing) {
@@ -143,6 +144,24 @@ class MessageModel
         ?.first
 
     val customDiyaId = CustomImdn.id(chatMessage)
+        ?: if (isOutgoing) OfflineInboxRepository.outgoingHistoryId(chatMessage) else null
+
+    /**
+     * The Linphone Basic SIP stack may expose an empty native messageId for a received
+     * message. Translation uses this key for its cache and in-flight de-duplication, so an
+     * empty id would make unrelated received bubbles share one translation result.  The
+     * Diya IMDN id is propagated by both the online and offline paths; for legacy messages
+     * that have neither id, derive a deterministic key from the room, original timestamp and
+     * text. This must not use object identity because the model is recreated on every reload.
+     */
+    @AnyThread
+    fun translationCacheId(): String {
+        customDiyaId?.takeIf { it.isNotBlank() }?.let { return "diya:$it" }
+        id.takeIf { it.isNotBlank() }?.let { return "sip:$it" }
+        val roomKey = "${chatMessage.chatRoom.localAddress.username.orEmpty()}:" +
+            chatMessage.chatRoom.peerAddress.username.orEmpty()
+        return "legacy:$roomKey:$timestampMillis:${getRawTextContent().hashCode()}"
+    }
 
     // A native reply id is generated independently on each SIP client and can occasionally
     // resolve to a different local message.  Prefer Diya's stable IMDN reference whenever it
@@ -241,7 +260,10 @@ class MessageModel
     // End of conference info related fields
 
     // Voice record related fields
-    val isVoiceRecord = MutableLiveData<Boolean>()
+    // Give the ViewStub its correct value before RecyclerView binds. Calling postValue(true)
+    // only after binding can leave an outgoing fallback voice bubble blank on some Android 14
+    // vendor builds even though its local audio Content is valid.
+    val isVoiceRecord = MutableLiveData(chatMessage.contents.any { it.isVoiceRecording })
 
     val isPlayingVoiceRecord = MutableLiveData<Boolean>()
 
@@ -267,6 +289,16 @@ class MessageModel
     private lateinit var voiceRecordPath: String
 
     private lateinit var voiceRecordPlayer: Player
+
+    private var isVoiceRecordPlayerReady = false
+
+    // Basic SIP queue restoration deliberately keeps only trusted HFT metadata, not a native
+    // Content with isVoiceRecording=true. Keep that metadata here so a received voice note can
+    // use the same inline player as a normal Linphone voice Content after its first download.
+    private var queuedVoiceMedia: OfflineInboxRepository.QueuedMedia? = null
+
+    @Volatile
+    private var queuedVoiceDownloadInProgress = false
 
     private val playerListener = PlayerListener {
         Log.i("$TAG End of file reached")
@@ -318,7 +350,7 @@ class MessageModel
         @WorkerThread
         override fun onMsgStateChanged(message: ChatMessage, messageState: ChatMessage.State?) {
             Log.i("$TAG Chat message [${message.messageId}] state changed to [$messageState]")
-            if (messageState != ChatMessage.State.FileTransferDone && messageState != ChatMessage.State.FileTransferInProgress) {
+            if (messageState != ChatMessage.State.FileTransferInProgress) {
                 // statusIcon.postValue(LinphoneUtils.getChatIconResId(chatMessage.state))
                 statusIcon.postValue(LinphoneUtils.getChatIconResId(deliveryState()))
                 if (messageState == ChatMessage.State.Displayed) {
@@ -550,6 +582,12 @@ class MessageModel
     fun togglePlayPauseVoiceRecord() {
         coreContext.postOnCoreThread {
             if (isPlayingVoiceRecord.value == false) {
+                val queuedMedia = queuedVoiceMedia
+                val localPath = if (::voiceRecordPath.isInitialized) voiceRecordPath else ""
+                if (queuedMedia != null && (localPath.isBlank() || !File(localPath).isFile)) {
+                    downloadQueuedVoiceRecordAndPlay(queuedMedia)
+                    return@postOnCoreThread
+                }
                 startVoiceRecordPlayer()
             } else {
                 pauseVoiceRecordPlayer()
@@ -618,12 +656,26 @@ class MessageModel
         val filesPath = arrayListOf<FileModel>()
 
         val contents = chatMessage.contents
+        val restoredOutgoing = if (isOutgoing && !chatMessage.isRetracted && contents.none { content ->
+                val nativeFile = content.isFile || content.isVoiceRecording ||
+                    (content.isFileTransfer && chatMessage.isFileTransferInProgress)
+                nativeFile && content.filePath?.let { File(it).isFile } == true
+            }
+        ) {
+            OfflineInboxRepository.outgoingHistoryMedia(chatMessage).takeIf { saved ->
+                saved.any { it.localPath != null } || contents.none { it.isFileTransfer }
+            }.orEmpty()
+        } else {
+            emptyList()
+        }
+        isVoiceRecord.postValue(restoredOutgoing.isEmpty() && contents.any { it.isVoiceRecording })
         allFilesDownloaded = true
         val exactly4Contents = contents.count {
             it.isFile || it.isFileTransfer
         } == 4
 
         for (content in contents) {
+            if (restoredOutgoing.isNotEmpty() && (content.isFile || content.isFileTransfer || content.isVoiceRecording)) continue
             val isFileEncrypted = content.isFileEncrypted
 
             if (content.isIcalendar) {
@@ -763,13 +815,31 @@ class MessageModel
             }
         }
 
-        // Queue-delivered messages retain only trusted HFT metadata in their local event. Build
-        // attachment placeholders here, so their file bytes are downloaded only on a user tap.
-        val queuedMedia = OfflineInboxRepository.queuedMedia(chatMessage)
+        // Render attachment metadata from the durable inbox or the local outgoing history.
+        val queuedMedia = if (isOutgoing) restoredOutgoing else OfflineInboxRepository.queuedMedia(chatMessage)
         if (queuedMedia.isNotEmpty()) {
-            allFilesDownloaded = queuedMedia.all { it.localPath != null }
-            val exactly4QueuedMedia = queuedMedia.size == 4
-            queuedMedia.forEachIndexed { index, media ->
+            val queuedVoice = queuedMedia.firstOrNull(::isQueuedVoiceRecording)
+            queuedVoiceMedia = queuedVoice
+            if (queuedVoice != null) {
+                isVoiceRecord.postValue(true)
+                if (queuedVoice.localPath != null) {
+                    computeQueuedVoiceRecordContent(queuedVoice.localPath)
+                } else if (queuedVoice.url.isNotBlank()) {
+                    OfflineInboxRepository.downloadQueuedMedia(queuedVoice) { path ->
+                        if (path != null) {
+                            coreContext.postOnCoreThread {
+                                computeContentsList()
+                            }
+                        }
+                    }
+                }
+                displayableContentFound = true
+            }
+
+            val queuedFiles = queuedMedia.filterNot { it == queuedVoice }
+            allFilesDownloaded = queuedFiles.all { it.localPath != null }
+            val exactly4QueuedMedia = queuedFiles.size == 4
+            queuedFiles.forEachIndexed { index, media ->
                 val localPath = media.localPath
                 val fileModel = FileModel(
                     localPath ?: media.name,
@@ -786,6 +856,10 @@ class MessageModel
                     if (downloaded != null) {
                         model.markDownloaded(downloaded)
                         onContentClicked?.invoke(model)
+                    } else if (media.url.isBlank()) {
+                        onRedToastToShow?.invoke(
+                            Pair(R.string.conversation_file_unavailable_toast, R.drawable.warning_circle)
+                        )
                     } else {
                         if (!model.tryStartDownload()) return@FileModel
                         model.updateTransferProgress(0)
@@ -793,6 +867,7 @@ class MessageModel
                             if (path != null) {
                                 model.markDownloaded(path)
                                 coreContext.postOnCoreThread {
+                                    computeContentsList()
                                     onFileTransferCompleted?.invoke(chatMessage)
                                 }
                             } else {
@@ -803,7 +878,27 @@ class MessageModel
                 }
                 filesPath.add(fileModel)
                 displayableContentFound = true
+
+                // Auto-download queued images so they appear in conversation bubbles like WhatsApp
+                if (localPath == null && media.url.isNotBlank() && fileModel.isImage) {
+                    if (fileModel.tryStartDownload()) {
+                        fileModel.updateTransferProgress(0)
+                        OfflineInboxRepository.downloadQueuedMedia(media) { path ->
+                            if (path != null) {
+                                fileModel.markDownloaded(path)
+                                coreContext.postOnCoreThread {
+                                    computeContentsList()
+                                    onFileTransferCompleted?.invoke(chatMessage)
+                                }
+                            } else {
+                                fileModel.updateTransferProgress(-1)
+                            }
+                        }
+                    }
+                }
             }
+        } else {
+            queuedVoiceMedia = null
         }
 
         filesList.postValue(filesPath)
@@ -1382,6 +1477,7 @@ class MessageModel
 
     @WorkerThread
     private fun initVoiceRecordPlayer() {
+        isVoiceRecordPlayerReady = false
         if (!::voiceRecordPath.isInitialized) {
             Log.e("$TAG No voice record path was set!")
             return
@@ -1405,14 +1501,69 @@ class MessageModel
         Log.i("$TAG Voice record player created")
 
         val path = voiceRecordPath
+        if (path.isBlank() || !File(path).isFile || File(path).length() == 0L) {
+            Log.e("$TAG Voice record file is missing or empty [$path]")
+            return
+        }
         Log.i("$TAG Opening voice record file [$path]")
         if (voiceRecordPlayer.open(path) == 0) {
+            isVoiceRecordPlayerReady = true
             val duration = voiceRecordPlayer.duration
             voiceRecordingDuration.postValue(duration)
             val formattedDuration = VoiceDurationUtils.format(duration)
             formattedVoiceRecordingDuration.postValue(formattedDuration)
         } else {
             Log.e("$TAG Player failed to open file at [$path]")
+        }
+    }
+
+    @WorkerThread
+    private fun isQueuedVoiceRecording(media: OfflineInboxRepository.QueuedMedia): Boolean {
+        val mimeType = media.mimeType.lowercase()
+        val fileName = media.name.lowercase()
+        return mimeType.contains("voice-recording=yes") ||
+            (mimeType.startsWith("audio/") && fileName.startsWith("voice-recording-"))
+    }
+
+    @WorkerThread
+    private fun computeQueuedVoiceRecordContent(path: String) {
+        if (!File(path).isFile || File(path).length() == 0L) return
+        voiceRecordPath = path
+        // Opening the local player here reads the actual MKV/Opus duration before the user
+        // presses Play, so the incoming queue bubble looks and behaves exactly like A's bubble.
+        if (isPlayerClosed()) initVoiceRecordPlayer()
+    }
+
+    @WorkerThread
+    private fun downloadQueuedVoiceRecordAndPlay(media: OfflineInboxRepository.QueuedMedia) {
+        if (queuedVoiceDownloadInProgress) return
+        queuedVoiceDownloadInProgress = true
+        Log.i("$TAG Downloading queued voice record [${media.name}] for inline playback")
+        OfflineInboxRepository.downloadQueuedMedia(media) { path ->
+            coreContext.postOnCoreThread {
+                queuedVoiceDownloadInProgress = false
+                if (isDestroyed || path == null) {
+                    Log.w("$TAG Couldn't download queued voice record [${media.name}]")
+                    onRedToastToShow?.invoke(
+                        Pair(
+                            R.string.conversation_failed_to_play_voice_recording_message,
+                            R.drawable.warning_circle
+                        )
+                    )
+                    return@postOnCoreThread
+                }
+                computeQueuedVoiceRecordContent(path)
+                if (isVoiceRecordPlayerReady) {
+                    startVoiceRecordPlayer()
+                } else {
+                    onRedToastToShow?.invoke(
+                        Pair(
+                            R.string.conversation_failed_to_play_voice_recording_message,
+                            R.drawable.warning_circle
+                        )
+                    )
+                }
+            }
         }
     }
 
@@ -1428,7 +1579,7 @@ class MessageModel
             Log.w("$TAG Player closed, let's open it first")
             initVoiceRecordPlayer()
 
-            if (voiceRecordPlayer.state == Player.State.Closed) {
+            if (!isVoiceRecordPlayerReady || isPlayerClosed()) {
                 Log.e("$TAG It seems the player fails to open the file, abort playback")
                 onRedToastToShow?.invoke(
                     Pair(
@@ -1492,6 +1643,8 @@ class MessageModel
             voiceRecordPlayerPosition.postValue(0)
             voiceRecordPlayer.close()
         }
+
+        isVoiceRecordPlayerReady = false
 
         voiceRecordPlayerPosition.postValue(0)
         isPlayingVoiceRecord.postValue(false)
@@ -1608,15 +1761,12 @@ class MessageModel
 
         transferringFileModel?.updateTransferProgress(-1)
         transferringFileModel = null
-        if (!allFilesDownloaded) {
-            computeContentsList()
-        } else {
-            for (content in message.contents) {
-                if (content.isVoiceRecording) {
-                    Log.i("$TAG File transfer done, updating voice record info")
-                    computeVoiceRecordContent(content)
-                    break
-                }
+        computeContentsList()
+        for (content in message.contents) {
+            if (content.isVoiceRecording) {
+                Log.i("$TAG File transfer done, updating voice record info")
+                computeVoiceRecordContent(content)
+                break
             }
         }
         onFileTransferCompleted?.invoke(message)

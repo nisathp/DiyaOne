@@ -2,6 +2,7 @@ package com.naminfo.utils
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.ContextWrapper
 import android.graphics.PorterDuff
 import android.graphics.drawable.AnimatedVectorDrawable
 import android.text.Editable
@@ -19,7 +20,6 @@ import androidx.annotation.ColorInt
 import androidx.annotation.ColorRes
 import androidx.annotation.DimenRes
 import androidx.annotation.UiThread
-import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.AppCompatEditText
 import androidx.appcompat.widget.AppCompatTextView
 import androidx.constraintlayout.widget.ConstraintLayout
@@ -34,6 +34,7 @@ import androidx.databinding.ViewDataBinding
 import androidx.emoji2.emojipicker.EmojiPickerView
 import androidx.emoji2.emojipicker.EmojiViewItem
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.findViewTreeLifecycleOwner
 import androidx.vectordrawable.graphics.drawable.AnimatedVectorDrawableCompat
 import coil3.dispose
 import coil3.load
@@ -62,11 +63,21 @@ import java.io.File
 
 private const val TAG = "[Data Binding Utils]"
 
+private fun findLifecycleOwner(view: View): LifecycleOwner? {
+    return view.findViewTreeLifecycleOwner() ?: run {
+        var context = view.context
+        while (context is ContextWrapper) {
+            if (context is LifecycleOwner) return context
+            context = context.baseContext
+        }
+        null
+    }
+}
+
 @BindingAdapter("inflatedLifecycleOwner")
 fun setInflatedViewStubLifecycleOwner(view: View, enable: Boolean) {
     val binding = DataBindingUtil.bind<ViewDataBinding>(view)
-    // This is a bit hacky...
-    binding?.lifecycleOwner = view.context as AppCompatActivity
+    binding?.lifecycleOwner = findLifecycleOwner(view)
 }
 
 @UiThread
@@ -127,9 +138,9 @@ fun <T> setEntries(
                 binding.setVariable(BR.onLongClickListener, onLongClick)
             }
 
-            // This is a bit hacky...
-            if (viewGroup.context as? LifecycleOwner != null) {
-                binding.lifecycleOwner = viewGroup.context as LifecycleOwner
+            val owner = findLifecycleOwner(viewGroup)
+            if (owner != null) {
+                binding.lifecycleOwner = owner
             } else {
                 Log.e(
                     "$TAG Failed to cast viewGroup's context as an Activity, lifecycle owner hasn't be set!"

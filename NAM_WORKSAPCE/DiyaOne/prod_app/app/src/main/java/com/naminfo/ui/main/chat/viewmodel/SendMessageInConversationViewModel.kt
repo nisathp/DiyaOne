@@ -51,6 +51,7 @@ import com.naminfo.utils.Event
 import com.naminfo.utils.FileUtils
 import com.naminfo.utils.LinphoneUtils
 import com.naminfo.utils.VoiceDurationUtils
+import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 
 class SendMessageInConversationViewModel
@@ -112,6 +113,11 @@ class SendMessageInConversationViewModel
 
     private lateinit var voiceRecordPlayer: Player
 
+    // A player may be created successfully but still fail to open a locally recorded file.
+    // Keep this separate from Player.State so Android-vendor media failures cannot lead to
+    // start() being called on an unusable player.
+    private var isVoiceRecordPlayerReady = false
+
     private var configuredDraftConversationId: String? = null
 
     private val playerListener = PlayerListener {
@@ -154,6 +160,10 @@ class SendMessageInConversationViewModel
     private lateinit var voiceMessageRecorder: Recorder
 
     private var voiceRecordAudioFocusRequest: AudioFocusRequestCompat? = null
+    // A new recording replaces the native recorder instance. Keep exactly one duration
+    // ticker so a delayed ticker from the previous instance can't update or stop the
+    // next voice message on slower vendor devices.
+    private var voiceRecorderTickerJob: Job? = null
 
     private var participantsListFilter = ""
 
@@ -190,6 +200,7 @@ class SendMessageInConversationViewModel
         super.onCleared()
 
         composingIdleJob?.cancel()
+        voiceRecorderTickerJob?.cancel()
         val stopGeneration = composingGeneration.incrementAndGet()
         coreContext.postOnCoreThread { stopComposingSignal(stopGeneration) }
 
@@ -354,6 +365,12 @@ class SendMessageInConversationViewModel
                     return@postOnCoreThread
                 }
 
+                if (coreContext.isAddressMyself(chatRoom.peerAddress)) {
+                    Log.w("$TAG Refusing to send a message to the signed-in account")
+                    showRedToast(R.string.conversation_cant_send_to_yourself, R.drawable.warning_circle)
+                    return@postOnCoreThread
+                }
+
                 val isBasicChatRoom: Boolean = chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())
 
                 val messageToReplyTo = chatMessageToReplyTo
@@ -375,15 +392,62 @@ class SendMessageInConversationViewModel
                         Log.i(
                             "$TAG Voice recording content created, file name is ${content.name} and duration is ${content.fileDuration}"
                         )
-                        if (isBasicChatRoom && contentAdded) {
+                        // Basic SIP must use addFileContent() even for a voice-only message.
+                        // addContent() creates an ordinary content part but does not reliably
+                        // start Linphone's FT-HTTP upload on Vivo Android 14.  The peer then
+                        // receives neither a downloadable voice attachment nor the durable
+                        // Firebase media metadata.  Keep voice in its own stored HFT message;
+                        // if there is a caption, the normal text message below carries it.
+                        if (isBasicChatRoom) {
                             val voiceMessage = chatRoom.createEmptyMessage()
-                            voiceMessage.addContent(content)
+                            voiceMessage.setToBeStored(true)
+                            voiceMessage.addFileContent(content)
+                            messageToReplyTo?.let { replyTarget ->
+                                addReplyMetadataAndFallback(
+                                    voiceMessage,
+                                    replyTarget,
+                                    toSend,
+                                    includeBodyFallback = false
+                                )
+                            }
+                            val voiceFileName = content.name.orEmpty().ifEmpty { "voice-recording.mka" }
+                            val transferLogId = FileTransferApiLogger.beginUpload(
+                                coreContext.core.fileTransferServer.orEmpty(),
+                                voiceFileName,
+                                0L
+                            )
+                            voiceMessage.addListener(object : ChatMessageListenerStub() {
+                                override fun onMsgStateChanged(
+                                    changedMessage: ChatMessage,
+                                    state: ChatMessage.State?
+                                ) {
+                                    when (state) {
+                                        ChatMessage.State.FileTransferDone -> {
+                                            FileTransferApiLogger.completeUpload(transferLogId)
+                                            OfflineInboxRepository.enqueueUploadedMedia(
+                                                changedMessage,
+                                                FileTransferApiLogger.uploadedMedia(voiceFileName)
+                                            )
+                                        }
+
+                                        ChatMessage.State.FileTransferError,
+                                        ChatMessage.State.NotDelivered ->
+                                            FileTransferApiLogger.failUpload(
+                                                transferLogId,
+                                                "Voice message transfer ended with state $state"
+                                            )
+
+                                        else -> Unit
+                                    }
+                                }
+                            })
                             CustomImdn.prepareOutgoing(voiceMessage)
                             OutgoingMessageRetryManager.watch(voiceMessage)
                             voiceMessage.send()
                             messageSentEvent.postValue(Event(voiceMessage))
                         } else {
                             message.addContent(content)
+                            contentAdded = true
                         }
                     } else {
                         Log.e("$TAG Voice recording content couldn't be created!")
@@ -411,6 +475,7 @@ class SendMessageInConversationViewModel
 
                         if (isBasicChatRoom) {
                             val fileMessage = chatRoom.createEmptyMessage()
+                            fileMessage.setToBeStored(true)
                             fileMessage.addFileContent(content)
                             messageToReplyTo?.let { replyTarget ->
                                 // Basic SIP rooms cannot send multipart (text + HFT XML) in a
@@ -446,7 +511,10 @@ class SendMessageInConversationViewModel
                                             // reliably. FreeSWITCH can acknowledge SIP delivery while
                                             // the peer handset is offline, so persist the signed HFT
                                             // URL before that proxy acknowledgement is treated as final.
-                                            OfflineInboxRepository.enqueueUploadedMedia(changedMessage)
+                                            OfflineInboxRepository.enqueueUploadedMedia(
+                                                changedMessage,
+                                                FileTransferApiLogger.uploadedMedia(attachment.fileName)
+                                            )
                                         }
 
                                         ChatMessage.State.FileTransferError,
@@ -665,6 +733,13 @@ class SendMessageInConversationViewModel
                         return@postOnCoreThread
                     }
 
+                    if (coreContext.isAddressMyself(chatRoom.peerAddress)) {
+                        Log.w("$TAG Refusing to forward a message to the signed-in account")
+                        prepared.cleanupStaging()
+                        showRedToast(R.string.conversation_cant_send_to_yourself, R.drawable.warning_circle)
+                        return@postOnCoreThread
+                    }
+
                     val sent = ChatForwardDispatcher.dispatchPayloadToChatRoom(
                         chatRoom = chatRoom,
                         payload = prepared,
@@ -872,14 +947,23 @@ class SendMessageInConversationViewModel
         }
         chatRoom.composeVoiceMessage()
 
-        val duration = voiceMessageRecorder.duration
+        val recorder = voiceMessageRecorder
+        val duration = recorder.duration
         val formattedDuration = VoiceDurationUtils.format(duration)
         formattedVoiceRecordingDuration.postValue(formattedDuration)
 
         val maxVoiceRecordDuration = corePreferences.voiceRecordingMaxDuration
-        recorderTickerFlow().onEach {
+        voiceRecorderTickerJob?.cancel()
+        voiceRecorderTickerJob = recorderTickerFlow(recorder).onEach {
             coreContext.postOnCoreThread {
-                val duration = voiceMessageRecorder.duration
+                // A recording can be sent and a new one started before the previous
+                // ticker gets its next turn. Never let that old ticker touch the new
+                // recorder or terminate it early.
+                if (!::voiceMessageRecorder.isInitialized || recorder !== voiceMessageRecorder) {
+                    return@postOnCoreThread
+                }
+
+                val duration = recorder.duration
                 val formattedDuration = VoiceDurationUtils.format(duration)
                 formattedVoiceRecordingDuration.postValue(formattedDuration)
 
@@ -896,6 +980,9 @@ class SendMessageInConversationViewModel
 
     @WorkerThread
     private fun stopVoiceRecorder() {
+        voiceRecorderTickerJob?.cancel()
+        voiceRecorderTickerJob = null
+
         if (voiceMessageRecorder.state == Recorder.State.Running) {
             Log.i("$TAG Closing voice recorder")
             voiceMessageRecorder.pause()
@@ -917,6 +1004,7 @@ class SendMessageInConversationViewModel
 
     @WorkerThread
     private fun initVoiceRecordPlayer() {
+        isVoiceRecordPlayerReady = false
         Log.i("$TAG Creating player for voice record")
 
         val playbackSoundCard = AudioUtils.getAudioPlaybackDeviceIdForCallRecordingOrVoiceMessage()
@@ -935,10 +1023,16 @@ class SendMessageInConversationViewModel
         Log.i("$TAG Voice record player created")
 
         val path = voiceMessageRecorder.file
-        if (path != null) {
+        if (path != null && File(path).isFile && File(path).length() > 0L) {
             Log.i("$TAG Opening voice record file [$path]")
-            voiceRecordPlayer.open(path)
-            voiceRecordingDuration.postValue(voiceRecordPlayer.duration)
+            if (voiceRecordPlayer.open(path) == 0) {
+                isVoiceRecordPlayerReady = true
+                voiceRecordingDuration.postValue(voiceRecordPlayer.duration)
+            } else {
+                Log.e("$TAG Player failed to open local voice record [$path]")
+            }
+        } else {
+            Log.e("$TAG Voice record file is missing or empty, aborting preview playback")
         }
     }
 
@@ -947,6 +1041,11 @@ class SendMessageInConversationViewModel
         if (isPlayerClosed()) {
             Log.w("$TAG Player closed, let's open it first")
             initVoiceRecordPlayer()
+        }
+
+        if (!isVoiceRecordPlayerReady || isPlayerClosed()) {
+            Log.e("$TAG Voice record player isn't ready, aborting preview playback")
+            return
         }
 
         val context = coreContext.context
@@ -1002,6 +1101,8 @@ class SendMessageInConversationViewModel
             voiceRecordPlayer.close()
         }
 
+        isVoiceRecordPlayerReady = false
+
         voiceRecordPlayerPosition.postValue(0)
         isPlayingVoiceRecord.postValue(false)
 
@@ -1022,8 +1123,13 @@ class SendMessageInConversationViewModel
         return !::voiceRecordPlayer.isInitialized || voiceRecordPlayer.state == Player.State.Closed
     }
 
-    private fun recorderTickerFlow() = flow {
-        while (isVoiceRecordingInProgress.value == true) {
+    private fun recorderTickerFlow(recorder: Recorder) = flow {
+        while (
+            isVoiceRecordingInProgress.value == true &&
+            ::voiceMessageRecorder.isInitialized &&
+            recorder === voiceMessageRecorder &&
+            recorder.state == Recorder.State.Running
+        ) {
             emit(Unit)
             delay(500)
         }

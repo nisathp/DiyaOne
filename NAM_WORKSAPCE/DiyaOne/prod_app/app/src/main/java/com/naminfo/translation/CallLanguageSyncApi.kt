@@ -1,6 +1,7 @@
 package com.naminfo.translation
 
 import android.net.Uri
+import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.core.ApiLogRepository
 import org.json.JSONObject
 import org.linphone.core.tools.Log
@@ -19,7 +20,7 @@ import java.util.concurrent.TimeUnit
 object CallLanguageSyncApi {
     private const val TAG = "[Call Language Sync]"
     // Translation-controller service reachable from physical Android devices.
-    private const val BASE_URL = "https://gomobion.in"
+    private const val DEFAULT_BASE_URL = "https://mobionglobal.org:8443"
     private const val API_KEY = "KirHbNtdUraLJHFq694krx65TD83zVJVNgIhCe367So"
     private const val CONNECT_TIMEOUT_MS = 5_000
     private const val READ_TIMEOUT_MS = 5_000
@@ -64,7 +65,7 @@ object CallLanguageSyncApi {
     }
 
     private fun postUpdate(callId: String, party: String, language: String): Boolean {
-        val endpoint = "$BASE_URL/v1/calls/${Uri.encode(callId)}/language"
+        val endpoint = "${controllerBaseUrl()}/v1/calls/${Uri.encode(callId)}/language"
         val body = JSONObject()
             .put("party", party)
             .put("lang", language)
@@ -107,4 +108,15 @@ object CallLanguageSyncApi {
 
     private const val CALLER = "caller"
     private const val ATTENDER = "attender"
+
+    private fun controllerBaseUrl(): String {
+        val configured = corePreferences.tCallDomain.trim().ifBlank { "mobionglobal.org:8443" }
+        return (
+            if (configured.startsWith("http://") || configured.startsWith("https://")) {
+            configured
+        } else {
+            "https://$configured"
+        }
+        ).trimEnd('/')
+    }
 }

@@ -104,19 +104,20 @@ class HistoryListFragment : AbstractMainFragment() {
             }
         }
 
-        adapter.itemSelectionToggledEvent.observe(viewLifecycleOwner) {
+        adapter.contactClickedEvent.observe(viewLifecycleOwner) {
             it.consume { model ->
-                listViewModel.toggleSelection(model)
+                val friendRefKey = model.friendRefKey
+                if (!friendRefKey.isNullOrEmpty()) {
+                    Log.i("$TAG Opening contact from call history with ref key [$friendRefKey]")
+                    sharedViewModel.navigateToContactsEvent.value = Event(true)
+                    sharedViewModel.showContactEvent.value = Event(friendRefKey)
+                }
             }
         }
 
-        adapter.itemLongPressedSelectionEvent.observe(viewLifecycleOwner) {
+        adapter.itemSelectionToggledEvent.observe(viewLifecycleOwner) {
             it.consume { model ->
-                if (listViewModel.isSelectionMode.value == true) {
-                    listViewModel.toggleSelection(model)
-                } else {
-                    listViewModel.enterSelectionMode(model)
-                }
+                listViewModel.toggleSelection(model)
             }
         }
 

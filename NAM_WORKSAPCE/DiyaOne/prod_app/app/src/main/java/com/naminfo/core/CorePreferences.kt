@@ -21,6 +21,7 @@ class CorePreferences
         private const val TAG = "[Preferences]"
 
         const val CONFIG_FILE_NAME = ".linphonerc"
+        const val DEFAULT_MOBION_API_BASE_URL = "https://mobionglobal.info/Diyaone/api"
     }
 
     private var _config: Config? = null
@@ -90,7 +91,11 @@ class CorePreferences
 
     @get:AnyThread @set:WorkerThread
     var firebasePresenceEnabled: Boolean
-        get() = config.getBool("app", "firebase_presence_enabled", false)
+        // Presence badges are a core DiyaOne feature.  A freshly installed handset
+        // must therefore query the shared presence service as soon as it signs in;
+        // using false as the fallback left every new Vivo install permanently
+        // offline until a developer-only setting was toggled manually.
+        get() = config.getBool("app", "firebase_presence_enabled", true)
         set(value) {
             config.setBool("app", "firebase_presence_enabled", value)
         }
@@ -377,7 +382,7 @@ class CorePreferences
 
     @get:AnyThread
     val defaultDomain: String
-        get() = config.getString("app", "default_domain", "203.95.216.68")!!
+        get() = config.getString("app", "default_domain", "106.51.56.13")!!
 
     @get:AnyThread
     val darkModeAllowed: Boolean
@@ -464,7 +469,7 @@ class CorePreferences
         get() = config.getString(
             "ui",
             "assistant_third_party_sip_account_domain",
-            "203.95.216.68"
+            "106.51.56.13:5061"
         )!!
 
     @get:AnyThread
@@ -592,6 +597,38 @@ class CorePreferences
         get() = config.getString("app", "api_domain", null)
         set(value) {
             config.setString("app", "api_domain", value ?: "")
+            config.sync()
+        }
+
+    /**
+     * Single source of truth for the authenticated Mobion API base URL.
+     *
+     * The sign-in flow persists a complete `/Diyaone/api` URL after a successful
+     * authentication. Calls made before that first sign-in use the production
+     * default, so contacts, token refresh and call wake authorization cannot
+     * silently use different fallback hosts.
+     */
+    @get:AnyThread
+    val mobionApiBaseUrl: String
+        get() = apiDomain
+            ?.trim()
+            ?.trimEnd('/')
+            ?.takeIf { it.isNotBlank() }
+            ?: DEFAULT_MOBION_API_BASE_URL
+
+    /** Translation-call controller host, editable from the sign-in advanced settings. */
+    var tCallDomain: String
+        get() = config.getString("app", "t_call_domain", "mobionglobal.org:8443") ?: "mobionglobal.org:8443"
+        set(value) {
+            config.setString("app", "t_call_domain", value.trim())
+            config.sync()
+        }
+
+    /** Translation-chat service host and port, editable from the sign-in advanced settings. */
+    var tChatDomain: String
+        get() = config.getString("app", "t_chat_domain", "mobionglobal.info:8020") ?: "mobionglobal.info:8020"
+        set(value) {
+            config.setString("app", "t_chat_domain", value.trim())
             config.sync()
         }
 

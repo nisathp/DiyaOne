@@ -67,7 +67,9 @@ abstract class AbstractConversationViewModel : GenericViewModel() {
     fun findChatRoom(room: ChatRoom?, conversationId: String) {
         coreContext.postOnCoreThread { core ->
             Log.i("$TAG Looking for conversation with conversation ID [$conversationId]")
-            if (room != null && ::chatRoom.isInitialized && chatRoom == room) {
+            val activeAccount = core.defaultAccount
+            val ownedRoom = room?.takeIf { LinphoneUtils.isHistoryOwnedBy(it.localAddress, activeAccount) }
+            if (ownedRoom != null && ::chatRoom.isInitialized && chatRoom == ownedRoom) {
                 Log.i("$TAG Conversation object already in memory, skipping")
 
                 this@AbstractConversationViewModel.conversationId = conversationId
@@ -78,10 +80,10 @@ abstract class AbstractConversationViewModel : GenericViewModel() {
                 return@postOnCoreThread
             }
 
-            if (room != null && (!::chatRoom.isInitialized || chatRoom != room)) {
-                if (LinphoneUtils.conversationIdMatchesChatRoom(conversationId, room)) {
+            if (ownedRoom != null && (!::chatRoom.isInitialized || chatRoom != ownedRoom)) {
+                if (LinphoneUtils.conversationIdMatchesChatRoom(conversationId, ownedRoom)) {
                     Log.i("$TAG Conversation object available in sharedViewModel, using it")
-                    chatRoom = room
+                    chatRoom = ownedRoom
 
                     this@AbstractConversationViewModel.conversationId = conversationId
                     beforeNotifyingChatRoomFound(sameOne = false)
@@ -95,6 +97,7 @@ abstract class AbstractConversationViewModel : GenericViewModel() {
             if (conversationId.isNotEmpty()) {
                 Log.i("$TAG Searching for conversation in Core using local & peer SIP addresses")
                 val found = LinphoneUtils.findChatRoomByConversationId(core, conversationId)
+                    ?.takeIf { LinphoneUtils.isHistoryOwnedBy(it.localAddress, activeAccount) }
                 if (found != null) {
                     this@AbstractConversationViewModel.conversationId = conversationId
                     if (::chatRoom.isInitialized && chatRoom == found) {

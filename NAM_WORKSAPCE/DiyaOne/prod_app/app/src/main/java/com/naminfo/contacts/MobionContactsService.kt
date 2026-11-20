@@ -39,8 +39,6 @@ object MobionContactsService {
      */
     val contactsRefreshRequested = MutableLiveData<Long>()
 
-    private const val DEFAULT_API_BASE = "https://mobionglobal.com/diyaone/api"
-
     private const val CONFERENCES_URL =
         "https://mobionglobal.com/fs_webservice/WebService.asmx/GroupSetting_View"
 
@@ -87,6 +85,22 @@ object MobionContactsService {
         contactsCache = resolvedContacts
         persistContacts(resolvedContacts)
         return resolvedContacts
+    }
+
+    /**
+     * Returns the directory name already available on the device without starting a network
+     * request. This is used for the signed-in account header as well: a handset does not need
+     * to have its own number saved in the native contacts database to display its profile name.
+     */
+    fun findCachedContactName(subscriberId: String): String? {
+        val normalized = PhoneContactNumbers.normalize(subscriberId)
+        if (normalized.isBlank()) return null
+        val contact = (contactsCache ?: readPersistedContacts())
+            .firstOrNull { PhoneContactNumbers.normalize(it.mobileNumber) == normalized }
+            ?: return null
+        return contact.name.trim().takeIf {
+            it.isNotBlank() && !PhoneContactNumbers.isNumericPlaceholder(it, normalized)
+        }
     }
 
     /** Clears only memory by default; sign-out also removes the persisted directory. */
@@ -172,8 +186,7 @@ object MobionContactsService {
      * subsequently filters this list against its local SIM/phone contacts by mobile number.
      */
     private fun fetchUsersContacts(allowTokenRefreshRetry: Boolean = true): List<Contact> {
-        val apiBase = corePreferences.apiDomain?.takeIf { it.isNotBlank() }
-            ?: DEFAULT_API_BASE
+        val apiBase = corePreferences.mobionApiBaseUrl
         val urlStr = "${apiBase.trimEnd('/')}/users"
         val connection = URL(urlStr).openConnection() as HttpURLConnection
         connection.requestMethod = "GET"
@@ -258,8 +271,7 @@ object MobionContactsService {
     }
 
     fun fetchProfilePictureUrl(subscriberId: String, allowTokenRefreshRetry: Boolean = true): String? {
-        val apiBase = corePreferences.apiDomain?.takeIf { it.isNotBlank() }
-            ?: "https://mobionglobal.com/Diyaone/api"
+        val apiBase = corePreferences.mobionApiBaseUrl
         val accessToken = MobionTokenRefresher.validAccessToken(apiBase)
         val encodedSubscriberId = URLEncoder.encode(subscriberId, Charsets.UTF_8.name())
         val connection = URL("${apiBase.trimEnd('/')}/users/$encodedSubscriberId")

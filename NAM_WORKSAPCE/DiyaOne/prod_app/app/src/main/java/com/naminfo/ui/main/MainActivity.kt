@@ -58,6 +58,8 @@ import com.naminfo.utils.FileUtils
 import com.naminfo.utils.LinphoneUtils
 import androidx.core.content.edit
 import com.naminfo.ui.sso.SingleSignOnActivity
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 @UiThread
 class MainActivity : GenericActivity() {
@@ -86,6 +88,9 @@ class MainActivity : GenericActivity() {
 
     private var navigatedToDefaultFragment = false
 
+    // Prevent the main navigation graph from being visible while the Assistant is opening.
+    private var assistantLaunchRequestedForMissingAccount = false
+
     private val destinationListener = object : NavController.OnDestinationChangedListener {
         override fun onDestinationChanged(
             controller: NavController,
@@ -101,7 +106,15 @@ class MainActivity : GenericActivity() {
     private val assistantLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode != android.app.Activity.RESULT_OK) return@registerForActivityResult
+        if (result.resultCode != android.app.Activity.RESULT_OK) {
+            // The Assistant is the only valid screen for a signed-out launch. If the user
+            // backs out of it, close this otherwise hidden MainActivity instead of revealing
+            // an empty/stale Chats screen behind it.
+            if (assistantLaunchRequestedForMissingAccount && !hasConfiguredAccount()) {
+                finish()
+            }
+            return@registerForActivityResult
+        }
         coreContext.postOnCoreThread { core ->
             if (core.accountList.isNotEmpty()) {
                 coreContext.postOnMainThread {
@@ -163,6 +176,18 @@ class MainActivity : GenericActivity() {
 
         super.onCreate(savedInstanceState)
 
+        while (!coreContext.isReady()) {
+            Thread.sleep(50)
+        }
+
+        // Start the login screen before inflating/restoring the Chats graph. Previously the
+        // account check happened much later on the Core thread, so a signed-out user briefly
+        // (and sometimes for several seconds) saw the previous Chats destination.
+        if (!hasConfiguredAccount()) {
+            assistantLaunchRequestedForMissingAccount = true
+            assistantLauncher.launch(Intent(this, AssistantActivity::class.java))
+        }
+
         binding = DataBindingUtil.setContentView(this, R.layout.main_activity)
         binding.lifecycleOwner = this
         setUpToastsArea(binding.toastsArea)
@@ -185,10 +210,6 @@ class MainActivity : GenericActivity() {
             val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
             v.updatePadding(insets.left, insets.top, insets.right, insets.bottom)
             WindowInsetsCompat.CONSUMED
-        }
-
-        while (!coreContext.isReady()) {
-            Thread.sleep(50)
         }
 
         viewModel = run {
@@ -406,7 +427,7 @@ class MainActivity : GenericActivity() {
                 Log.i("$TAG First launch, skipping welcome and opening one-time registration")
                 corePreferences.firstLaunch = false
             }
-            if (core.accountList.isEmpty()) {
+            if (core.accountList.isEmpty() && !assistantLaunchRequestedForMissingAccount) {
                 Log.w("$TAG No account found, showing Assistant activity")
                 coreContext.postOnMainThread {
                     try {
@@ -510,6 +531,22 @@ class MainActivity : GenericActivity() {
 
     fun showAssistant() {
         assistantLauncher.launch(Intent(this, AssistantActivity::class.java))
+    }
+
+    private fun hasConfiguredAccount(): Boolean {
+        // A stale Linphone account alone is not a login. It can survive a vendor process
+        // restore even after the authenticated Mobion session has been removed; opening the
+        // Chats graph in that state is both confusing and able to expose old local rooms.
+        if (corePreferences.authToken.isNullOrBlank() && corePreferences.refreshToken.isNullOrBlank()) {
+            return false
+        }
+        val latch = CountDownLatch(1)
+        var hasAccount = true
+        coreContext.postOnCoreThread { core ->
+            hasAccount = core.accountList.isNotEmpty()
+            latch.countDown()
+        }
+        return !latch.await(1, TimeUnit.SECONDS) || hasAccount
     }
 
     fun loadContacts() {

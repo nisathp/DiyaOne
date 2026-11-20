@@ -18,6 +18,9 @@
             name="onCallClickListener"
             type="View.OnClickListener" />
         <variable
+            name="onContactClickListener"
+            type="View.OnClickListener" />
+        <variable
             name="onAddContactClickListener"
             type="View.OnClickListener" />
     </data>
@@ -34,22 +37,29 @@
         android:paddingEnd="16dp"
         android:background="@drawable/primary_cell_background">
 
-        <include
+        <FrameLayout
             android:id="@+id/avatar"
+            android:onClick="@{onContactClickListener}"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginStart="5dp"
             android:layout_marginTop="5dp"
             android:layout_marginBottom="5dp"
-            layout="@layout/contact_avatar"
-            bind:model="@{model.avatarModel}"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent" />
+            app:layout_constraintTop_toTopOf="parent">
+
+            <include
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                layout="@layout/contact_avatar"
+                bind:model="@{model.avatarModel}" />
+        </FrameLayout>
 
         <androidx.appcompat.widget.AppCompatTextView
             style="@style/default_text_style"
             android:id="@+id/call_log_display_name"
+            android:onClick="@{onContactClickListener}"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginStart="10dp"

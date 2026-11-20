@@ -705,6 +705,9 @@ class ContactsManager
             }
             if (normalizedSelf.isNotEmpty() && normalized == normalizedSelf) {
                 selfRemotePhoto = cleanPhoto.orEmpty()
+                // A directory response includes the signed-in subscriber. It is profile data,
+                // not a callable/chat contact; never create a Friend row for oneself.
+                continue
             }
             if (savedNames.isNotEmpty() && normalized !in savedNames) {
                 continue

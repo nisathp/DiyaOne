@@ -38,7 +38,6 @@ import androidx.navigation.fragment.findNavController
 import androidx.navigation.fragment.navArgs
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import androidx.recyclerview.widget.RecyclerView.AdapterDataObserver
 import androidx.recyclerview.widget.SimpleItemAnimator
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetBehavior.BottomSheetCallback
@@ -216,61 +215,10 @@ open class ConversationFragment : SlidingPaneChildFragment() {
                     sendMessageViewModel.isEmojiPickerOpen.value = false
                 }
             }
-
-            val unreadCount = viewModel.unreadMessagesCount.value ?: 0
-            if (unreadCount > 0) {
-                Log.i(
-                    "$TAG Messages have been displayed and [$unreadCount] of them are unread, scrolling to first unread"
-                )
-                scrollToFirstUnreadMessageOrBottom()
-            }
         }
     }
 
-    private val dataObserver = object : AdapterDataObserver() {
-        override fun onItemRangeInserted(positionStart: Int, itemCount: Int) {
-            if (positionStart > 0) {
-                adapter.notifyItemChanged(positionStart - 1) // For grouping purposes
-            } else if (adapter.itemCount != itemCount) {
-                if (viewModel.searchInProgress.value == true) {
-                    scrollToTargetSearchPosition()
-                    return
-                }
-            }
-
-            if (viewModel.searchInProgress.value == true) {
-                scrollToTargetSearchPosition()
-                return
-            }
-
-            if (viewModel.isUserScrollingUp.value == true) {
-                Log.i(
-                    "$TAG [$itemCount] events have been loaded but user was scrolling up in conversation, do not scroll"
-                )
-                return
-            }
-
-            if (positionStart == 0 && adapter.itemCount == itemCount) {
-                // First time we fill the list with messages
-                Log.i("$TAG [$itemCount] events have been loaded")
-                if (!initialDisplayedReceiptRefreshDone && itemCount > 0) {
-                    initialDisplayedReceiptRefreshDone = true
-                    Log.i("$TAG Latest messages are visible, refreshing displayed receipts")
-                    viewModel.refreshDisplayedReceipts()
-                }
-                val unreadCount = viewModel.unreadMessagesCount.value ?: 0
-                if (unreadCount > 0) {
-                    Log.i("$TAG [$unreadCount] unread messages, scrolling to first one")
-                    scrollToFirstUnreadMessageOrBottom()
-                }
-            } else {
-                Log.i(
-                    "$TAG [$itemCount] new events have been loaded, scrolling to first unread message"
-                )
-                scrollToFirstUnreadMessageOrBottom()
-            }
-        }
-    }
+    private val eventDiff = ConversationEventAdapter.EventLogDiffCallback()
 
     private fun scrollToTargetSearchPosition() {
         val targetIndex = (viewModel.itemToScrollTo.value ?: 0).coerceIn(0, (adapter.itemCount - 1).coerceAtLeast(0))
@@ -715,16 +663,32 @@ open class ConversationFragment : SlidingPaneChildFragment() {
             it.consume {
                 val items = viewModel.eventsList
                 Log.i("$TAG Events (messages) list submitted, contains [${items.size}] items")
+                val latest = items.lastOrNull()
+                val latestMessage = latest?.model as? MessageModel
+                // A send can be followed by several history refreshes. Follow the latest
+                // row only when it actually changes, using the same identity as the adapter.
+                val newLatest = latest != null && latestMessage != null &&
+                    adapter.currentList.none { eventDiff.areItemsTheSame(it, latest) }
                 adapter.submitList(items) {
-                    if (viewModel.searchInProgress.value == true) {
-                        scrollToTargetSearchPosition()
-                    }
-                }
+                    if (viewLifecycleOwnerLiveData.value == null) return@submitList
+                    // Attach the populated adapter so RecyclerView can restore its saved position.
+                    if (binding.eventsList.adapter != adapter) binding.eventsList.adapter = adapter
 
-                // Wait for adapter to have items before setting it in the RecyclerView,
-                // otherwise scroll position isn't retained
-                if (binding.eventsList.adapter != adapter) {
-                    binding.eventsList.adapter = adapter
+                    when {
+                        items.isEmpty() -> Unit
+                        viewModel.searchInProgress.value == true -> scrollToTargetSearchPosition()
+                        !initialDisplayedReceiptRefreshDone -> {
+                            initialDisplayedReceiptRefreshDone = true
+                            viewModel.refreshDisplayedReceipts()
+                            if ((viewModel.unreadMessagesCount.value ?: 0) > 0) {
+                                scrollToFirstUnreadMessageOrBottom()
+                            }
+                        }
+                        newLatest && (
+                            latestMessage?.isOutgoing == true ||
+                            viewModel.isUserScrollingUp.value != true
+                        ) -> scrollToLatestMessage()
+                    }
                 }
 
                 (view.parent as? ViewGroup)?.doOnPreDraw {
@@ -906,14 +870,10 @@ open class ConversationFragment : SlidingPaneChildFragment() {
 
         sendMessageViewModel.askRecordAudioPermissionEvent.observe(viewLifecycleOwner) {
             it.consume {
+                // Request exactly once. On a first Android 14 request,
+                // shouldShowRequestPermissionRationale() is false; the old flow then opened
+                // Settings immediately after the system dialog and interrupted Vivo's grant.
                 requestRecordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                if (ActivityCompat.shouldShowRequestPermissionRationale(requireActivity(), Manifest.permission.RECORD_AUDIO)) {
-                    Log.w("$TAG Asking for RECORD_AUDIO permission")
-                    requestRecordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                } else {
-                    Log.i("$TAG Permission request for RECORD_AUDIO will be automatically denied, go to android app settings instead")
-                    (requireActivity() as GenericActivity).goToAndroidPermissionSettings()
-                }
             }
         }
 
@@ -1249,12 +1209,6 @@ open class ConversationFragment : SlidingPaneChildFragment() {
             }
         }
 
-        try {
-            adapter.registerAdapterDataObserver(dataObserver)
-        } catch (e: IllegalStateException) {
-            Log.e("$TAG Failed to register data observer to adapter: $e")
-        }
-
         val bottomSheetBehavior = BottomSheetBehavior.from(binding.messageBottomSheet.root)
         bottomSheetBehavior.addBottomSheetCallback(bottomSheetCallback)
     }
@@ -1274,12 +1228,6 @@ open class ConversationFragment : SlidingPaneChildFragment() {
             bottomSheetReactionsModel?.destroy()
             bottomSheetDeliveryModel?.destroy()
             coreContext.notificationsManager.resetCurrentlyDisplayedChatRoomId()
-        }
-
-        try {
-            adapter.unregisterAdapterDataObserver(dataObserver)
-        } catch (e: IllegalStateException) {
-            Log.e("$TAG Failed to unregister data observer to adapter: $e")
         }
 
         val bottomSheetBehavior = BottomSheetBehavior.from(binding.messageBottomSheet.root)
@@ -1352,6 +1300,14 @@ open class ConversationFragment : SlidingPaneChildFragment() {
             }
             recyclerView.post { markVisibleMessagesAsRead() }
         }
+    }
+
+    private fun scrollToLatestMessage() {
+        if (adapter.itemCount == 0) return
+        binding.eventsList.scrollToPosition(adapter.itemCount - 1)
+        viewModel.isUserScrollingUp.value = false
+        viewModel.markAsRead()
+        sharedViewModel.updateUnreadMessageCountForCurrentConversationEvent.postValue(Event(true))
     }
 
     private fun markVisibleMessagesAsRead() {

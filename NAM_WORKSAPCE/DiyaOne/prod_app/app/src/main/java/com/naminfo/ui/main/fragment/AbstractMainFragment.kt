@@ -121,6 +121,11 @@ abstract class AbstractMainFragment : GenericMainFragment() {
             sharedViewModel.refreshDrawerMenuAccountsListEvent.value = Event(false)
         }
 
+        viewModel.unreadMessages.observe(viewLifecycleOwner) {
+            // Keep the account badge in the drawer in sync with the bottom Chats badge.
+            sharedViewModel.refreshDrawerMenuAccountsListEvent.value = Event(false)
+        }
+
         viewModel.navigateToContactsEvent.observe(viewLifecycleOwner) {
             it.consume {
                 if (currentFragmentId != R.id.contactsListFragment) {
@@ -323,9 +328,10 @@ abstract class AbstractMainFragment : GenericMainFragment() {
     override fun onResume() {
         super.onResume()
 
-        // Each bottom navigation fragment owns a separate view model. Refresh the
-        // counter so a fragment can't restore a stale badge after History cleared it.
+        // Each bottom navigation fragment owns a separate view model. Refresh both
+        // counters so a recreated fragment can't restore stale unread or missed-call badges.
         coreContext.postOnCoreThread {
+            viewModel.computeUnreadMessagesCount()
             viewModel.updateMissedCallsCount()
         }
 

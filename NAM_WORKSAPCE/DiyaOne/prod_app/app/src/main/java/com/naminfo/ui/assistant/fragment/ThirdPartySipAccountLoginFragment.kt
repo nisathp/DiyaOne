@@ -84,9 +84,11 @@ class ThirdPartySipAccountLoginFragment : GenericFragment() {
 
         viewModel.apiFailureDiagnosticEvent.observe(viewLifecycleOwner) {
             it.consume { diagnostic ->
-                (requireActivity() as GenericActivity).showScrollableErrorToast(
-                    diagnostic.title,
-                    diagnostic.details
+                // API endpoint/HTTP diagnostics are recorded in API Logs for support, but
+                // must never be shown to an ordinary user during Sign in. The ViewModel emits
+                // accountLoginErrorEvent immediately afterwards with a short actionable toast.
+                Log.w(
+                    "$TAG ${diagnostic.title}; technical details are available in API Logs"
                 )
             }
         }

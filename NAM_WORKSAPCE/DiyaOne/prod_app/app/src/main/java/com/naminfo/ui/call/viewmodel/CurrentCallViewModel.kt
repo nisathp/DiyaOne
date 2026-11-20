@@ -158,6 +158,9 @@ class CurrentCallViewModel
 
     var terminatedByUser = false
 
+    @Volatile
+    private var isPendingOutgoingCall = false
+
     val isRemoteRecordingEvent: MutableLiveData<Event<Pair<Boolean, String>>> by lazy {
         MutableLiveData()
     }
@@ -569,7 +572,9 @@ class CurrentCallViewModel
         refreshKeyguardLockedStatus()
 
         coreContext.postOnCoreThread { core ->
-            hideSipAddresses.postValue(corePreferences.hideSipAddresses)
+            hideSipAddresses.postValue(
+                if (isPendingOutgoingCall) false else corePreferences.hideSipAddresses
+            )
             coreContext.contactsManager.addListener(contactsListener)
 
             core.addListener(coreListener)
@@ -772,6 +777,33 @@ class CurrentCallViewModel
                 finishActivityEvent.postValue(Event(true))
             }
         }
+    }
+
+    /**
+     * Shows a real outgoing-call screen while the caller waits for the receiver's FCM wake
+     * and SIP registration acknowledgement. There is deliberately no SIP Call yet at this
+     * point, so this state must not try to access [currentCall].
+     */
+    @UiThread
+    fun showPendingOutgoingCall(calleeDisplayName: String) {
+        isPendingOutgoingCall = true
+        displayedName.value = calleeDisplayName.ifBlank {
+            AppUtils.getString(R.string.active_call_unknown_caller)
+        }
+        displayedAddress.value = AppUtils.getString(R.string.wake_call_notification_connecting)
+        hideSipAddresses.value = false
+        isOutgoing.value = true
+        isOutgoingRinging.value = false
+        isOutgoingEarlyMedia.value = false
+        isVideoEnabled.value = false
+        isMicrophoneMuted.value = false
+        hideVideo.value = true
+    }
+
+    @UiThread
+    fun clearPendingOutgoingCall() {
+        isPendingOutgoingCall = false
+        hideSipAddresses.value = corePreferences.hideSipAddresses
     }
 
     @UiThread

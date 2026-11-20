@@ -26,6 +26,7 @@ class CallLogModel
     val timestamp = callLog.startDate
 
     val address = callLog.remoteAddress
+    internal val localAddress = callLog.localAddress
 
     val sipUri = address.asStringUriOnly()
 
@@ -148,7 +149,11 @@ class CallLogModel
     @UiThread
     fun delete() {
         coreContext.postOnCoreThread { core ->
-            val logsToRemove = core.callLogs.filter { it.remoteAddress.weakEqual(address) }
+            val account = core.defaultAccount ?: return@postOnCoreThread
+            if (!LinphoneUtils.isHistoryOwnedBy(callLog.localAddress, account)) return@postOnCoreThread
+            val logsToRemove = core.callLogs.filter {
+                LinphoneUtils.isHistoryOwnedBy(it.localAddress, account) && it.remoteAddress.weakEqual(address)
+            }
             for (log in logsToRemove) {
                 core.removeCallLog(log)
             }

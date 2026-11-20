@@ -82,8 +82,8 @@ class DiyaOneApplication : Application(), SingletonImageLoader.Factory {
 
         val appName = context.getString(R.string.app_name)
         Factory.instance().setLoggerDomain(appName)
-        Factory.instance().loggingService.setLogLevel(LogLevel.Message)
-        Factory.instance().enableLogcatLogs(corePreferences.printLogsInLogcat)
+        Factory.instance().loggingService.setLogLevel(LogLevel.Debug)
+        Factory.instance().enableLogcatLogs(true)
 
         Log.i("$TAG Report Core preferences initialized")
         Compatibility.setupAppStartupListener(context)

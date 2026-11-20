@@ -137,6 +137,12 @@ class NotificationsManager
 
     private val notificationsMap = HashMap<Int, Notification>()
 
+    // The FCM wake UUID and the later SIP Call-ID are intentionally different.
+    // Keep the UUIDs we displayed so the temporary "Connecting call…" alert can
+    // be removed when the corresponding SIP INVITE reaches the handset.
+    private val displayedWakeCallIds = ConcurrentHashMap.newKeySet<String>()
+
+    @Volatile
     private var currentlyDisplayedChatRoomId: String = ""
     private var currentlyDisplayedIncomingCallFragment: Boolean = false
 
@@ -197,6 +203,7 @@ class NotificationsManager
             .setContentIntent(contentIntent)
             .build()
         notificationManager.notify(WAKE_CALL_NOTIFICATION_TAG, callId.hashCode(), notification)
+        displayedWakeCallIds.add(callId)
         Log.i("$TAG Showing immediate FCM wake alert for call [$callId]")
     }
 
@@ -204,6 +211,18 @@ class NotificationsManager
     fun cancelIncomingCallWakeNotification(callId: String?) {
         if (callId.isNullOrBlank()) return
         notificationManager.cancel(WAKE_CALL_NOTIFICATION_TAG, callId.hashCode())
+        displayedWakeCallIds.remove(callId)
+    }
+
+    /**
+     * A SIP INVITE does not carry the Firebase wake UUID, so cancelling by its
+     * SIP Call-ID cannot remove the earlier wake notification.  There can only
+     * be one incoming call at a time; clear every temporary wake alert as soon
+     * as one becomes a real incoming SIP call.
+     */
+    @AnyThread
+    private fun cancelDisplayedWakeCallNotifications() {
+        displayedWakeCallIds.toList().forEach(::cancelIncomingCallWakeNotification)
     }
 
     private lateinit var mediaPlayer: MediaPlayer
@@ -292,7 +311,7 @@ class NotificationsManager
             Log.i("$TAG Call state changed: [$currentState]")
             when (currentState) {
                 Call.State.IncomingReceived, Call.State.IncomingEarlyMedia -> {
-                    cancelIncomingCallWakeNotification(call.callLog.callId)
+                    cancelDisplayedWakeCallNotifications()
                     Log.i(
                         "$TAG Showing incoming call notification for [${call.remoteAddress.asStringUriOnly()}]"
                     )
@@ -660,6 +679,13 @@ class NotificationsManager
     fun resetCurrentlyDisplayedChatRoomId() {
         currentlyDisplayedChatRoomId = ""
         Log.i("$TAG Reset currently displayed conversation")
+    }
+
+    @AnyThread
+    fun isChatRoomCurrentlyDisplayed(chatRoom: ChatRoom): Boolean {
+        val currentId = currentlyDisplayedChatRoomId
+        return currentId.isNotEmpty() &&
+            LinphoneUtils.conversationIdMatchesChatRoom(currentId, chatRoom)
     }
 
     @MainThread
@@ -1710,9 +1736,9 @@ class NotificationsManager
                 globalLang
             }
 
-            val peerAddressStr = notifiable.remoteAddress ?: message.senderAddress
-            val peerUsername = Factory.instance().createAddress(peerAddressStr)?.username
-                ?: peerAddressStr.substringBefore("@").removePrefix("sip:").trim()
+            val localAddressStr = notifiable.localIdentity.orEmpty()
+            val recipientUsername = Factory.instance().createAddress(localAddressStr)?.username
+                ?: localAddressStr.substringBefore("@").removePrefix("sip:").trim()
 
             var translatedText: String? = null
             if (!message.isOutgoing && effectiveLang != ChatTranslationLanguage.NONE && rawText.isNotBlank()) {
@@ -1722,7 +1748,7 @@ class NotificationsManager
                 } else {
                     translatedText = runBlocking {
                         withTimeoutOrNull(3500) {
-                            TranslationRepository.translateMessage(message.messageId, peerUsername, rawText, effectiveLang).getOrNull()
+                            TranslationRepository.translateMessage(message.messageId, recipientUsername, rawText, effectiveLang).getOrNull()
                         }
                     }
                     if (translatedText == null) {
@@ -1730,7 +1756,7 @@ class NotificationsManager
                         val localIdent = notifiable.localIdentity.orEmpty()
                         val remoteIdent = notifiable.remoteAddress.orEmpty()
                         CoroutineScope(Dispatchers.IO).launch {
-                            val result = TranslationRepository.translateMessage(msgId, peerUsername, rawText, effectiveLang)
+                            val result = TranslationRepository.translateMessage(msgId, recipientUsername, rawText, effectiveLang)
                             if (result.isSuccess && !result.getOrNull().isNullOrBlank()) {
                                 coreContext.postOnCoreThread {
                                     val localAddr = Factory.instance().createAddress(localIdent)

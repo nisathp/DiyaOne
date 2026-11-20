@@ -34,6 +34,7 @@ import androidx.core.net.toUri
 import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.core.CustomComposing
 import com.naminfo.core.CustomImdn
+import com.naminfo.core.OfflineInboxRepository
 import com.naminfo.ui.main.chat.RemoteComposingState
 import com.naminfo.translation.ChatTranslationLanguage
 import com.naminfo.translation.TranslationRepository
@@ -168,6 +169,24 @@ class ConversationViewModel
         coreContext.postOnCoreThread { computeComposingLabel() }
     }
 
+    // Queue read acknowledgements are applied to the durable outgoing row, while the currently
+    // visible bubble can still be an optimistic Basic-SIP wrapper. Update that live model as
+    // well so B reading a message turns A's tick double without requiring a screen reopen.
+    private val customReceiptObserver: (String, ChatMessage.State) -> Unit = { messageKey, state ->
+        val matched = eventsList
+            .asSequence()
+            .mapNotNull { it.model as? MessageModel }
+            .filter { it.isOutgoing && CustomImdn.key(it.chatMessage) == messageKey }
+            .toList()
+        if (matched.isNotEmpty()) {
+            Log.i("$TAG Refreshing ${matched.size} visible delivery icon(s) for [$messageKey] to [$state]")
+            matched.forEach { model ->
+                model.statusIcon.postValue(LinphoneUtils.getChatIconResId(state))
+                model.isInError.postValue(false)
+            }
+        }
+    }
+
     private val coreListener = object : CoreListenerStub() {
         @WorkerThread
         override fun onMessagesReceived(
@@ -178,12 +197,18 @@ class ConversationViewModel
             if (!isDisplayedRoom(room)) return
             var visibleAdded = false
             for (msg in messages) {
-                if (msg == null || !LinphoneUtils.isDisplayableChatMessage(msg)) continue
+                if (
+                    msg == null ||
+                    !LinphoneUtils.isDisplayableChatMessage(msg) ||
+                    OfflineInboxRepository.isMessageDeletedLocally(room, msg)
+                ) {
+                    continue
+                }
                 visibleAdded = true
                 val key = messageKey(msg) ?: continue
                 optimisticMessages[key] = msg
             }
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+            unreadMessagesCount.postValue(totalUnreadMessagesCount())
             if (!visibleAdded) return
 
             Log.i("$TAG Core receive fallback for active conversation, refreshing history")
@@ -194,7 +219,7 @@ class ConversationViewModel
         @WorkerThread
         override fun onChatRoomRead(core: Core, room: ChatRoom) {
             if (!isDisplayedRoom(room)) return
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+            unreadMessagesCount.postValue(totalUnreadMessagesCount())
         }
     }
 
@@ -237,7 +262,12 @@ class ConversationViewModel
             // already in the Core but is missing from the open conversation UI.
             for (event in eventLogs) {
                 val msg = event.chatMessage ?: continue
-                if (CustomImdn.isHiddenControlMessage(msg)) continue
+                if (
+                    CustomImdn.isHiddenControlMessage(msg) ||
+                    OfflineInboxRepository.isMessageDeletedLocally(chatRoom, msg)
+                ) {
+                    continue
+                }
                 val key = messageKey(msg) ?: continue
                 optimisticMessages[key] = msg
             }
@@ -296,13 +326,18 @@ class ConversationViewModel
             Log.i("$TAG Received [${eventLogs.size}] new message(s), refreshing history")
             for (event in eventLogs) {
                 val msg = event.chatMessage ?: continue
-                if (CustomImdn.isHiddenControlMessage(msg)) continue
+                if (
+                    CustomImdn.isHiddenControlMessage(msg) ||
+                    OfflineInboxRepository.isMessageDeletedLocally(chatRoom, msg)
+                ) {
+                    continue
+                }
                 val key = messageKey(msg) ?: continue
                 optimisticMessages[key] = msg
             }
             computeComposingLabel()
 
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+            unreadMessagesCount.postValue(totalUnreadMessagesCount())
             refreshEventsFromHistorySoon()
         }
 
@@ -411,7 +446,7 @@ class ConversationViewModel
                 messageDeletedEvent.postValue(Event(true))
             }
 
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+            unreadMessagesCount.postValue(totalUnreadMessagesCount())
         }
 
         @WorkerThread
@@ -444,6 +479,7 @@ class ConversationViewModel
             coreContext.contactsManager.addListener(contactsListener)
             coreContext.contactsManager.syncMobionDirectoryAsync()
             CustomComposing.addObserver(customComposingObserver)
+            CustomImdn.addObserver(customReceiptObserver)
         }
 
         searchBarVisible.value = false
@@ -462,6 +498,7 @@ class ConversationViewModel
         coreContext.postOnCoreThread {
             coreContext.contactsManager.removeListener(contactsListener)
             CustomComposing.removeObserver(customComposingObserver)
+            CustomImdn.removeObserver(customReceiptObserver)
             remoteComposingState.clear()
             if (coreListenerRegistered) {
                 coreContext.core.removeListener(coreListener)
@@ -546,7 +583,7 @@ class ConversationViewModel
     fun updateUnreadMessageCount() {
         if (!isChatRoomInitialized()) return
         coreContext.postOnCoreThread {
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+            unreadMessagesCount.postValue(totalUnreadMessagesCount())
         }
     }
 
@@ -576,35 +613,36 @@ class ConversationViewModel
     @UiThread
     fun deleteChatMessage(chatMessageModel: MessageModel) {
         coreContext.postOnCoreThread {
-            val eventsLogs = eventsList
-            val found = eventsLogs.find {
-                it.model == chatMessageModel
-            }
-            if (found != null) {
-                val list = arrayListOf<EventLogModel>()
-                list.addAll(eventsLogs)
-
-                // Update previous & next messages if needed
-                updatePreviousAndNextMessages(list, found)
-
-                Log.i("$TAG Removing chat message id [${chatMessageModel.id}] from events list")
-                list.remove(found)
-
-                eventsList = list
-
-                updateEvents.postValue(Event(true))
-                isEmpty.postValue(eventsList.isEmpty())
-            } else {
-                Log.e(
-                    "$TAG Failed to find chat message id [${chatMessageModel.id}] in events list!"
-                )
+            val message = chatMessageModel.chatMessage
+            val deletedIds = OfflineInboxRepository.markMessageDeletedLocally(message)
+            if (chatMessageModel.isOutgoing) {
+                OfflineInboxRepository.removeQueuedOutgoing(message)
             }
 
-            Log.i("$TAG Deleting message id [${chatMessageModel.id}] from database")
-            chatRoom.deleteMessage(chatMessageModel.chatMessage)
+            fun isDeletedCopy(candidate: ChatMessage): Boolean = candidate === message ||
+                OfflineInboxRepository.messageIdentifiers(candidate).any { it in deletedIds }
+
+            optimisticMessages.entries.removeAll { (_, candidate) -> isDeletedCopy(candidate) }
+            val remaining = ArrayList(eventsList)
+            val matchingEvents = remaining.filter { event ->
+                (event.model as? MessageModel)?.chatMessage?.let(::isDeletedCopy) == true
+            }
+            for (event in matchingEvents) {
+                updatePreviousAndNextMessages(remaining, event)
+                remaining.remove(event)
+                event.destroy()
+            }
+            eventsList = remaining
+            updateEvents.postValue(Event(true))
+            isEmpty.postValue(remaining.isEmpty())
+
+            LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, message.chatRoom).forEach { room ->
+                val storedCopies = room.getHistoryMessageEvents(0).mapNotNull { it.chatMessage }.filter(::isDeletedCopy)
+                storedCopies.forEach { room.deleteMessage(it) }
+            }
+            unreadMessagesCount.postValue(totalUnreadMessagesCount())
             messageDeletedEvent.postValue(Event(true))
-
-            updateRepliesUpTo(chatMessageModel.chatMessage)
+            updateRepliesUpTo(message)
         }
     }
 
@@ -627,10 +665,12 @@ class ConversationViewModel
                     Log.i("$TAG Marking chat room as read")
                     room.markAsRead()
                 }
+                CustomImdn.markQueueDeliveredMessagesRead(listOf(room))
                 CustomImdn.roomRead(room)
                 coreContext.notificationsManager.dismissChatNotification(room)
             }
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+            OfflineInboxRepository.markLocalFallbackItemsRead(chatRoom)
+            unreadMessagesCount.postValue(totalUnreadMessagesCount())
         }
     }
 
@@ -646,7 +686,7 @@ class ConversationViewModel
                 message.markAsRead()
                 CustomImdn.messageRead(message)
             }
-            unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+            unreadMessagesCount.postValue(totalUnreadMessagesCount())
         }
     }
 
@@ -664,8 +704,10 @@ class ConversationViewModel
                 if (CustomImdn.visibleUnreadMessagesCount(room) > 0) {
                     room.markAsRead()
                 }
+                CustomImdn.markQueueDeliveredMessagesRead(listOf(room))
                 CustomImdn.roomRead(room)
             }
+            OfflineInboxRepository.markLocalFallbackItemsRead(chatRoom)
 
             val visibleMessages = eventsList
                 .asSequence()
@@ -732,7 +774,11 @@ class ConversationViewModel
             val oldestEvent = eventsList.firstOrNull()?.eventLog
             val rooms = getSiblingChatRooms()
             val isBasicRoom = rooms.any { it.hasCapability(ChatRoom.Capabilities.Basic.toInt()) }
-            val maxSize = rooms.sumOf { it.historyEventsSize }.coerceAtLeast(chatRoom.historyEventsSize)
+            val maxSize = rooms.sumOf {
+                if (it.hasCapability(ChatRoom.Capabilities.Basic.toInt())) it.historySize else it.historyEventsSize
+            }.coerceAtLeast(
+                if (chatRoom.hasCapability(ChatRoom.Capabilities.Basic.toInt())) chatRoom.historySize else chatRoom.historyEventsSize
+            )
             val mask = HistoryFilter.ChatMessage.toInt() or HistoryFilter.InfoNoDevice.toInt()
             var requested = if (isBasicRoom) {
                 (eventsList.size + MESSAGES_PER_PAGE).coerceAtLeast(MESSAGES_PER_PAGE)
@@ -856,7 +902,13 @@ class ConversationViewModel
             if (key != null) {
                 optimisticMessages[key] = message
             }
-            Log.i("$TAG Scheduling sent message [${message.messageId}] history refresh")
+            // Do not wait for the asynchronous SQLite event callback before showing the
+            // message. That callback is particularly late on some Android 14 devices;
+            // if the user leaves the room first, the very first message looked lost.
+            // computeEvents() builds a safe EventLogModel directly from the ChatMessage
+            // for optimistic entries and never dereferences message.eventLog.
+            Log.i("$TAG Showing sent message [${message.messageId}] optimistically and scheduling history refresh")
+            computeEvents()
             refreshEventsFromHistorySoon()
         }
     }
@@ -880,6 +932,7 @@ class ConversationViewModel
 
         cachedTranslationConversationId = LinphoneUtils.getConversationId(chatRoom)
         cachedPeerUsername = chatRoom.peerAddress.username.orEmpty()
+        cachedLocalTranslationUsername = chatRoom.localAddress.username.orEmpty()
 
         computeComposingLabel()
 
@@ -890,7 +943,7 @@ class ConversationViewModel
 
         computeConversationInfo()
 
-        unreadMessagesCount.postValue(CustomImdn.visibleUnreadMessagesCount(getSiblingChatRooms()))
+        unreadMessagesCount.postValue(totalUnreadMessagesCount())
         computeEvents()
     }
 
@@ -967,7 +1020,11 @@ class ConversationViewModel
         var history = getDisplayHistoryEvents(MESSAGES_PER_PAGE)
         rooms.forEach { room ->
             room.unreadHistory.forEach { msg ->
-                if (msg != null && !CustomImdn.isHiddenControlMessage(msg)) {
+                if (
+                    msg != null &&
+                    !CustomImdn.isHiddenControlMessage(msg) &&
+                    !OfflineInboxRepository.isMessageDeletedLocally(room, msg)
+                ) {
                     val key = messageKey(msg)
                     if (key != null && !optimisticMessages.containsKey(key)) {
                         optimisticMessages[key] = msg
@@ -977,33 +1034,100 @@ class ConversationViewModel
         }
         var list = getEventsListFromHistory(history)
         // If trailing control/receipt events fill the entire first page (e.g. after reply/forward),
-        // widen to full history so valid chat messages aren't hidden as an empty screen.
-        if (list.isEmpty() && rooms.any { it.historyEventsSize > 0 }) {
+        // or if paginated fetch returned no displayable items, widen to full history.
+        if (list.isEmpty()) {
             list.forEach(EventLogModel::destroy)
             history = getDisplayHistoryEvents(0)
             list = getEventsListFromHistory(history)
         }
         val storedMessages = history.mapNotNull { it.chatMessage }
         val storedMessageKeys = storedMessages.mapNotNull(::messageKey).toSet()
-        val storedCustomIds = storedMessages.mapNotNull {
-            CustomImdn.id(it) ?: it.getCustomHeader("X-Diya-Message-ID")?.takeIf(String::isNotBlank)
-        }.toSet()
+        val storedCustomIds = storedMessages.mapNotNull(::extractCustomMessageId).toSet()
         val storedNativeIds = storedMessages.mapNotNull {
             it.messageId.takeIf(String::isNotBlank)
         }.toSet()
         val storedFingerprints = storedMessages.mapNotNull(::incomingFingerprint).toSet()
         optimisticMessages.entries.removeAll { (key, msg) ->
             key in storedMessageKeys ||
-                (CustomImdn.id(msg) ?: msg.getCustomHeader("X-Diya-Message-ID")) in storedCustomIds ||
+                extractCustomMessageId(msg) in storedCustomIds ||
                 msg.messageId.takeIf(String::isNotBlank) in storedNativeIds ||
-                incomingFingerprint(msg) in storedFingerprints
+                incomingFingerprint(msg) in storedFingerprints ||
+                OfflineInboxRepository.isMessageDeletedLocally(chatRoom, msg)
         }
         optimisticMessages.values.forEach { message ->
-            if (LinphoneUtils.isDisplayableChatMessage(message)) {
+            if (
+                LinphoneUtils.isDisplayableChatMessage(message) &&
+                !OfflineInboxRepository.isMessageDeletedLocally(chatRoom, message)
+            ) {
                 Log.w("$TAG Showing optimistic message [${message.messageId}] because it isn't in Core history yet")
                 list.add(createOptimisticSentMessageModel(message))
             }
         }
+        // Gather all IDs and fingerprints already present in history, optimistic messages, or current list
+        val allPresentCustomIds = (
+            storedCustomIds +
+                optimisticMessages.values.mapNotNull(::extractCustomMessageId) +
+                list.mapNotNull { (it.model as? MessageModel)?.chatMessage?.let(::extractCustomMessageId) }
+        ).toMutableSet()
+        val allPresentFingerprints = (
+            storedFingerprints +
+                optimisticMessages.values.mapNotNull(::incomingFingerprint) +
+                list.mapNotNull { (it.model as? MessageModel)?.chatMessage?.let(::incomingFingerprint) }
+        ).toMutableSet()
+
+        // Vivo Android 14 can dispatch the incoming callback yet reject the synthesized Basic
+        // event in Core SQLite. Render only durable queue rows not already in native history or optimistic list.
+        OfflineInboxRepository.localFallbackMessages(chatRoom, allPresentCustomIds).forEach { message ->
+            val customId = extractCustomMessageId(message)
+            val fingerprint = incomingFingerprint(message)
+            if (customId != null && customId in allPresentCustomIds) {
+                return@forEach
+            }
+            if (fingerprint != null && fingerprint in allPresentFingerprints) {
+                return@forEach
+            }
+            if (customId != null) allPresentCustomIds.add(customId)
+            if (fingerprint != null) allPresentFingerprints.add(fingerprint)
+            Log.w("$TAG Showing durable queue fallback [${CustomImdn.id(message)}] missing from Core history")
+            list.add(createOptimisticSentMessageModel(message))
+        }
+
+        // Deduplicate the combined list to ensure no duplicate bubbles are displayed
+        val deduplicatedList = arrayListOf<EventLogModel>()
+        val seenCustomIds = mutableSetOf<String>()
+        val seenNativeIds = mutableSetOf<String>()
+        val seenFingerprints = mutableSetOf<String>()
+        val seenKeys = mutableSetOf<String>()
+
+        for (eventModel in list) {
+            val message = (eventModel.model as? MessageModel)?.chatMessage
+            if (message == null) {
+                deduplicatedList.add(eventModel)
+                continue
+            }
+            val customId = extractCustomMessageId(message)
+            val nativeId = message.messageId.takeIf { it.isNotBlank() }
+            val fingerprint = incomingFingerprint(message)
+            val key = messageKey(message)
+
+            val isDuplicate = (customId != null && customId in seenCustomIds) ||
+                (nativeId != null && nativeId in seenNativeIds) ||
+                (fingerprint != null && fingerprint in seenFingerprints) ||
+                (key != null && key in seenKeys)
+
+            if (!isDuplicate) {
+                if (customId != null) seenCustomIds.add(customId)
+                if (nativeId != null) seenNativeIds.add(nativeId)
+                if (fingerprint != null) seenFingerprints.add(fingerprint)
+                if (key != null) seenKeys.add(key)
+                deduplicatedList.add(eventModel)
+            } else {
+                Log.w("$TAG Dropped duplicate message from UI: customId=$customId nativeId=$nativeId fingerprint=$fingerprint")
+                eventModel.destroy()
+            }
+        }
+        list = deduplicatedList
+
         list.sortWith(
             // Kotlin's sort is stable, so native order remains the tiebreaker when timestamps match.
             compareBy<EventLogModel> { (it.model as? MessageModel)?.timestampMillis ?: Long.MIN_VALUE }
@@ -1013,6 +1137,14 @@ class ConversationViewModel
         updateEvents.postValue(Event(true))
         isEmpty.postValue(eventsList.isEmpty())
         checkAndTranslateIncomingMessages()
+    }
+
+    @WorkerThread
+    private fun totalUnreadMessagesCount(): Int {
+        val rooms = getSiblingChatRooms()
+        val nativeUnreadIds = CustomImdn.visibleUnreadMessageIds(rooms)
+        return CustomImdn.visibleUnreadMessagesCount(rooms) +
+            OfflineInboxRepository.unreadStoredItemsCountForRoom(chatRoom, nativeUnreadIds)
     }
 
     /**
@@ -1183,6 +1315,7 @@ class ConversationViewModel
     private fun extractCustomMessageId(message: ChatMessage): String? =
         CustomImdn.id(message)
             ?: message.getCustomHeader("X-Diya-Message-ID")?.takeIf { it.isNotBlank() }
+            ?: if (!CustomImdn.isSemanticallyIncoming(message)) OfflineInboxRepository.outgoingHistoryId(message) else null
 
     @WorkerThread
     private fun messageKey(message: ChatMessage): String? {
@@ -1192,7 +1325,7 @@ class ConversationViewModel
         } else {
             message.messageId.takeIf { it.isNotBlank() }?.let { "native:$it" } ?: return null
         }
-        val isOutgoing = message.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(message)
+        val isOutgoing = !CustomImdn.isSemanticallyIncoming(message)
         return "$isOutgoing|${canonicalAddressKey(message.fromAddress)}|$identity"
     }
 
@@ -1252,7 +1385,13 @@ class ConversationViewModel
         }
         return incoming.filter { event ->
             val message = event.chatMessage
-            if (message != null && !LinphoneUtils.isDisplayableChatMessage(message)) {
+            if (
+                message != null &&
+                (
+                    !LinphoneUtils.isDisplayableChatMessage(message) ||
+                        OfflineInboxRepository.isMessageDeletedLocally(message.chatRoom, message)
+                    )
+            ) {
                 false
             } else {
                 val key = messageEventKey(event)
@@ -1274,12 +1413,19 @@ class ConversationViewModel
 
     @WorkerThread
     private fun incomingFingerprint(message: ChatMessage): String? {
-        if (message.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(message)) return null
+        if (!CustomImdn.isSemanticallyIncoming(message)) return null
         val body = message.utf8Text.orEmpty()
         val fileNames = message.contents.joinToString("|") { it.name.orEmpty() }
         if (body.isBlank() && fileNames.isBlank()) return null
+        // A queue copy is synthesized locally, so its native fromAddress may be B itself.
+        // Use the Basic room peer (A) for that copy, matching the sender of the direct SIP copy.
+        val sender = if (CustomImdn.isQueueDeliveredIncoming(message)) {
+            message.chatRoom.peerAddress
+        } else {
+            message.fromAddress
+        }
         val bucket5s = CustomImdn.timestampMillis(message) / 5_000L
-        return "${canonicalAddressKey(message.fromAddress)}|$bucket5s|$body|$fileNames"
+        return "${canonicalAddressKey(sender)}|$bucket5s|$body|$fileNames"
     }
 
     @WorkerThread
@@ -1343,8 +1489,8 @@ class ConversationViewModel
             val chatMessage = event.chatMessage!!
 
             // If they have the same direction, the same from address and were sent in a short timelapse, group them
-            (chatMessage.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(chatMessage)) ==
-                (previousChatMessage.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(previousChatMessage)) &&
+            CustomImdn.isSemanticallyIncoming(chatMessage) ==
+                CustomImdn.isSemanticallyIncoming(previousChatMessage) &&
                 chatMessage.fromAddress.weakEqual(previousChatMessage.fromAddress) &&
                 kotlin.math.abs(
                     CustomImdn.timestamp(chatMessage) - CustomImdn.timestamp(previousChatMessage)
@@ -1640,6 +1786,9 @@ class ConversationViewModel
     @Volatile
     private var cachedPeerUsername: String? = null
 
+    @Volatile
+    private var cachedLocalTranslationUsername: String? = null
+
     fun getTranslationConversationId(): String {
         return cachedTranslationConversationId ?: conversationId
     }
@@ -1665,8 +1814,10 @@ class ConversationViewModel
                 if (isChatRoomInitialized()) {
                     cachedTranslationConversationId = LinphoneUtils.getConversationId(chatRoom)
                     cachedPeerUsername = chatRoom.peerAddress.username.orEmpty()
+                    cachedLocalTranslationUsername = chatRoom.localAddress.username.orEmpty()
                 } else {
                     cachedPeerUsername = ""
+                    cachedLocalTranslationUsername = ""
                 }
                 viewModelScope.launch(Dispatchers.Main.immediate) {
                     checkAndTranslateIncomingMessages()
@@ -1675,7 +1826,8 @@ class ConversationViewModel
             return
         }
         val effectiveLang = resolveEffectiveLanguage()
-        val toNumber = peer.orEmpty()
+        // `to_number` is the receiving account whose translation preference is being used.
+        val toNumber = cachedLocalTranslationUsername.orEmpty()
 
         viewModelScope.launch(Dispatchers.IO) {
             val currentEvents = ArrayList(eventsList)
@@ -1694,7 +1846,8 @@ class ConversationViewModel
                     continue
                 }
 
-                val cached = com.naminfo.translation.TranslationRepository.getCachedTranslation(messageModel.id, effectiveLang)
+                val translationCacheId = messageModel.translationCacheId()
+                val cached = com.naminfo.translation.TranslationRepository.getCachedTranslation(translationCacheId, effectiveLang)
                 if (cached != null) {
                     coreContext.postOnMainThread {
                         messageModel.applyTranslation(cached, effectiveLang)
@@ -1704,7 +1857,7 @@ class ConversationViewModel
 
                 messageModel.isTranslating.postValue(true)
                 val result = com.naminfo.translation.TranslationRepository.translateMessage(
-                    messageModel.id,
+                    translationCacheId,
                     toNumber,
                     originalText,
                     effectiveLang

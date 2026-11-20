@@ -40,13 +40,14 @@ class ThirdPartySipAccountLoginViewModel
     constructor() : GenericViewModel() {
     companion object {
         private const val TAG = "[Third Party SIP Account Login ViewModel]"
-        private const val MOBION_API_DOMAIN = "mobionglobal.com"
+        private const val MOBION_API_DOMAIN = "mobionglobal.info"
     }
 
     private data class ApiAuthenticationResult(
         val success: Boolean,
         val failureReason: String? = null,
-        val profilePictureUrl: String? = null
+        val profilePictureUrl: String? = null,
+        val profileDisplayName: String? = null
     )
 
     data class ApiFailureDiagnostic(
@@ -61,6 +62,10 @@ class ThirdPartySipAccountLoginViewModel
     val apiDomain = MutableLiveData<String>()
 
     val sipDomain = MutableLiveData<String>()
+
+    val tCallDomain = MutableLiveData<String>()
+
+    val tChatDomain = MutableLiveData<String>()
 
     val displayName = MutableLiveData<String>()
 
@@ -196,6 +201,8 @@ class ThirdPartySipAccountLoginViewModel
                     corePreferences.defaultDomain
                 }
             )
+            tCallDomain.postValue(corePreferences.tCallDomain)
+            tChatDomain.postValue(corePreferences.tChatDomain)
 
             val defaultTransport = corePreferences.thirdPartySipAccountDefaultTransport.uppercase(
                 Locale.getDefault()
@@ -244,6 +251,13 @@ class ThirdPartySipAccountLoginViewModel
                 accountLoginErrorEvent.value = Event(error)
                 return@launch
             }
+
+            corePreferences.tCallDomain = tCallDomain.value.orEmpty()
+                .trim()
+                .ifBlank { "mobionglobal.org:8443" }
+            corePreferences.tChatDomain = tChatDomain.value.orEmpty()
+                .trim()
+                .ifBlank { "mobionglobal.info:8020" }
 
             coreContext.postOnCoreThread { core ->
                 core.loadConfigFromXml(corePreferences.thirdPartyDefaultValuesPath)
@@ -318,8 +332,15 @@ class ThirdPartySipAccountLoginViewModel
 
                 val accountParams = core.createAccountParams()
 
-                if (displayName.value.orEmpty().isNotEmpty()) {
-                    identityAddress.displayName = displayName.value.orEmpty().trim()
+                val requestedDisplayName = displayName.value.orEmpty().trim()
+                val authenticatedDisplayName = authentication.profileDisplayName.orEmpty().trim()
+                val resolvedDisplayName = requestedDisplayName.takeIf {
+                    !PhoneContactNumbers.isNumericPlaceholder(it, parsedUser)
+                } ?: authenticatedDisplayName.takeIf {
+                    !PhoneContactNumbers.isNumericPlaceholder(it, parsedUser)
+                }
+                if (resolvedDisplayName != null) {
+                    identityAddress.displayName = resolvedDisplayName
                 }
                 val profileSection = "saved_profile_${identityAddress.asStringUriOnly()}"
                 if (identityAddress.displayName.isNullOrBlank()) {
@@ -393,8 +414,14 @@ class ThirdPartySipAccountLoginViewModel
     private fun clearCachedSipAuthInfos(core: Core, username: String, domain: String) {
         if (username.isBlank() || domain.isBlank()) return
         val staleInfos = core.authInfoList.filter { authInfo ->
-            authInfo.username == username &&
-                (authInfo.domain.isNullOrBlank() || authInfo.domain.equals(domain, ignoreCase = true))
+            val isTargetUser = authInfo.username.equals(username, ignoreCase = true)
+            // thirdPartyDefaultValuesPath may load a generic AuthInfo (for example
+            // username "diya") for this registrar. Linphone then prefers that realm
+            // match over the freshly added phone-number credential after logout/login,
+            // submitting the wrong digest username and receiving SIP 403.
+            val isTargetRegistrar = authInfo.domain.equals(domain, ignoreCase = true) ||
+                authInfo.realm.equals(domain, ignoreCase = true)
+            isTargetUser || isTargetRegistrar
         }
         staleInfos.forEach { authInfo ->
             Log.i("$TAG Removing cached SIP auth info for [$username] realm=[${authInfo.realm}]")
@@ -505,6 +532,7 @@ class ThirdPartySipAccountLoginViewModel
                 ApiLogRepository.complete(requireNotNull(signinLogId), signinCode, responseText)
                 Log.i("$TAG Signin API succeeded with HTTP $signinCode")
                 var profilePictureUrl: String? = null
+                var profileDisplayName: String? = null
                 try {
                     val json = JSONObject(responseText)
                     val token = json.optString("token").ifEmpty { json.optString("accessToken") }
@@ -523,16 +551,20 @@ class ThirdPartySipAccountLoginViewModel
                     // directory now (rather than reusing a previous user's disk cache), save
                     // it for offline fallback, and use the same response for our profile photo.
                     val normalizedSubscriberId = PhoneContactNumbers.normalize(subscriberId)
-                    profilePictureUrl = MobionContactsService.fetchContacts(forceRefresh = true)
+                    val profile = MobionContactsService.fetchContacts(forceRefresh = true)
                         .firstOrNull { it.mobileNumber == normalizedSubscriberId }
-                        ?.profilePictureUrl
+                    profilePictureUrl = profile?.profilePictureUrl
+                    profileDisplayName = profile?.name?.takeIf {
+                        !PhoneContactNumbers.isNumericPlaceholder(it, normalizedSubscriberId)
+                    }
                 } catch (e: Exception) {
                     Log.w("$TAG Failed to parse signin response JSON: $e")
                 }
                 signinConn.disconnect()
                 return@withContext ApiAuthenticationResult(
                     success = true,
-                    profilePictureUrl = profilePictureUrl
+                    profilePictureUrl = profilePictureUrl,
+                    profileDisplayName = profileDisplayName
                 )
             } else {
                 val errorText = signinConn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()

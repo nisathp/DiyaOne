@@ -165,6 +165,25 @@ class LinphoneUtils {
             }
         }
 
+        /** Local history keeps its SIP identity even after its Account object is removed. */
+        @WorkerThread
+        fun isHistoryOwnedBy(localAddress: Address?, account: Account?): Boolean {
+            val identity = account?.params?.identityAddress ?: return false
+            val localUser = localAddress?.username?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+            val activeUser = identity.username?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+            if (identity.weakEqual(localAddress)) return true
+
+            // FreeSWITCH may save a phone login with an alias domain or an international prefix.
+            // Compare normalized phone usernames only. Named SIP users require an address match.
+            if (!localUser.all { it.isDigit() || it in "+-() " } ||
+                !activeUser.all { it.isDigit() || it in "+-() " }
+            ) {
+                return false
+            }
+            val phone = PhoneContactNumbers.normalize(localUser)
+            return phone.isNotEmpty() && phone == PhoneContactNumbers.normalize(activeUser)
+        }
+
         @WorkerThread
         fun applyInternationalPrefix(account: Account? = null): Boolean {
             return account?.params?.useInternationalPrefixForCallsAndChats
@@ -561,11 +580,13 @@ class LinphoneUtils {
                 ChatMessage.State.Displayed -> {
                     R.drawable.checks
                 }
-                ChatMessage.State.DeliveredToUser -> {
+                // "DeliveredToUser" confirms that the recipient device got the message,
+                // not that the recipient opened the conversation.  Keep it a single tick;
+                // only an IMDN "displayed" receipt is a read acknowledgement.
+                ChatMessage.State.Delivered,
+                ChatMessage.State.DeliveredToUser,
+                ChatMessage.State.FileTransferDone -> {
                     R.drawable.check
-                }
-                ChatMessage.State.Delivered, ChatMessage.State.FileTransferDone -> {
-                    R.drawable.envelope_simple
                 }
                 ChatMessage.State.NotDelivered, ChatMessage.State.FileTransferError -> {
                     R.drawable.warning_circle
@@ -687,6 +708,16 @@ class LinphoneUtils {
                             basicChatAddressesMatch(room.peerAddress, peer) &&
                             basicChatAddressesMatch(room.localAddress, local)
                     }?.let { return it }
+
+                    val localUser = normalizeOneToOneUserPart(local.username.orEmpty())
+                    val peerUser = normalizeOneToOneUserPart(peer.username.orEmpty())
+                    if (localUser.isNotBlank() && peerUser.isNotBlank()) {
+                        val targetPeerKey = "$localUser::$peerUser"
+                        core.chatRooms.firstOrNull { room ->
+                            room.hasCapability(ChatRoom.Capabilities.Basic.toInt()) &&
+                                getOneToOnePeerKey(room) == targetPeerKey
+                        }?.let { return it }
+                    }
 
                     // Empty Basic rooms are intentionally hidden from core.chatRooms until
                     // their first message is sent. A contact can therefore create a room and
@@ -857,6 +888,7 @@ class LinphoneUtils {
 
         @WorkerThread
         fun hasVisibleOrRecentMessages(chatRoom: ChatRoom): Boolean {
+            if (chatRoom.unreadMessagesCount > 0) return true
             val lastMsg = chatRoom.lastMessageInHistory
             if (isDisplayableChatMessage(lastMsg)) return true
             if (chatRoom.unreadHistory.any { isDisplayableChatMessage(it) }) return true

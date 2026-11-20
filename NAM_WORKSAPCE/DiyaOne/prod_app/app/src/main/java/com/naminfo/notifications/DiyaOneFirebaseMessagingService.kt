@@ -19,6 +19,7 @@ class DiyaOneFirebaseMessagingService : FirebaseMessaging() {
         val callId = data["call-id"] ?: data["callId"]
         val readyToken = data["ready-token"]
         val callerName = data["callerName"]?.takeIf { it.isNotBlank() } ?: "Incoming call"
+        val calleeNumber = data["calleeNumber"] ?: data["receiverNumber"] ?: data["recipient"] ?: data["toNumber"]
 
         Log.i(
             "$TAG FCM received at [${System.currentTimeMillis()}]. Type: [$type], Call-ID: [$callId], " +
@@ -27,18 +28,26 @@ class DiyaOneFirebaseMessagingService : FirebaseMessaging() {
         )
 
         if (type == "WAKE_CALL" || type == "INCOMING_CALL") {
-            Log.i("$TAG Received WAKE_CALL push for callId [$callId]. Setting pendingWakeCallId and refreshing registers")
-            if (!callId.isNullOrEmpty() && !readyToken.isNullOrEmpty()) {
-                // Show a user-visible alert before Core startup or SIP registration.
-                // It is replaced by the normal actionable CallStyle notification once
-                // FreeSWITCH delivers the matching SIP INVITE.
+            if (callId.isNullOrEmpty() || readyToken.isNullOrEmpty() || calleeNumber.isNullOrEmpty()) {
+                Log.w("$TAG Incoming-call FCM is missing callId or ready-token")
+                return
+            }
+            coreContext.postOnCoreThread {
+                val activeNumber = coreContext.core.defaultAccount?.params?.identityAddress?.username
+                    .orEmpty().filter(Char::isDigit)
+                val requestedNumber = calleeNumber.filter(Char::isDigit)
+                if (activeNumber.isBlank() || requestedNumber != activeNumber) {
+                    // An FCM registration token is device-scoped. If this phone has changed
+                    // account, an old server token mapping must never wake or register the
+                    // new account for a call addressed to the old one.
+                    Log.w("$TAG Ignoring WAKE_CALL [$callId] for [$requestedNumber]; active account is [$activeNumber]")
+                    return@postOnCoreThread
+                }
+                Log.i("$TAG Accepted WAKE_CALL [$callId] for active account [$activeNumber]")
                 coreContext.notificationsManager.showIncomingCallWakeNotification(callId, callerName)
                 coreContext.pendingWakeCallId = callId
                 coreContext.pendingWakeReadyToken = readyToken
-            } else {
-                Log.w("$TAG Incoming-call FCM is missing callId or ready-token")
-            }
-            coreContext.postOnCoreThread {
+                coreContext.pendingWakeRegistrationCallId = callId
                 if (coreContext.isCoreAvailable() && coreContext.core.globalState == org.linphone.core.GlobalState.On) {
                     Log.i("$TAG Refreshing SIP registration for call [$callId], beforeState=[${coreContext.core.defaultAccount?.state}]")
                     coreContext.core.refreshRegisters()
@@ -65,6 +74,15 @@ class DiyaOneFirebaseMessagingService : FirebaseMessaging() {
             Log.i("$TAG Received offline queue delivery acknowledgement for id [$messageId]")
             coreContext.postOnCoreThread {
                 CustomImdn.markDeliveredFromOfflineQueue(messageId, recipient)
+            }
+        }
+
+        if (type == "OFFLINE_QUEUE_READ" || type == "OFFLINE_QUEUE_DISPLAYED") {
+            val messageId = data["id"]
+            val recipient = data["recipient"]
+            Log.i("$TAG Received offline queue read acknowledgement for id [$messageId]")
+            coreContext.postOnCoreThread {
+                CustomImdn.markDisplayedFromOfflineQueue(messageId, recipient)
             }
         }
 

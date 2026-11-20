@@ -102,6 +102,10 @@ internal fun createOutgoingTextMessage(
         edit != null -> chatRoom.createReplacesMessage(edit)
         else -> chatRoom.createEmptyMessage()
     }
+    // A Basic SIP message can be accepted by the proxy before the Core has written its
+    // history event. Explicitly retaining it prevents the first outgoing bubble from
+    // disappearing when the conversation is closed immediately after Send.
+    message.setToBeStored(true)
     if (text.isNotEmpty() || replyTo != null) {
         if (replyTo != null) {
             addReplyMetadataAndFallback(message, replyTo, text)

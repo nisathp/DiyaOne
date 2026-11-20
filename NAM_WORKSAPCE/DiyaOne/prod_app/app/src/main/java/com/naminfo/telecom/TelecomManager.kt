@@ -95,12 +95,22 @@ class TelecomManager
             friend?.name ?: LinphoneUtils.getDisplayName(address)
         }
 
-        // Always set type to video (if enabled in Core) as it indicates that video is supported, not that it's being used at the time
+        // The Y29's Telecom forces a video endpoint to speaker while Linphone is already
+        // playing the audio call's ringback on the earpiece. Report the outgoing audio offer
+        // as audio on this model so both use the same route during ringing.
+        val isVivoY29OutgoingAudio = Build.MANUFACTURER.equals("vivo", ignoreCase = true) &&
+            Build.MODEL.equals("V2420", ignoreCase = true) && call.dir == Call.Dir.Outgoing &&
+            !call.params.isVideoEnabled
+
+        // Other devices keep using this type to advertise that video is supported.
         // https://developer.android.com/reference/kotlin/androidx/core/telecom/CallAttributesCompat#CALL_TYPE_VIDEO_CALL()
         val type = if (!call.core.isVideoEnabled) {
             CallAttributesCompat.CALL_TYPE_AUDIO_CALL
         } else if (Build.DEVICE in SAMSUNG_S23s) {
             Log.w("$TAG Samsung S23, S23 FE, S23+ or S23 Ultra detected [${Build.MODEL}], applying workaround to prevent no audio on earpiece issue")
+            CallAttributesCompat.CALL_TYPE_AUDIO_CALL
+        } else if (isVivoY29OutgoingAudio) {
+            Log.i("$TAG Registering Vivo Y29 outgoing audio call with Telecom to keep the earpiece ringback route")
             CallAttributesCompat.CALL_TYPE_AUDIO_CALL
         } else {
             CallAttributesCompat.CALL_TYPE_VIDEO_CALL

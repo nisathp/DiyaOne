@@ -36,7 +36,8 @@ class MatchedContactsViewModel : ViewModel() {
 
     private data class AccountIdentity(
         val uri: String,
-        val domain: String
+        val domain: String,
+        val normalizedNumber: String
     )
 
     private data class MatchedContact(
@@ -72,7 +73,8 @@ class MatchedContactsViewModel : ViewModel() {
 
                     AccountIdentity(
                         uri = address.asStringUriOnly(),
-                        domain = address.domain.orEmpty()
+                        domain = address.domain.orEmpty(),
+                        normalizedNumber = PhoneContactNumbers.normalize(address.username.orEmpty())
                     ).also {
                         check(it.domain.isNotBlank()) {
                             "Your account SIP domain is missing."
@@ -93,7 +95,10 @@ class MatchedContactsViewModel : ViewModel() {
                         // The server directory can contain subscribers that are
                         // not in this phone's address book. Never show those.
                         .filter { apiContact ->
-                            PhoneContactNumbers.normalize(apiContact.mobileNumber) in phoneContacts
+                            val number = PhoneContactNumbers.normalize(apiContact.mobileNumber)
+                            number.isNotEmpty() &&
+                                number != identity.normalizedNumber &&
+                                number in phoneContacts
                         }
                         .map { apiContact ->
                             val key = PhoneContactNumbers.normalize(apiContact.mobileNumber)

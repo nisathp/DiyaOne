@@ -11,6 +11,7 @@ import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.contacts.MobionContactsService
 import com.naminfo.core.ApiLogRepository
 import com.naminfo.core.MobionTokenRefresher
+import com.naminfo.core.OfflineInboxRepository
 import com.naminfo.R
 import com.naminfo.ui.main.contacts.viewmodel.ContactsListViewModel
 import org.linphone.core.Account
@@ -277,6 +278,11 @@ class AccountProfileViewModel
 
         viewModelScope.launch {
             try {
+                // A logout is an account switch boundary. Clear transient queue work and the
+                // old call alert, while retaining recipient-scoped history for this account's
+                // next login.
+                coreContext.clearPendingWakeCall()
+                OfflineInboxRepository.clearSessionData()
                 performLogout()
                 ContactsListViewModel.resetMobionSessionCache()
 
@@ -317,10 +323,7 @@ class AccountProfileViewModel
         }
     }
 
-    /**
-     * Keeps chat history but removes the local SIP credentials if FreeSWITCH doesn't answer
-     * an UNREGISTER. This is deliberately a fallback; the normal path waits for Cleared.
-     */
+    /** Removes local SIP credentials if FreeSWITCH doesn't answer UNREGISTER. */
     private suspend fun removeAccountLocallyAfterUnregisterFailure(): Unit =
         suspendCancellableCoroutine { continuation ->
             coreContext.postOnCoreThread { core ->
@@ -523,8 +526,9 @@ class AccountProfileViewModel
                                             pictureUri
                                         )
 
-                                        // Keep conversations and call history.
-                                        // Do not use removeAccountWithData().
+                                        // Keep native history. The conversation list filters
+                                        // rooms by local SIP identity, so another account
+                                        // cannot see it but this account can recover it later.
                                         if (cleanupCore.accountList.any { it == target }) {
                                             cleanupCore.removeAccount(target)
                                         }

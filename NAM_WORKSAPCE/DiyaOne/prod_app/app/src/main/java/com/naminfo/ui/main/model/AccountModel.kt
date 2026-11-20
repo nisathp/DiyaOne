@@ -8,7 +8,10 @@ import androidx.lifecycle.MutableLiveData
 import com.naminfo.DiyaOneApplication.Companion.coreContext
 import com.naminfo.R
 import com.naminfo.contacts.AbstractAvatarModel
+import com.naminfo.contacts.MobionContactsService
+import com.naminfo.contacts.PhoneContactNumbers
 import com.naminfo.core.CustomImdn
+import com.naminfo.core.OfflineInboxRepository
 import org.linphone.core.Account
 import org.linphone.core.AccountListenerStub
 import org.linphone.core.ChatMessage
@@ -32,6 +35,7 @@ class AccountModel
 ) : AbstractAvatarModel() {
     companion object {
         private const val TAG = "[Account Model]"
+        private const val UNREAD_HISTORY_SETTLE_DELAY_MS = 500L
     }
 
     val identity = account.params.identityAddress?.asStringUriOnly().orEmpty()
@@ -67,11 +71,8 @@ class AccountModel
             )
             update()
             if (state == RegistrationState.Ok) {
-                val phone = account.params.identityAddress?.username.orEmpty()
-                val prid = account.params.pushNotificationConfig?.prid.orEmpty()
-                if (phone.isNotEmpty() && prid.isNotEmpty()) {
-                    com.naminfo.DiyaOneApplication.coreContext.saveTokenToFirestoreBackend(phone, prid)
-                }
+                // CoreContext's registration callback owns FCM token persistence. A Linphone
+                // pn-prid is a SIP push identifier, not reliably this device's FCM token.
                 com.naminfo.DiyaOneApplication.coreContext.fetchAndSyncFcmToken()
 
                 if (com.naminfo.DiyaOneApplication.corePreferences.loginTime.isNullOrEmpty()) {
@@ -109,12 +110,19 @@ class AccountModel
     private val coreListener = object : CoreListenerStub() {
         @WorkerThread
         override fun onChatRoomRead(core: Core, chatRoom: ChatRoom) {
-            computeNotificationsCount()
+            scheduleNotificationsCount()
         }
 
         @WorkerThread
         override fun onMessageRetracted(core: Core, chatRoom: ChatRoom, message: ChatMessage) {
-            computeNotificationsCount()
+            scheduleNotificationsCount()
+        }
+
+        @WorkerThread
+        override fun onChatRoomStateChanged(core: Core, chatRoom: ChatRoom, state: ChatRoom.State?) {
+            if (state == ChatRoom.State.Deleted) {
+                scheduleNotificationsCount()
+            }
         }
 
         @WorkerThread
@@ -128,7 +136,19 @@ class AccountModel
             }.toTypedArray()
 
             if (visibleMessages.isEmpty()) return
-            computeNotificationsCount()
+            scheduleNotificationsCount()
+        }
+
+        @WorkerThread
+        override fun onCallStateChanged(
+            core: Core,
+            call: org.linphone.core.Call,
+            state: org.linphone.core.Call.State?,
+            message: String
+        ) {
+            if (state == org.linphone.core.Call.State.End || state == org.linphone.core.Call.State.Error) {
+                scheduleNotificationsCount()
+            }
         }
     }
 
@@ -227,10 +247,31 @@ class AccountModel
     @WorkerThread
     fun computeNotificationsCount() {
         if (!isAccountAlive()) return
-        val accountRooms = coreContext.core.chatRooms
-            .filter { LinphoneUtils.getAccountForAddress(it.localAddress) == account }
-        val unreadMessages = CustomImdn.visibleUnreadMessagesCount(accountRooms)
+        val accountRooms = if (coreContext.core.accountList.size <= 1) {
+            coreContext.core.chatRooms.asIterable()
+        } else {
+            coreContext.core.chatRooms.filter {
+                LinphoneUtils.getAccountForAddress(it.localAddress) == account
+            }
+        }
+        val nativeUnreadIds = CustomImdn.visibleUnreadMessageIds(accountRooms)
+        val unreadMessages = CustomImdn.visibleUnreadMessagesCount(accountRooms) +
+            OfflineInboxRepository.unreadStoredItemsCountForRecipient(
+                account.params.identityAddress?.username,
+                nativeUnreadIds
+            )
         notificationsCount.postValue(unreadMessages + account.missedCallsCount)
+    }
+
+    @WorkerThread
+    private fun scheduleNotificationsCount() {
+        // Native Core callbacks hold its lock. Recompute after the callback returns so
+        // unread-history inspection cannot race with navigation or message delivery.
+        coreContext.postOnCoreThread { computeNotificationsCount() }
+        coreContext.postOnCoreThreadDelayed(
+            { computeNotificationsCount() },
+            UNREAD_HISTORY_SETTLE_DELAY_MS
+        )
     }
 
     @WorkerThread
@@ -314,12 +355,18 @@ class AccountModel
         trust.postValue(SecurityLevel.EndToEndEncryptedAndVerified)
         showTrust.postValue(isEndToEndEncryptionMandatory())
 
-        // The drawer is the signed-in user's profile area. Prefer the label saved for this
-        // number in the handset/SIM contacts, rather than the SIP profile display name. If the
-        // phone is not saved locally, show its number so the account remains identifiable.
+        // The drawer is the signed-in user's profile area. Some OEMs (notably Vivo) don't
+        // expose the user's own SIM number as a native contact, so do not make the profile name
+        // depend on the handset address book. Use the signed-in SIP/profile label and the cached
+        // authenticated directory before falling back to the number.
         val identityAddress = account.params.identityAddress
         val phoneNumber = identityAddress?.username.orEmpty()
-        val name = identityAddress?.let(coreContext.contactsManager::findSavedNativeName)
+        val profileName = identityAddress?.displayName?.trim()?.takeIf {
+            it.isNotBlank() && !PhoneContactNumbers.isNumericPlaceholder(it, phoneNumber)
+        }
+        val name = profileName
+            ?: MobionContactsService.findCachedContactName(phoneNumber)
+            ?: identityAddress?.let(coreContext.contactsManager::findSavedNativeName)
             ?: phoneNumber.ifBlank { LinphoneUtils.getDisplayName(identityAddress) }
         displayName.postValue(name)
 

@@ -60,6 +60,10 @@ class HistoryListAdapter :
         MutableLiveData()
     }
 
+    val contactClickedEvent: MutableLiveData<Event<CallLogModel>> by lazy {
+        MutableLiveData()
+    }
+
     val callFriendClickedEvent: MutableLiveData<Event<Friend>> by lazy {
         MutableLiveData()
     }
@@ -138,7 +142,7 @@ class HistoryListAdapter :
                     setOnLongClickListener {
                         val currentModel = model
                         if (currentModel != null) {
-                            itemLongPressedSelectionEvent.value = Event(currentModel)
+                            callLogLongClickedEvent.value = Event(currentModel)
                             true
                         } else {
                             false
@@ -151,6 +155,11 @@ class HistoryListAdapter :
                     setOnAddContactClickListener {
                         model?.takeIf { it.canAddToContacts }?.let {
                             addContactClickedEvent.value = Event(it)
+                        }
+                    }
+                    setOnContactClickListener {
+                        model?.takeIf { it.friendExists && !it.friendRefKey.isNullOrEmpty() }?.let {
+                            contactClickedEvent.value = Event(it)
                         }
                     }
                 }

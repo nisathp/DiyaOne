@@ -8,6 +8,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.linphone.core.tools.Log
 import java.io.BufferedReader
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
@@ -15,7 +16,7 @@ import java.util.concurrent.Executors as JavaExecutors
 
 object TranslationRepository {
     private const val TAG = "[Translation Repository]"
-    private const val API_URL = "http://203.95.216.68:8020/translate"
+    private const val DEFAULT_TCHAT_DOMAIN = "https://mobionglobal.info:8020/translate"
     private const val API_KEY = "qhyvM1rr4RE2vqnvAAdfoDDC9Wlbylv-XXiUYF0HaZE"
 
     private val inFlightRequests = ConcurrentHashMap.newKeySet<String>()
@@ -70,35 +71,67 @@ object TranslationRepository {
             }
         }
 
-        var logId: Long? = null
         try {
-            Log.i("$TAG Calling Translation API for messageId [$messageId], targetLang [${targetLanguage.apiValue}]")
+            var lastFailure: Throwable? = null
+            repeat(3) { attempt ->
+                val result = requestTranslation(cacheKey, messageId, toNumber, originalText, targetLanguage)
+                if (result.isSuccess) return@withContext result
+
+                lastFailure = result.exceptionOrNull()
+                // A reset/timeout is transient on the translator's HTTP endpoint. Retrying only
+                // transport and 5xx failures avoids retrying invalid credentials or malformed data.
+                val retryable = lastFailure is IOException ||
+                    (lastFailure as? TranslationHttpException)?.statusCode?.let { it in 500..599 } == true
+                if (!retryable || attempt == 2) return@withContext result
+                Log.w("$TAG Translation attempt ${attempt + 1} failed for [$messageId], retrying", lastFailure)
+                delay(350L * (attempt + 1))
+            }
+            Result.failure(lastFailure ?: IllegalStateException("Translation failed"))
+        } finally {
+            inFlightRequests.remove(cacheKey)
+        }
+    }
+
+    private fun requestTranslation(
+        cacheKey: String,
+        messageId: String,
+        toNumber: String,
+        originalText: String,
+        targetLanguage: ChatTranslationLanguage
+    ): Result<String> {
+        var logId: Long? = null
+        var connection: HttpURLConnection? = null
+        return try {
+            // The translation API accepts the human-readable language name (for example "Tamil").
+            val languageParam = targetLanguage.label
+            Log.i("$TAG Calling Translation API for messageId [$messageId], targetLang [$languageParam]")
             val requestJson = JSONObject().apply {
                 put("to_number", toNumber)
-                put("language", targetLanguage.apiValue)
+                put("language", languageParam)
                 put("message", originalText)
             }
-            logId = ApiLogRepository.begin("POST", API_URL, requestJson.toString())
+            val apiUrl = translationApiUrl()
+            logId = ApiLogRepository.begin("POST", apiUrl, requestJson.toString())
 
-            val url = URL(API_URL)
-            val connection = (url.openConnection() as HttpURLConnection).apply {
+            val url = URL(apiUrl)
+            connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
-                setRequestProperty("x-api-key", API_KEY)
-                setRequestProperty("accept", "*/*")
+                setRequestProperty("X-API-Key", API_KEY)
+                setRequestProperty("accept", "application/json, */*")
                 setRequestProperty("Content-Type", "application/json; charset=UTF-8")
                 connectTimeout = 10000
                 readTimeout = 10000
                 doOutput = true
             }
 
-            connection.outputStream.use { os ->
+            connection!!.outputStream.use { os ->
                 val input = requestJson.toString().toByteArray(Charsets.UTF_8)
                 os.write(input, 0, input.size)
             }
 
-            val responseCode = connection.responseCode
+            val responseCode = connection!!.responseCode
             if (responseCode == HttpURLConnection.HTTP_OK) {
-                val responseText = connection.inputStream.bufferedReader().use(BufferedReader::readText)
+                val responseText = connection!!.inputStream.bufferedReader().use(BufferedReader::readText)
                 ApiLogRepository.complete(requireNotNull(logId), responseCode, responseText)
                 val responseJson = JSONObject(responseText)
                 val translatedMessage = if (responseJson.has("translated_message") && !responseJson.isNull("translated_message")) {
@@ -111,24 +144,51 @@ object TranslationRepository {
                     Log.i("$TAG Translation successful for messageId [$messageId]")
                     memoryCache[cacheKey] = translatedMessage
                     corePreferences.setPersistedTranslation(cacheKey, translatedMessage)
-                    return@withContext Result.success(translatedMessage)
+                    return Result.success(translatedMessage)
                 } else {
                     Log.e("$TAG 'translated_message' field missing in API response: $responseText")
-                    return@withContext Result.failure(IllegalStateException("Empty translated_message in response"))
+                    return Result.failure(IllegalStateException("Empty translated_message in response"))
                 }
             } else {
-                val errorStream = connection.errorStream?.bufferedReader()?.use(BufferedReader::readText)
+                val errorStream = connection!!.errorStream?.bufferedReader()?.use(BufferedReader::readText)
                 ApiLogRepository.complete(requireNotNull(logId), responseCode, errorStream)
-                Log.e("$TAG API HTTP Error [$responseCode]: $errorStream")
-                return@withContext Result.failure(IllegalStateException("HTTP $responseCode: $errorStream"))
+                val friendlyError = when (responseCode) {
+                    401 -> "HTTP 401 Unauthorized: Invalid or missing X-API-Key"
+                    502 -> "HTTP 502 Bad Gateway: Translation service failed"
+                    else -> "HTTP $responseCode: $errorStream"
+                }
+                Log.e("$TAG API HTTP Error [$responseCode]: $friendlyError")
+                return Result.failure(TranslationHttpException(responseCode, friendlyError))
             }
         } catch (e: Exception) {
             // A request may fail before a connection response is available.
-            ApiLogRepository.fail(logId ?: ApiLogRepository.begin("POST", API_URL), e)
+            ApiLogRepository.fail(logId ?: ApiLogRepository.begin("POST", translationApiUrl()), e)
             Log.e("$TAG Exception during translation: $e")
-            return@withContext Result.failure(e)
+            return Result.failure(e)
         } finally {
-            inFlightRequests.remove(cacheKey)
+            connection?.disconnect()
         }
+    }
+
+    private class TranslationHttpException(val statusCode: Int, message: String) : IOException(message)
+
+    private fun translationApiUrl(): String {
+        val configured = corePreferences.tChatDomain.trim()
+        if (configured.isBlank()) return DEFAULT_TCHAT_DOMAIN
+
+        val host = configured.removePrefix("http://").removePrefix("https://")
+            .substringBefore('/').substringBefore(':')
+        // A bare IPv4 T Chat endpoint is HTTP. Treating it as HTTPS produces an Android TLS
+        // handshake failure even when the translator is responding normally.
+        val defaultScheme = if (host.matches(Regex("\\d{1,3}(?:\\.\\d{1,3}){3}"))) "http" else "https"
+        val base = if (configured.startsWith("http://", ignoreCase = true) ||
+            configured.startsWith("https://", ignoreCase = true)
+        ) {
+            configured
+        } else {
+            "$defaultScheme://$configured"
+        }
+        val normalized = base.trimEnd('/')
+        return if (normalized.endsWith("/translate", ignoreCase = true)) normalized else "$normalized/translate"
     }
 }

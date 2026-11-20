@@ -13,6 +13,7 @@ import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.core.CustomComposing
 import com.naminfo.core.CustomImdn
+import com.naminfo.core.OfflineInboxRepository
 import com.naminfo.translation.ChatTranslationLanguage
 import com.naminfo.translation.TranslationRepository
 import com.naminfo.ui.main.chat.ChatDraftRepository
@@ -37,12 +38,14 @@ import com.naminfo.utils.FileUtils
 import com.naminfo.utils.LinphoneUtils
 import com.naminfo.utils.ShortcutUtils
 import com.naminfo.utils.TimestampUtils
+import org.json.JSONArray
 
 class ConversationModel
     @WorkerThread
     constructor(val chatRoom: ChatRoom) {
     companion object {
         private const val TAG = "[Conversation Model]"
+        private const val UNREAD_HISTORY_SETTLE_DELAY_MS = 500L
     }
 
     val id = LinphoneUtils.getConversationId(chatRoom)
@@ -168,7 +171,9 @@ class ConversationModel
 
         @WorkerThread
         override fun onNewEvent(chatRoom: ChatRoom, eventLog: EventLog) {
+            updateLastMessage()
             updateLastUpdatedTime()
+            refreshUnreadCountAfterCoreCallback(chatRoom)
         }
 
         @WorkerThread
@@ -239,18 +244,25 @@ class ConversationModel
      * query can form a Core-lock/ChatRoom-lock deadlock and trigger an ANR.
      */
     @WorkerThread
-    private fun unreadCountForConversation(): Int =
-        CustomImdn.visibleUnreadMessagesCount(
-            LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
-        )
+    private fun unreadCountForConversation(): Int {
+        val rooms = LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
+        val nativeUnreadIds = CustomImdn.visibleUnreadMessageIds(rooms)
+        return CustomImdn.visibleUnreadMessagesCount(rooms) +
+            OfflineInboxRepository.unreadStoredItemsCountForRoom(chatRoom, nativeUnreadIds)
+    }
 
     @WorkerThread
     private fun refreshUnreadCountAfterCoreCallback(room: ChatRoom) {
-        coreContext.postOnCoreThread {
+        val refreshUnreadCount = {
             if (room == chatRoom || LinphoneUtils.areSameOneToOnePeer(room, chatRoom)) {
                 unreadMessageCount.postValue(unreadCountForConversation())
             }
         }
+        coreContext.postOnCoreThread { refreshUnreadCount() }
+        coreContext.postOnCoreThreadDelayed(
+            { refreshUnreadCount() },
+            UNREAD_HISTORY_SETTLE_DELAY_MS
+        )
     }
 
     init {
@@ -326,6 +338,8 @@ class ConversationModel
             unreadRooms.forEach { room ->
                 room.markAsRead()
             }
+            CustomImdn.markQueueDeliveredMessagesRead(unreadRooms)
+            OfflineInboxRepository.markLocalFallbackItemsRead(chatRoom)
             unreadMessageCount.postValue(unreadCountForConversation())
             Log.i("$TAG Conversation [$id] has been marked as read")
         }
@@ -409,7 +423,7 @@ class ConversationModel
 
     @WorkerThread
     private fun updateLastMessageStatus(message: ChatMessage) {
-        val isOutgoing = message.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(message)
+        val isOutgoing = !CustomImdn.isSemanticallyIncoming(message)
 
         if (isGroup && !isOutgoing) {
             val fromAddress = message.fromAddress
@@ -426,7 +440,10 @@ class ConversationModel
         val textContent = message.contents.find { it.isText && !it.isFile }?.utf8Text?.trim().orEmpty()
         val visibleText = LinphoneUtils.stripMessageEnvelopes(textContent)
         val hasEnvelope = visibleText != textContent
-        val rawSpannable = if (hasEnvelope && visibleText.isNotEmpty() && !LinphoneUtils.isFileTransferMetadata(visibleText)) {
+        val queuedMedia = OfflineInboxRepository.queuedMedia(message).firstOrNull()
+        val rawSpannable = if (queuedMedia != null && (visibleText.isBlank() || LinphoneUtils.isFileTransferMetadata(visibleText))) {
+            SpannableStringBuilder(mediaPreviewLabel(queuedMedia.name, queuedMedia.mimeType)).toSpannable()
+        } else if (hasEnvelope && visibleText.isNotEmpty() && !LinphoneUtils.isFileTransferMetadata(visibleText)) {
             SpannableStringBuilder(visibleText).toSpannable()
         } else {
             LinphoneUtils.getFormattedTextDescribingMessage(message)
@@ -447,10 +464,10 @@ class ConversationModel
                 lastMessageText.postValue(SpannableStringBuilder(cachedTranslation).toSpannable())
             } else {
                 lastMessageText.postValue(rawSpannable)
-                val peerUsername = chatRoom.peerAddress.username ?: ""
+                val recipientUsername = chatRoom.localAddress.username ?: ""
                 if (visibleText.isNotBlank()) {
                     CoroutineScope(Dispatchers.IO).launch {
-                        val result = TranslationRepository.translateMessage(messageId, peerUsername, visibleText, effectiveLang)
+                        val result = TranslationRepository.translateMessage(messageId, recipientUsername, visibleText, effectiveLang)
                         if (result.isSuccess) {
                             val translated = result.getOrNull()
                             if (!translated.isNullOrBlank()) {
@@ -483,6 +500,9 @@ class ConversationModel
                 icon = getIconFromContent(content)
                 if (icon != 0) break
             }
+            if (icon == 0 && queuedMedia != null) {
+                icon = getIconFromMediaMimeType(queuedMedia.mimeType)
+            }
             lastMessageContentIcon.postValue(icon)
         }
     }
@@ -492,17 +512,32 @@ class ConversationModel
         detachLastMessageListener()
         lastMessage = null
 
-        val message = LinphoneUtils.findLatestVisibleMessage(
-            LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
+        val message = latestVisibleMessageExcludingLocalDeletes()
+        val fallback = OfflineInboxRepository.localFallbackItems(chatRoom, nativeMessageIds())
+            .maxByOrNull { it.timestampMillis }
+        val useFallback = fallback != null && (
+            message == null ||
+            fallback.timestampMillis > CustomImdn.timestampMillis(message)
         )
         if (message == null || CustomImdn.key(message) != customReceiptState?.first) {
             customReceiptState = null
         }
-        if (message != null) {
+        if (useFallback) {
+            lastMessageTextSender.postValue("")
+            lastMessageDeliveryIcon.postValue(0)
+            lastMessageContentIcon.postValue(fallbackMediaIcon(fallback!!.mediaJson))
+            lastMessageText.postValue(
+                SpannableStringBuilder(
+                    fallbackPreviewLabel(fallback.text, fallback.mediaJson)
+                ).toSpannable()
+            )
+            isLastMessageOutgoing.postValue(fallback.isOutgoing)
+            dateTime.postValue(humanReadableTimestamp(fallback.timestampMillis))
+        } else if (message != null) {
             lastMessage = message
             updateLastMessageStatus(message)
 
-            if (message.isOutgoing && !CustomImdn.isQueueDeliveredIncoming(message) && message.state != ChatMessage.State.Displayed) {
+            if (!CustomImdn.isSemanticallyIncoming(message) && message.state != ChatMessage.State.Displayed) {
                 message.addListener(chatMessageListener)
                 hasLastMessageListener = true
             } else if (message.contents.find { it.isFileTransfer } != null) {
@@ -510,19 +545,7 @@ class ConversationModel
                 hasLastMessageListener = true
             }
 
-            val timestamp = CustomImdn.timestampMillis(message) / 1000L
-            val humanReadableTimestamp = when {
-                TimestampUtils.isToday(timestamp) -> {
-                    TimestampUtils.timeToString(timestamp)
-                }
-                TimestampUtils.isYesterday(timestamp) -> {
-                    AppUtils.getString(R.string.yesterday)
-                }
-                else -> {
-                    TimestampUtils.toString(timestamp, onlyDate = true)
-                }
-            }
-            dateTime.postValue(humanReadableTimestamp)
+            dateTime.postValue(humanReadableTimestamp(CustomImdn.timestampMillis(message)))
         } else {
             lastMessage = null
             lastMessageTextSender.postValue("")
@@ -559,11 +582,87 @@ class ConversationModel
         }
     }
 
+    private fun fallbackPreviewLabel(text: String, mediaJson: String?): String {
+        val visibleText = LinphoneUtils.stripMessageEnvelopes(text).trim()
+        if (visibleText.isNotBlank() && !LinphoneUtils.isFileTransferMetadata(visibleText)) return visibleText
+        val media = mediaJson?.let { runCatching { JSONArray(it).optJSONObject(0) }.getOrNull() }
+        return if (media != null) {
+            mediaPreviewLabel(media.optString("name", "Attachment"), media.optString("mimeType"))
+        } else {
+            ""
+        }
+    }
+
+    private fun fallbackMediaIcon(mediaJson: String?): Int {
+        val media = mediaJson?.let { runCatching { JSONArray(it).optJSONObject(0) }.getOrNull() }
+        return media?.let { getIconFromMediaMimeType(it.optString("mimeType")) } ?: 0
+    }
+
+    private fun mediaPreviewLabel(name: String, mimeType: String): String =
+        if (mimeType.startsWith("audio/", ignoreCase = true) && mimeType.contains("voice-recording", ignoreCase = true)) {
+            "Voice message"
+        } else {
+            name.ifBlank { "Attachment" }
+        }
+
+    private fun getIconFromMediaMimeType(mimeType: String): Int = when {
+        mimeType.startsWith("audio/", ignoreCase = true) && mimeType.contains("voice-recording", ignoreCase = true) -> R.drawable.waveform
+        mimeType.startsWith("image/", ignoreCase = true) -> R.drawable.file_image
+        mimeType.startsWith("video/", ignoreCase = true) -> R.drawable.file_video
+        mimeType.startsWith("audio/", ignoreCase = true) -> R.drawable.file_audio
+        else -> R.drawable.file
+    }
+
     @WorkerThread
     private fun updateLastUpdatedTime() {
-        val timestamp = LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
+        val nativeTimestamp = LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
             .maxOfOrNull { it.lastUpdateTime } ?: chatRoom.lastUpdateTime
-        lastUpdateTime.postValue(timestamp)
+        val fallbackTimestamp = OfflineInboxRepository.localFallbackItems(chatRoom, nativeMessageIds())
+            .maxOfOrNull { it.timestampMillis } ?: 0L
+        lastUpdateTime.postValue(maxOf(nativeTimestamp, fallbackTimestamp))
+    }
+
+    /**
+     * A locally deleted Basic-SIP event can be returned again by Core after a fragment restart.
+     * Never let that stale event become the Chats-list preview/date while the conversation view
+     * correctly hides it through the same tombstone store.
+     */
+    @WorkerThread
+    private fun latestVisibleMessageExcludingLocalDeletes(): ChatMessage? =
+        LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
+            .asSequence()
+            .flatMap { room ->
+                val events = if (room.hasCapability(Capabilities.Basic.toInt())) {
+                    room.getHistoryMessageEvents(0)
+                } else {
+                    room.getHistoryEvents(0)
+                }
+                events.asSequence().mapNotNull { it.chatMessage }
+            }
+            .filter { message ->
+                LinphoneUtils.isDisplayableChatMessage(message) &&
+                    !CustomImdn.isHiddenControlMessage(message) &&
+                    !OfflineInboxRepository.isMessageDeletedLocally(message.chatRoom, message)
+            }
+            .maxByOrNull(CustomImdn::timestampMillis)
+
+    @WorkerThread
+    private fun nativeMessageIds(): Set<String> =
+        LinphoneUtils.findSiblingOneToOneChatRooms(coreContext.core, chatRoom)
+            .asSequence()
+            .flatMap { it.getHistoryMessageEvents(0).asSequence() }
+            .mapNotNull { it.chatMessage }
+            .mapNotNull { CustomImdn.id(it) ?: it.getCustomHeader("X-Diya-Message-ID") }
+            .toSet()
+
+    @WorkerThread
+    private fun humanReadableTimestamp(timestampMillis: Long): String {
+        val timestamp = timestampMillis / 1000L
+        return when {
+            TimestampUtils.isToday(timestamp) -> TimestampUtils.timeToString(timestamp)
+            TimestampUtils.isYesterday(timestamp) -> AppUtils.getString(R.string.yesterday)
+            else -> TimestampUtils.toString(timestamp, onlyDate = true)
+        }
     }
 
     @WorkerThread

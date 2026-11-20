@@ -1,6 +1,7 @@
 package com.naminfo.core
 
 import android.util.Log
+import org.json.JSONObject
 import java.util.ArrayDeque
 
 /** Bridges native Linphone file-transfer diagnostics into the API Logs screen. */
@@ -11,6 +12,7 @@ object FileTransferApiLogger {
     private val xmlFileName = Regex("<file-name>([^<]+)</file-name>")
     private val xmlFileSize = Regex("<file-size>(\\d+)</file-size>")
     private val xmlContentType = Regex("<content-type>([^<]+)</content-type>")
+    private val xmlDownloadUrl = Regex("<data\\s+url=\\\"([^\\\"]+)\\\"")
     private val lock = Any()
 
     private data class PendingUpload(
@@ -19,6 +21,10 @@ object FileTransferApiLogger {
     )
 
     private val pendingUploads = ArrayDeque<PendingUpload>()
+    // Linphone's FileTransferDone callback may expose only the original local Content and not
+    // the finalized FT-HTTP XML. Keep the signed URL in memory only, keyed by unique file name,
+    // so the offline queue can retain the attachment metadata without writing a token to logs.
+    private val uploadedMediaByFileName = linkedMapOf<String, JSONObject>()
 
     fun beginUpload(url: String, fileName: String, fileSize: Long): Long {
         val request = "$REQUEST_DESCRIPTION; file=$fileName; size=$fileSize bytes"
@@ -45,6 +51,20 @@ object FileTransferApiLogger {
             val fileSize = xmlFileSize.find(line)?.groupValues?.getOrNull(1) ?: "unknown"
             val contentType = xmlContentType.find(line)?.groupValues?.getOrNull(1) ?: "unknown"
             val hasDownloadUrl = line.contains("<data ") && line.contains("url=")
+            val downloadUrl = xmlDownloadUrl.find(line)?.groupValues?.getOrNull(1)
+            if (downloadUrl != null && fileName != "unknown") {
+                synchronized(lock) {
+                    uploadedMediaByFileName[fileName] = JSONObject().apply {
+                        put("url", downloadUrl)
+                        put("name", fileName)
+                        put("mimeType", contentType)
+                        put("size", fileSize.toLongOrNull() ?: 0L)
+                    }
+                    while (uploadedMediaByFileName.size > 40) {
+                        uploadedMediaByFileName.remove(uploadedMediaByFileName.keys.first())
+                    }
+                }
+            }
             Log.i(
                 TAG,
                 "HFT response XML received: file=$fileName size=$fileSize type=$contentType downloadUrl=$hasDownloadUrl"
@@ -78,6 +98,11 @@ object FileTransferApiLogger {
 
     fun completeUpload(id: Long) {
         if (remove(id)) ApiLogRepository.complete(id, 200, "File transfer completed")
+    }
+
+    /** Returns an in-memory copy of the HFT metadata captured from the native response. */
+    fun uploadedMedia(fileName: String): JSONObject? = synchronized(lock) {
+        uploadedMediaByFileName[fileName]?.let { JSONObject(it.toString()) }
     }
 
     fun failUpload(id: Long, reason: String) {

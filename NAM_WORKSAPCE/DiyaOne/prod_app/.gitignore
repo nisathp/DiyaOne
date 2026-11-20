@@ -36,6 +36,7 @@ hs_err_pid*.log
 
 # Local recovery / backups
 recovery-backups/
+/outputs/baselines/
 
 # OS
 .DS_Store

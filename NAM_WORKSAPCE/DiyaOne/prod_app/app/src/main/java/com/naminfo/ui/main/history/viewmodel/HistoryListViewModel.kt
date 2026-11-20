@@ -142,9 +142,9 @@ class HistoryListViewModel
     @UiThread
     fun removeAllCallLogs() {
         coreContext.postOnCoreThread { core ->
-            val account = LinphoneUtils.getDefaultAccount()
-            account?.clearCallLogs()
-            core.clearCallLogs()
+            val account = core.defaultAccount ?: return@postOnCoreThread
+            core.callLogs.filter { LinphoneUtils.isHistoryOwnedBy(it.localAddress, account) }
+                .forEach { core.removeCallLog(it) }
 
             historyDeletedEvent.postValue(Event(true))
             computeCallLogsList(currentFilter)
@@ -219,12 +219,13 @@ class HistoryListViewModel
         val selectedModels = allDisplayedModels.filter { selectedCallLogIds.contains(it.id.orEmpty()) }
 
         coreContext.postOnCoreThread { core ->
-            for (model in selectedModels) {
-                val logsToRemove = core.callLogs.filter { it.remoteAddress.weakEqual(model.address) }
-                for (log in logsToRemove) {
-                    core.removeCallLog(log)
-                }
-            }
+            val account = core.defaultAccount ?: return@postOnCoreThread
+            val selectedPeers = selectedModels.filter { LinphoneUtils.isHistoryOwnedBy(it.localAddress, account) }
+                .map { it.address }
+            core.callLogs.filter { log ->
+                LinphoneUtils.isHistoryOwnedBy(log.localAddress, account) &&
+                    selectedPeers.any { log.remoteAddress.weakEqual(it) }
+            }.forEach { core.removeCallLog(it) }
 
             coreContext.postOnMainThread {
                 exitSelectionMode()
@@ -242,8 +243,16 @@ class HistoryListViewModel
 
     @WorkerThread
     private fun computeCallLogsList(filter: String) {
-        if (coreContext.core.globalState != GlobalState.On) {
+        val core = coreContext.core
+        if (core.globalState != GlobalState.On) {
             Log.e("$TAG Core isn't ON yet, do not attempt to get calls history")
+            return
+        }
+        val account = core.defaultAccount
+        if (account == null) {
+            tempCallLogsList.clear()
+            callLogs.postValue(arrayListOf())
+            fetchInProgress.postValue(false)
             return
         }
 
@@ -263,12 +272,7 @@ class HistoryListViewModel
 
         val list = arrayListOf<CallLogModelWrapper>()
 
-        val account = LinphoneUtils.getDefaultAccount()
-        // History remains on this device after sign-out; only show this account's calls.
-        val localAddress = account?.params?.identityAddress
-        val logs = coreContext.core.callLogs.filter {
-            localAddress?.weakEqual(it.localAddress) == true
-        }
+        val logs = core.callLogs.filter { LinphoneUtils.isHistoryOwnedBy(it.localAddress, account) }
 
         val mode = selectedHistoryFilterMode.value ?: CallHistoryFilterMode.ALL
         val filteredLogs = logs.filter { log ->
@@ -324,13 +328,15 @@ class HistoryListViewModel
 
     @WorkerThread
     private fun processMagicSearchResults(results: Array<SearchResult>) {
+        val account = coreContext.core.defaultAccount ?: return
+        if (currentFilter.isEmpty()) return
         Log.i("$TAG Processing [${results.size}] results")
 
         val contactsList = arrayListOf<CallLogModelWrapper>()
         val suggestionsList = arrayListOf<CallLogModelWrapper>()
         val requestList = arrayListOf<CallLogModelWrapper>()
 
-        val defaultAccountDomain = LinphoneUtils.getDefaultAccount()?.params?.domain
+        val defaultAccountDomain = account.params.domain
         for (result in results) {
             val address = result.address
             val friend = result.friend
@@ -384,7 +390,7 @@ class HistoryListViewModel
         }
 
         val list = arrayListOf<CallLogModelWrapper>()
-        list.addAll(tempCallLogsList)
+        list.addAll(tempCallLogsList.filter { LinphoneUtils.isHistoryOwnedBy(it.callLogModel?.localAddress, account) })
         list.addAll(contactsList)
         list.addAll(suggestionsList)
         list.addAll(requestList)

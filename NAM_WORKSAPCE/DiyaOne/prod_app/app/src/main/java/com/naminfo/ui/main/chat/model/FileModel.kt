@@ -33,7 +33,7 @@ class FileModel
     val isEncrypted: Boolean,
     val originalPath: String,
     val isFromEphemeralMessage: Boolean,
-    val isWaitingToBeDownloaded: Boolean = false,
+    var isWaitingToBeDownloaded: Boolean = false,
     val flexboxLayoutWrapBefore: Boolean = false,
     private val onTransferCancelled: (() -> Unit)? = null,
     private val onClicked: ((model: FileModel) -> Unit)? = null
@@ -54,21 +54,21 @@ class FileModel
 
     val mediaPreviewAvailable = MutableLiveData<Boolean>()
 
-    val mimeType: FileUtils.MimeType
+    var mimeType: FileUtils.MimeType = FileUtils.MimeType.Unknown
 
-    val mimeTypeString: String
+    var mimeTypeString: String = ""
 
-    val isMedia: Boolean
+    var isMedia: Boolean = false
 
-    val isImage: Boolean
+    var isImage: Boolean = false
 
-    val isVideoPreview: Boolean
+    var isVideoPreview: Boolean = false
 
     val audioVideoDuration = MutableLiveData<String>()
 
-    val isPdf: Boolean
+    var isPdf: Boolean = false
 
-    val isAudio: Boolean
+    var isAudio: Boolean = false
 
     val month = TimestampUtils.month(fileCreationTimestamp)
 
@@ -188,12 +188,35 @@ class FileModel
     @AnyThread
     fun markDownloaded(localPath: String) {
         path = localPath
+        isWaitingToBeDownloaded = false
+        val extension = FileUtils.getExtensionFromFileName(localPath).ifEmpty {
+            FileUtils.getExtensionFromFileName(fileName)
+        }
+        val mime = FileUtils.getMimeTypeFromExtension(extension)
+        mimeTypeString = mime
+        mimeType = FileUtils.getMimeType(mime)
+        if (mimeType == FileUtils.MimeType.Image) {
+            isImage = true
+            isMedia = true
+        } else if (mimeType == FileUtils.MimeType.Video) {
+            isVideoPreview = true
+            isMedia = true
+        } else if (mimeType == FileUtils.MimeType.Audio) {
+            isAudio = true
+        } else if (extension == "pdf") {
+            isPdf = true
+        }
         updateTransferProgress(-1)
         if (isImage) {
             mediaPreview.postValue(localPath)
             mediaPreviewAvailable.postValue(true)
         } else if (isVideoPreview) {
             loadVideoPreview()
+        } else if (isPdf) {
+            loadPdfPreview()
+        }
+        if (isVideoPreview || isAudio) {
+            getDuration()
         }
     }
 

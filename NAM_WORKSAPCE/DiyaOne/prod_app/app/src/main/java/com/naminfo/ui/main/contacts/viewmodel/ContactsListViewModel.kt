@@ -17,6 +17,7 @@ import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.contacts.ContactsManager.ContactsListener
 import com.naminfo.contacts.MobionContactsService
+import com.naminfo.contacts.PhoneContactNumbers
 import org.linphone.core.Friend
 import org.linphone.core.FriendList
 import org.linphone.core.FriendListListenerStub
@@ -488,6 +489,10 @@ class ContactsListViewModel
         val hideEmptyContacts = corePreferences.hideContactsWithoutPhoneNumberOrSipAddress
         for (result in results) {
             val friend = result.friend ?: continue
+            if (isCurrentAccountFriend(friend)) {
+                Log.i("$TAG Ignoring the signed-in account in contacts search")
+                continue
+            }
             if (friend.refKey.orEmpty().startsWith("conference:permanent:")) {
                 continue
             }
@@ -560,6 +565,20 @@ class ContactsListViewModel
         }
 
         Log.i("$TAG Processed [${results.size}] results into [${list.size} contacts]")
+    }
+
+    @WorkerThread
+    private fun isCurrentAccountFriend(friend: Friend): Boolean {
+        val self = PhoneContactNumbers.normalize(
+            coreContext.core.defaultAccount?.params?.identityAddress?.username.orEmpty()
+        )
+        if (self.isEmpty()) return false
+
+        return friend.addresses.any { address ->
+            PhoneContactNumbers.normalize(address.username.orEmpty()) == self
+        } || friend.phoneNumbers.any { number ->
+            PhoneContactNumbers.normalize(number.orEmpty()) == self
+        }
     }
 
     @WorkerThread

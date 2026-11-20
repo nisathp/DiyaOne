@@ -52,6 +52,8 @@
     <string name="sip_address_domain">Domain</string>
     <string name="assistant_sip_account_api_domain">API domain</string>
     <string name="assistant_sip_account_sip_domain">SIP domain</string>
+    <string name="assistant_sip_account_tcall_domain">TCall domain</string>
+    <string name="assistant_sip_account_tchat_domain">TChat domain</string>
     <string name="username">Username</string>
     <string name="authentication_id">Authentication ID (if different)</string>
     <string name="password">Password</string>
@@ -625,6 +627,7 @@
     <string name="new_conversation_no_contact">No contact and no suggestion for the moment…</string>
     <string name="new_conversation_no_matching_contact">No matching result…</string>
     <string name="conversation_text_field_hint">Say something…</string>
+    <string name="conversation_cant_send_to_yourself">You can’t send a message to your own account</string>
     <plurals name="conversation_composing_label">
         <item quantity="one">%s is typing…</item>
         <item quantity="other">%s are typing…</item>
@@ -917,6 +920,7 @@
     <string name="call_error_io_error_toast">Service unavailable or network error</string>
     <string name="call_error_server_timeout_toast">Server timeout</string>
     <string name="call_error_temporarily_unavailable_toast">Temporarily unavailable</string>
+    <string name="call_error_cannot_call_yourself">You can’t call your own account</string>
 
     <!-- Conference (in-call) -->
     <string name="conference_share_link_title">Share invitation</string>

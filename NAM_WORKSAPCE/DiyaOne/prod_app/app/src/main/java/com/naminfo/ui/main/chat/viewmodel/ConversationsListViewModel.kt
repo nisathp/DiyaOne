@@ -8,6 +8,7 @@ import com.naminfo.DiyaOneApplication.Companion.corePreferences
 import com.naminfo.R
 import com.naminfo.contacts.ContactsManager
 import com.naminfo.core.CustomImdn
+import com.naminfo.core.OfflineInboxRepository
 import org.linphone.core.Address
 import org.linphone.core.ChatMessage
 import org.linphone.core.ChatRoom
@@ -203,11 +204,17 @@ class ConversationsListViewModel
 
         val list = arrayListOf<ConversationModelWrapper>()
 
-        val account = LinphoneUtils.getDefaultAccount()
+        val allRooms = (coreContext.core.chatRooms.asList() + OfflineInboxRepository.restoredLocalFallbackRooms())
+            .distinctBy { LinphoneUtils.getConversationId(it) }
+            .filter(::isRoomForDefaultAccount)
         val chatRooms = if (filter.isEmpty()) {
-            account?.chatRooms
+            allRooms
         } else {
-            account?.filterChatRooms(filter)
+            allRooms.filter { room ->
+                val peer = room.peerAddress.asStringUriOnly()
+                val displayName = LinphoneUtils.getDisplayName(room.peerAddress)
+                peer.contains(filter, ignoreCase = true) || displayName.contains(filter, ignoreCase = true)
+            }
         }
         // FreeSWITCH can expose the same one-to-one SIP peer through more than one
         // underlying chat room (for example after an offline delivery is replayed).
@@ -216,7 +223,17 @@ class ConversationsListViewModel
         val hideEmptyChatRooms = coreContext.core.config.getBool("misc", "hide_empty_chat_rooms", true)
         val displayedOneToOnePeers = mutableSetOf<String>()
         for (chatRoom in chatRooms.orEmpty().sortedByDescending { it.lastUpdateTime }) {
-            if (hideEmptyChatRooms && !LinphoneUtils.isChatRoomAGroup(chatRoom) && !LinphoneUtils.hasVisibleOrRecentMessages(chatRoom)) {
+            // A Basic room restored after process death has no native SQLite events on some
+            // vendor builds. Its durable queue rows are intentionally rendered by
+            // ConversationModel as local fallback messages, so it is a real conversation and
+            // must not be removed by the native-history-only empty-room filter.
+            val hasLocalFallbackMessages = OfflineInboxRepository.localFallbackItems(chatRoom).isNotEmpty()
+            if (
+                hideEmptyChatRooms &&
+                !LinphoneUtils.isChatRoomAGroup(chatRoom) &&
+                !LinphoneUtils.hasVisibleOrRecentMessages(chatRoom) &&
+                !hasLocalFallbackMessages
+            ) {
                 Log.w("$TAG Skipping control-only or never-used conversation for peer [${chatRoom.peerAddress.asStringUriOnly()}]")
                 continue
             }
@@ -234,11 +251,14 @@ class ConversationsListViewModel
     }
 
     @WorkerThread
+    private fun isRoomForDefaultAccount(chatRoom: ChatRoom): Boolean =
+        LinphoneUtils.isHistoryOwnedBy(chatRoom.localAddress, coreContext.core.defaultAccount)
+
+    @WorkerThread
     private fun addChatRoom(chatRoom: ChatRoom, force: Boolean = false) {
         val identifier = chatRoom.identifier
-        val chatRoomAccount = chatRoom.account
         val defaultAccount = LinphoneUtils.getDefaultAccount()
-        if (defaultAccount == null || chatRoomAccount == null || chatRoomAccount != defaultAccount) {
+        if (defaultAccount == null || !isRoomForDefaultAccount(chatRoom)) {
             Log.w(
                 "$TAG Chat room with identifier [$identifier] was created but not displaying it because it doesn't belong to currently default account"
             )

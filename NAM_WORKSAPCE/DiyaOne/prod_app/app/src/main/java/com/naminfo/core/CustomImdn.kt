@@ -92,12 +92,8 @@ object CustomImdn {
     }
 
     private fun validId(value: String?): String? {
-        if (value == null) return null
-        return runCatching {
-            UUID.fromString(value).toString().takeIf {
-                it.equals(value, ignoreCase = true)
-            }
-        }.getOrNull()
+        val clean = value?.trim().orEmpty()
+        return clean.takeIf { it.matches(Regex("[A-Za-z0-9._-]{8,200}")) }
     }
 
     /**
@@ -149,6 +145,10 @@ object CustomImdn {
         isReceipt(message) || CustomComposing.isControlMessage(message)
 
     private const val KEY_QUEUE_DELIVERED = "queueDelivered"
+    // Locally injected queue events are already marked read by some Basic-SIP SDK builds.
+    // Preserve their actual user-visible read state separately so the list and navigation
+    // badges stay accurate until the recipient opens the conversation.
+    private const val KEY_QUEUE_UNREAD = "queueUnread"
     private const val KEY_QUEUED_MEDIA = "queuedMedia"
     private const val KEY_IS_FORWARDED = "isForwarded"
 
@@ -173,6 +173,7 @@ object CustomImdn {
             data.put("id", id)
         }
         data.put(KEY_QUEUE_DELIVERED, true)
+        data.put(KEY_QUEUE_UNREAD, true)
         if (isForward) {
             data.put(KEY_IS_FORWARDED, true)
         }
@@ -228,24 +229,63 @@ object CustomImdn {
      */
     fun timestamp(message: ChatMessage): Long = timestampMillis(message) / 1000L
 
-    private fun isSemanticallyIncoming(message: ChatMessage): Boolean =
-        !message.isOutgoing || isQueueDeliveredIncoming(message)
+    /**
+     * FreeSWITCH can occasionally deliver a remote SIP MESSAGE with an outgoing native
+     * wrapper. Notifications still see that event, but a strict isOutgoing check then
+     * hides it from every unread badge. Trust a different sender identity as incoming;
+     * own messages retain the same sender and local identities and remain excluded.
+     */
+    fun isSemanticallyIncoming(message: ChatMessage): Boolean {
+        if (!message.isOutgoing || isQueueDeliveredIncoming(message)) return true
+
+        val sender = normalizedPeer(message.fromAddress.username)
+        val local = normalizedPeer(message.chatRoom.localAddress.username)
+        return sender.isNotEmpty() && local.isNotEmpty() && sender != local
+    }
 
     fun visibleUnreadMessagesCount(room: ChatRoom): Int =
-        visibleUnreadMessagesCount(room.unreadHistory.asIterable())
+        visibleUnreadMessagesCount(listOf(room))
 
-    fun visibleUnreadMessagesCount(rooms: Iterable<ChatRoom>): Int =
-        visibleUnreadMessagesCount(rooms.asSequence().flatMap { it.unreadHistory.asSequence() }.asIterable())
+    fun visibleUnreadMessagesCount(rooms: Iterable<ChatRoom>): Int {
+        val candidates = rooms.asSequence().flatMap { r ->
+            val unread = r.unreadHistory.asSequence()
+            val events = r.getHistoryMessageEvents(0).asSequence().mapNotNull { it.chatMessage }
+                .filter { !it.isRead || metadata(it).optBoolean(KEY_QUEUE_UNREAD, false) }
+            unread + events
+        }.asIterable()
+        return visibleUnreadMessagesCount(candidates)
+    }
+
+    /**
+     * Stable IDs already represented by native unread history.  The durable inbox uses the
+     * same application IDs, so callers can merge its rows with native history without turning
+     * one received message into two badges.  This is especially important on Vivo builds where
+     * a locally injected Basic-SIP event is exposed as read by the SDK even while the durable
+     * inbox row remains unread.
+     */
+    fun visibleUnreadMessageIds(rooms: Iterable<ChatRoom>): Set<String> {
+        val ids = mutableSetOf<String>()
+        for (room in rooms) {
+            val candidates = room.unreadHistory.asSequence() +
+                room.getHistoryMessageEvents(0).asSequence().mapNotNull { it.chatMessage }
+                    .filter { !it.isRead || metadata(it).optBoolean(KEY_QUEUE_UNREAD, false) }
+            for (message in candidates) {
+                if (!isUnreadIncoming(message) || isHiddenControlMessage(message)) continue
+                stableMessageId(message)?.let(ids::add)
+            }
+        }
+        return ids
+    }
 
     internal fun visibleUnreadMessagesCount(messages: Iterable<ChatMessage?>): Int {
         val seenIds = mutableSetOf<String>()
         return messages.count { message ->
-            if (message == null || message.isRead || !isSemanticallyIncoming(message) ||
+            if (message == null || !isUnreadIncoming(message) ||
                 isHiddenControlMessage(message)
             ) {
                 false
             } else {
-                val id = stableMessageId(message)
+                val id = stableMessageId(message) ?: message.messageId
                 id == null || seenIds.add(id)
             }
         }
@@ -254,6 +294,29 @@ object CustomImdn {
     private fun stableMessageId(message: ChatMessage): String? =
         validId(metadata(message).optString("id"))
             ?: validId(message.getCustomHeader(HEADER))
+
+    private fun isUnreadIncoming(message: ChatMessage): Boolean =
+        isSemanticallyIncoming(message) &&
+            (!message.isRead || metadata(message).optBoolean(KEY_QUEUE_UNREAD, false))
+
+    /**
+     * Marks queue-injected messages as read when their conversation becomes visible.
+     * This complements [ChatRoom.markAsRead], which cannot change the native read flag on
+     * SDK versions that create local queue events as already read.
+     */
+    fun markQueueDeliveredMessagesRead(rooms: Iterable<ChatRoom>) {
+        for (room in rooms) {
+            for (message in room.getHistoryMessageEvents(0).asSequence().mapNotNull { it.chatMessage }) {
+                if (!metadata(message).optBoolean(KEY_QUEUE_UNREAD, false)) {
+                    continue
+                }
+                val data = metadata(message)
+                data.put(KEY_QUEUE_UNREAD, false)
+                save(message, data)
+                sendReceipt(message, "displayed")
+            }
+        }
+    }
 
     /**
      * FreeSWITCH can fan one SIP MESSAGE out as multiple requests with distinct
@@ -361,7 +424,7 @@ object CustomImdn {
         expectedRecipient: String = ""
     ): List<ChatMessage> {
         fun isOriginal(message: ChatMessage): Boolean =
-            message.isOutgoing && !isReceipt(message) && id(message) == messageId
+            !isSemanticallyIncoming(message) && !isReceipt(message) && id(message) == messageId
 
         val peer = expectedRecipient.ifEmpty {
             normalizedPeer(room?.peerAddress?.username)
@@ -426,19 +489,44 @@ object CustomImdn {
     }
 
     fun effectiveState(message: ChatMessage): ChatMessage.State {
-        if (!message.isOutgoing) return message.state
+        val nativeState = message.state
+        if (isSemanticallyIncoming(message) || nativeState == ChatMessage.State.Displayed) return nativeState
 
-        return when (metadata(message).optString("receivedStatus")) {
-            "displayed" -> ChatMessage.State.Displayed
-            "delivered" -> {
-                if (message.state == ChatMessage.State.Displayed) {
-                    ChatMessage.State.Displayed
-                } else {
-                    ChatMessage.State.DeliveredToUser
-                }
-            }
-            else -> message.state
+        val receipt = metadata(message).optString("receivedStatus")
+        val saved = OfflineInboxRepository.outgoingHistoryStatus(message)
+        return when {
+            receipt == "displayed" || saved == "displayed" -> ChatMessage.State.Displayed
+            receipt == "delivered" || saved == "delivered" -> ChatMessage.State.Delivered
+            saved == "sent" && nativeState in setOf(
+                ChatMessage.State.Idle,
+                ChatMessage.State.InProgress,
+                ChatMessage.State.FileTransferInProgress,
+                ChatMessage.State.PendingDelivery,
+                ChatMessage.State.Queued
+            ) -> ChatMessage.State.Delivered
+            else -> nativeState
         }
+    }
+
+    fun recordLocalSendCompletion(message: ChatMessage, state: ChatMessage.State) {
+        val messageId = id(message) ?: return
+        val room = message.chatRoom
+        val status = when (state) {
+            ChatMessage.State.Displayed -> "displayed"
+            ChatMessage.State.DeliveredToUser -> "delivered"
+            else -> "sent"
+        }
+        OfflineInboxRepository.updateLocalOutgoingStatus(
+            messageId, room.localAddress.username, room.peerAddress.username, status, message.messageId
+        )
+    }
+
+    /** Restores the receipt state on a display-only outgoing fallback message. */
+    fun restoreOutgoingReceiptState(message: ChatMessage, status: String?) {
+        if (status != "delivered" && status != "displayed") return
+        val data = metadata(message)
+        data.put("receivedStatus", status)
+        save(message, data)
     }
 
     /**
@@ -446,7 +534,7 @@ object CustomImdn {
      * Receipt messages never generate another receipt.
      */
     fun receive(room: ChatRoom, message: ChatMessage) {
-        if (message.isOutgoing || !supported(room)) return
+        if (!isSemanticallyIncoming(message) || !supported(room)) return
 
         if (isReceipt(message)) {
             try {
@@ -466,6 +554,20 @@ object CustomImdn {
             return
         }
 
+        val isDisplayedNow = coreContext.notificationsManager.isChatRoomCurrentlyDisplayed(room)
+
+        if (isQueueDeliveredIncoming(message)) {
+            Log.i("[Custom IMDN] Preserving injected queue incoming message id=$messageId isDisplayedNow=$isDisplayedNow")
+            trackIncomingForDisplayed(message)
+            if (isDisplayedNow) {
+                val data = metadata(message)
+                data.put(KEY_QUEUE_UNREAD, false)
+                save(message, data)
+                sendReceipt(message, "displayed")
+            }
+            return
+        }
+
         // The history callback may contain multiple SIP transactions created
         // by one app send. Dedupe before storing metadata or acknowledging it.
         // The in-memory claim also protects devices whose local DB rejected the
@@ -474,22 +576,27 @@ object CustomImdn {
             removeDuplicateIncomingMessage(room, message, messageId)
         ) {
             Log.i(
-                "[Custom IMDN] Ignoring duplicate incoming message " +
-                    "id=$messageId sipId=${message.messageId}"
+                "[Custom IMDN] Duplicate incoming message id=$messageId received. Resending delivery receipt with force=true to stop sender retries."
             )
+            sendReceipt(message, "delivered", force = true)
+            if (isDisplayedNow) {
+                sendReceipt(message, "displayed", force = true)
+            }
             room.deleteMessage(message)
             return
         }
 
         val data = metadata(message)
         data.put("id", messageId)
+        if (!isDisplayedNow) {
+            data.put(KEY_QUEUE_UNREAD, true)
+        }
         save(message, data)
         trackIncomingForDisplayed(message)
 
         sendReceipt(message, "delivered")
 
-        // Handles messages already marked read before this callback.
-        if (message.isRead) {
+        if (isDisplayedNow) {
             sendReceipt(message, "displayed")
         }
     }
@@ -524,7 +631,7 @@ object CustomImdn {
         val targets = findMatchingOutgoings(room, messageId)
 
         if (targets.isEmpty()) {
-            Log.w("[Custom IMDN] No outgoing match for id=$messageId")
+            recordSnapshotReceipt(room.localAddress.username, room.peerAddress.username, messageId, status, room)
             return
         }
 
@@ -557,6 +664,10 @@ object CustomImdn {
         val keysToNotify = linkedMapOf<String, ChatMessage.State>()
 
         for (target in targets) {
+            val room = target.chatRoom
+            OfflineInboxRepository.updateLocalOutgoingStatus(
+                messageId, room.localAddress.username, room.peerAddress.username, status, target.messageId
+            )
             val data = metadata(target)
             val previous = data.optString("receivedStatus")
             // Ignore duplicates and prevent displayed -> delivered regression.
@@ -580,6 +691,15 @@ object CustomImdn {
             snapshot.forEach { observer -> observer(messageKey, state) }
         }
         return resolvedState
+    }
+
+    private fun recordSnapshotReceipt(local: String?, peer: String?, messageId: String, status: String, room: ChatRoom?) {
+        if (!OfflineInboxRepository.updateLocalOutgoingStatus(messageId, local, peer, status)) return
+        if (room != null) {
+            val state = if (status == "displayed") ChatMessage.State.Displayed else ChatMessage.State.Delivered
+            val messageKey = key(room, messageId)
+            observers.toList().forEach { it(messageKey, state) }
+        }
     }
 
     internal fun normalizedPeer(raw: String?): String {
@@ -621,7 +741,10 @@ object CustomImdn {
         for (room in rooms) {
             if (!supported(room)) continue
             lastRoomReadScanAtMs[LinphoneUtils.getConversationId(room)] = now
-            for (message in room.unreadHistory) {
+            val unreadMessages = room.unreadHistory.asSequence() +
+                room.getHistoryMessageEvents(0).asSequence().mapNotNull { it.chatMessage }
+                    .filter { !it.isRead || metadata(it).optBoolean(KEY_QUEUE_UNREAD, false) }
+            for (message in unreadMessages) {
                 if (isSemanticallyIncoming(message) && !isReceipt(message) && id(message) != null) {
                     trackIncomingForDisplayed(message)
                     sendReceipt(message, "displayed")
@@ -773,6 +896,11 @@ object CustomImdn {
     }
 
     fun messageRead(message: ChatMessage) {
+        if (metadata(message).optBoolean(KEY_QUEUE_UNREAD, false)) {
+            val data = metadata(message)
+            data.put(KEY_QUEUE_UNREAD, false)
+            save(message, data)
+        }
         if (
             isSemanticallyIncoming(message) &&
             !isReceipt(message) &&
@@ -789,9 +917,16 @@ object CustomImdn {
      * the item and scheduled its HFT downloads, so it has the same meaning as B's SIP receipt.
      * Call on the Linphone core thread.
      */
-    fun markDeliveredFromOfflineQueue(messageId: String?, recipient: String?) {
+    fun markDeliveredFromOfflineQueue(messageId: String?, recipient: String?) =
+        applyOfflineQueueReceipt(messageId, recipient, "delivered")
+
+    fun markDisplayedFromOfflineQueue(messageId: String?, recipient: String?) =
+        applyOfflineQueueReceipt(messageId, recipient, "displayed")
+
+    private fun applyOfflineQueueReceipt(messageId: String?, recipient: String?, status: String) {
         val stableId = validId(messageId) ?: return
         val expectedRecipient = normalizedPeer(recipient)
+        if (expectedRecipient.isEmpty()) return
         val targets = findMatchingOutgoings(
             room = null,
             messageId = stableId,
@@ -799,12 +934,19 @@ object CustomImdn {
         )
 
         if (targets.isEmpty()) {
-            Log.w("[Custom IMDN] No outgoing queue match for id=$stableId")
+            val core = coreContext.core
+            val local = core.defaultAccount?.params?.identityAddress?.username
+            val room = (core.chatRooms.asSequence() + OfflineInboxRepository.restoredLocalFallbackRooms().asSequence())
+                .firstOrNull {
+                    normalizedPeer(it.localAddress.username) == normalizedPeer(local) &&
+                        normalizedPeer(it.peerAddress.username) == expectedRecipient
+                }
+            recordSnapshotReceipt(local, recipient, stableId, status, room)
             return
         }
 
-        if (applyOutgoingStatus(targets, stableId, "delivered") != null) {
-            Log.i("[Custom IMDN] Offline queue delivered id=$stableId targets=${targets.size}")
+        if (applyOutgoingStatus(targets, stableId, status) != null) {
+            Log.i("[Custom IMDN] Offline queue $status id=$stableId targets=${targets.size}")
         }
     }
 
@@ -845,6 +987,19 @@ object CustomImdn {
 
         if (status == "displayed") {
             key(original)?.let(awaitingDisplayed::remove)
+            // receiveChatMessage() materializes a durable queue item as a local Basic-SIP
+            // event. On affected SDKs its fromAddress is consequently the receiver itself;
+            // the room peer is the real original sender and must receive the FCM read ACK.
+            val sender = if (isQueueDeliveredIncoming(original)) {
+                original.chatRoom.peerAddress.username
+            } else {
+                original.fromAddress.username?.takeIf { it.isNotBlank() }
+                    ?: LinphoneUtils.getConversationId(original.chatRoom).ifEmpty {
+                        original.chatRoom.peerAddress.username
+                    }
+            }
+            val recipient = original.chatRoom.localAddress.username
+            OfflineInboxRepository.notifyRead(sender, recipient, listOf(messageId))
         }
         val pendingKey = "${key(original)}|$status"
         if (!pending.add(pendingKey)) return

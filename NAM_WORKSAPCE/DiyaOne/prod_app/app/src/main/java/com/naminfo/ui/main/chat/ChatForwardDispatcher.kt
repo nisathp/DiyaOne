@@ -146,7 +146,7 @@ internal object ChatForwardDispatcher {
                 if (existingLocal != null) {
                     val fileName = ensureExtension(media.name, mimeType, existingLocal.name)
                     stageFile(existingLocal, fileName, mimeType)?.let { attachments.add(it) }
-                } else {
+                } else if (media.url.isNotBlank()) {
                     attachments.add(AttachmentSource.QueuedRemote(media, mimeType))
                 }
             }
@@ -439,7 +439,10 @@ internal object ChatForwardDispatcher {
                 when (state) {
                     ChatMessage.State.FileTransferDone -> {
                         FileTransferApiLogger.completeUpload(transferLogId)
-                        OfflineInboxRepository.enqueueUploadedMedia(changedMessage)
+                        OfflineInboxRepository.enqueueUploadedMedia(
+                            changedMessage,
+                            FileTransferApiLogger.uploadedMedia(fileName)
+                        )
                     }
 
                     ChatMessage.State.FileTransferError,

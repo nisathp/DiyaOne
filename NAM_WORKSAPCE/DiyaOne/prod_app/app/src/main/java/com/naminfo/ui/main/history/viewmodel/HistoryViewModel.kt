@@ -78,7 +78,7 @@ class HistoryViewModel
         @WorkerThread
         override fun onContactsLoaded() {
             val id = displayedCallId ?: return
-            coreContext.core.findCallLogFromCallId(id)?.let {
+            findCallLogByIdOrRefKey(coreContext.core, id)?.let {
                 callLogModel.postValue(CallLogModel(it))
             }
         }
@@ -91,11 +91,8 @@ class HistoryViewModel
         @WorkerThread
         override fun onCallLogUpdated(core: Core, callLog: CallLog) {
             val peerAddress = callLog.remoteAddress
-            val localAddress = callLog.localAddress
-            val defaultAccount = LinphoneUtils.getDefaultAccount()
-            if (::address.isInitialized && address.weakEqual(peerAddress) && defaultAccount?.params?.identityAddress?.weakEqual(
-                    localAddress
-                ) == true
+            if (::address.isInitialized && address.weakEqual(peerAddress) &&
+                LinphoneUtils.isHistoryOwnedBy(callLog.localAddress, core.defaultAccount)
             ) {
                 Log.i("$TAG A call log was created, updating list")
                 computeCallLogs()
@@ -150,7 +147,7 @@ class HistoryViewModel
     fun findCallLogByCallId(callId: String) {
         coreContext.postOnCoreThread { core ->
             displayedCallId = callId
-            val callLog = core.findCallLogFromCallId(callId)
+            val callLog = findCallLogByIdOrRefKey(core, callId)
             if (callLog != null) {
                 address = callLog.remoteAddress
                 callLocalAddress = callLog.localAddress
@@ -177,11 +174,23 @@ class HistoryViewModel
         }
     }
 
+    @WorkerThread
+    private fun findCallLogByIdOrRefKey(core: Core, id: String): CallLog? {
+        val account = core.defaultAccount ?: return null
+        return core.findCallLogFromCallId(id)?.takeIf { LinphoneUtils.isHistoryOwnedBy(it.localAddress, account) }
+            ?: core.callLogs.firstOrNull {
+                (it.callId == id || it.refKey == id) && LinphoneUtils.isHistoryOwnedBy(it.localAddress, account)
+            }
+    }
+
     @UiThread
     fun deleteHistory() {
         coreContext.postOnCoreThread { core ->
+            val account = core.defaultAccount ?: return@postOnCoreThread
             for (model in historyCallLogs.value.orEmpty()) {
-                core.removeCallLog(model.callLog)
+                if (LinphoneUtils.isHistoryOwnedBy(model.callLog.localAddress, account)) {
+                    core.removeCallLog(model.callLog)
+                }
             }
             historyDeletedEvent.postValue(Event(true))
         }
@@ -378,28 +387,15 @@ class HistoryViewModel
 
     @WorkerThread
     private fun computeCallLogs() {
-        val history = arrayListOf<CallLogHistoryModel>()
-        val account = LinphoneUtils.getDefaultAccount()
-        account ?: return
-
-        val list = account.getCallLogsForAddress(address)
-        for (log in list) {
-            val historyModel = CallLogHistoryModel(log)
-            history.add(historyModel)
-        }
-
-        // Required when "unique account displays all call logs from Core" workaround
-        // TODO FIXME: remove workaround later
-        if (list.isEmpty()) {
-            for (log in coreContext.core.callLogs) {
-                if (log.remoteAddress.weakEqual(address) &&
-                    account.params.identityAddress?.weakEqual(log.localAddress) == true
-                ) {
-                    val historyModel = CallLogHistoryModel(log)
-                    history.add(historyModel)
+        val core = coreContext.core
+        val account = core.defaultAccount ?: return
+        val logs = account.getCallLogsForAddress(address).filter { LinphoneUtils.isHistoryOwnedBy(it.localAddress, account) }
+            .ifEmpty {
+                core.callLogs.filter {
+                    it.remoteAddress.weakEqual(address) && LinphoneUtils.isHistoryOwnedBy(it.localAddress, account)
                 }
             }
-        }
+        val history = logs.mapTo(arrayListOf(), ::CallLogHistoryModel)
 
         Log.i("$TAG Found [${history.size}] call logs")
         historyCallLogs.postValue(history)
